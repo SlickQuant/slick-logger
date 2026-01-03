@@ -1,6 +1,6 @@
 // MIT License
 //
-// Copyright (c) 2025 SlickQuant
+// Copyright (c) 2025-2026 SlickQuant
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -55,8 +55,8 @@
 
 #define SLICK_LOGGER_VERSION_MAJOR 1
 #define SLICK_LOGGER_VERSION_MINOR 0
-#define SLICK_LOGGER_VERSION_PATCH 1
-#define SLICK_LOGGER_VERSION "1.0.1"
+#define SLICK_LOGGER_VERSION_PATCH 2
+#define SLICK_LOGGER_VERSION "1.0.2"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20

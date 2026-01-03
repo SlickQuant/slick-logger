@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(slick_logger 
-    VERSION 1.0.1
+    VERSION 1.0.2
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -14,7 +14,7 @@ set(BUILD_SLICK_QUEUE_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick_queue
     GIT_REPOSITORY https://github.com/SlickQuant/slick_queue.git
-    GIT_TAG v1.1.2
+    GIT_TAG v1.2.1
 )
 FetchContent_MakeAvailable(slick_queue)
 
@@ -43,8 +43,6 @@ target_include_directories(slick_logger INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(slick_logger INTERFACE slick::slick_queue)
-
-message(STATUS "Slick Queue: ${slick_queue_SOURCE_DIR}")
 
 if (MSVC)
     set(CMAKE_CXX_FLAGS_RELEASE "-O2")
@@ -105,22 +103,3 @@ install(FILES
 )
 
 message(STATUS "slick_logger: ${PROJECT_VERSION}")
-
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_custom_target(dist_slick_logger ALL
-        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/dist/include
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        COMMENT "Copying slick_logger headers to dist/include"
-        VERBATIM
-    )
-
-    if (PROJECT_IS_TOP_LEVEL)
-        add_custom_target(package_slick_logger ALL
-            COMMAND ${CMAKE_COMMAND} -E tar "cfv" "${CMAKE_BINARY_DIR}/dist/slick_logger_${PROJECT_VERSION}.zip" --format=zip "include"
-            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist"
-            COMMENT "Creating zip archive"
-        )
-
-        add_dependencies(package_slick_logger dist_slick_logger)
-    endif()
-endif()
