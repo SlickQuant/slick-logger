@@ -1,3 +1,9 @@
+# v1.0.3 - 01-08-2026
+- Fix crash when logging empty string_view values
+  - Add length check before memcpy in store_string_in_queue() to handle empty strings safely
+  - Set null terminator directly for zero-length strings instead of copying
+- Add comprehensive unit test for empty string_view logging (EmptyStringView test)
+
 # v1.0.2 - 01-03-2026
 - Update slick_queue to v1.2.1
 - Added GitHub release workflow

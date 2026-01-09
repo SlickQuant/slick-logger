@@ -1574,10 +1574,15 @@ inline StringRef Logger::store_string_in_queue(std::string_view str) {
 
     // Reserve space in string queue
     uint64_t start_index = string_queue_->reserve(len);
-    // Copy string data
-    char* dest = (*string_queue_)[start_index];
-    std::memcpy(dest, str.data(), len);
 
+    char* dest = (*string_queue_)[start_index];
+    if (length) {
+        // Copy string data
+        std::memcpy(dest, str.data(), len);
+    } 
+    else {
+        *dest = '\0';
+    } 
     // Publish the string data
     string_queue_->publish(start_index, len);
     return StringRef{dest, length};

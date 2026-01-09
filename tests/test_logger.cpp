@@ -17,6 +17,7 @@ protected:
         std::filesystem::remove("test_mixed.log");
         std::filesystem::remove("test_char_array.log");
         std::filesystem::remove("test_single_string.log");
+        std::filesystem::remove("test_empty_string.log");
     }
 };
 
@@ -345,6 +346,28 @@ TEST_F(SlickLoggerTest, CharArrayLogging) {
     
     // Check valid formats work
     EXPECT_TRUE(file_contents.find("Log char array: test char array") != std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, EmptyStringView) {
+    std::filesystem::remove("test_empty_string.log");
+    
+    slick::logger::Logger::instance().init("test_empty_string.log", 8);
+
+    std::string_view s;
+    
+    LOG_INFO("Log empty string: {}", s);
+    
+    slick::logger::Logger::instance().shutdown();
+    
+    ASSERT_TRUE(std::filesystem::exists("test_empty_string.log"));
+    
+    std::ifstream log_file("test_empty_string.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    EXPECT_TRUE(std::getline(log_file, line));
+    // Check valid formats work
+    EXPECT_EQ(line.size(), 52);
+    EXPECT_EQ(line.find(" [INFO] Log empty string: "), 26);
 }
 
 int main(int argc, char **argv) {
