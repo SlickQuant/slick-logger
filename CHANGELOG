@@ -1,3 +1,6 @@
+# 
+- Updated cmake config template to avoid cmake config warning
+
 # v1.0.4 - 01-11-2026
 - Updated to slick-queue v1.2.2
 - Try find slick-queue using CONFIG mode first before falling back to fetching it manually

@@ -3,10 +3,11 @@
 include(CMakeFindDependencyMacro)
 
 # Find slick-queue dependency
-find_dependency(slick-queue QUIET)
+find_dependency(slick-queue 1.2.2 CONFIG QUIET)
 
 # If slick_queue is not found via find_package, try to fetch it
 if(NOT slick-queue_FOUND)
+    message(STATUS "Fetching slick_queue...")
     include(FetchContent)
     set(BUILD_SLICK_QUEUE_TESTS OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(
