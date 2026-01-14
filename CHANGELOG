@@ -1,3 +1,11 @@
+# v1.0.4 - 01-11-2026
+- Updated to slick-queue v1.2.2
+- Try find slick-queue using CONFIG mode first before falling back to fetching it manually
+- Renamed repository from slick_logger to slick-logger (hyphenated naming follows recommended convention)
+- Changed export name from slick::slick_logger to slick::logger
+- Refactored repository name in CMake configuration files
+- Updated documentation and build references to use new repository name
+
 # v1.0.3 - 01-08-2026
 - Fix crash when logging empty string_view values
   - Add length check before memcpy in store_string_in_queue() to handle empty strings safely

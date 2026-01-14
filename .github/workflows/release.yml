@@ -44,7 +44,8 @@ jobs:
 
       - name: Create header archive
         run: |
-          zip -r ./slick_logger-${{ steps.get_version.outputs.VERSION }}.zip include/
+          zip -r ./slick-logger-${{ steps.get_version.outputs.VERSION }}.zip include/
+          tar -czf ./slick-logger-${{ steps.get_version.outputs.VERSION }}.tar.gz include/
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -59,4 +60,5 @@ jobs:
           prerelease: false
           generate_release_notes: false
           files: |
-            slick_logger-${{ steps.get_version.outputs.VERSION }}.zip
+            slick-logger-${{ steps.get_version.outputs.VERSION }}.zip
+            slick-logger-${{ steps.get_version.outputs.VERSION }}.tar.gz

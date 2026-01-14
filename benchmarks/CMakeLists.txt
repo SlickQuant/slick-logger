@@ -47,11 +47,11 @@ endif()
 
 # Simple working benchmark  
 add_executable(simple_benchmark simple_benchmark.cpp)
-target_link_libraries(simple_benchmark slick_logger spdlog::spdlog fmt::fmt)
+target_link_libraries(simple_benchmark slick::logger spdlog::spdlog fmt::fmt)
 
 # Quick benchmark for testing
 add_executable(quick_benchmark quick_benchmark.cpp)
-target_link_libraries(quick_benchmark slick_logger spdlog::spdlog fmt::fmt)
+target_link_libraries(quick_benchmark slick::logger spdlog::spdlog fmt::fmt)
 
 # Main benchmark executable
 add_executable(slick_logger_benchmark
@@ -62,7 +62,7 @@ add_executable(slick_logger_benchmark
 )
 
 target_link_libraries(slick_logger_benchmark
-    slick_logger
+    slick::logger
     benchmark_utils
     ${SPDLOG_LIBRARIES}
     ${FMT_LIBRARIES}
@@ -85,21 +85,21 @@ endif()
 # Individual micro-benchmarks
 add_executable(latency_benchmark latency_benchmark.cpp)
 target_link_libraries(latency_benchmark 
-    slick_logger
+    slick::logger
     benchmark_utils
     ${SPDLOG_LIBRARIES}
 )
 
 add_executable(throughput_benchmark throughput_benchmark.cpp)
 target_link_libraries(throughput_benchmark 
-    slick_logger
+    slick::logger
     benchmark_utils
     ${SPDLOG_LIBRARIES}
 )
 
 add_executable(memory_benchmark memory_benchmark.cpp)
 target_link_libraries(memory_benchmark 
-    slick_logger
+    slick::logger
     benchmark_utils
     ${SPDLOG_LIBRARIES}
 )

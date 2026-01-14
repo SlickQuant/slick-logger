@@ -8,8 +8,8 @@ This guide helps you build and run the comprehensive benchmark suite to compare 
 
 ```bash
 # Clone the repository  
-git clone https://github.com/SlickQuant/slick_logger.git
-cd slick_logger
+git clone https://github.com/SlickQuant/slick-logger.git
+cd slick-logger
 
 # Create build directory
 mkdir build && cd build

@@ -152,7 +152,7 @@ void measure_slick_logger_latency() {
         analyzer.add_measurement(
             std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count(),
             std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count(),
-            "slick_logger"
+            "slick-logger"
         );
     }
 

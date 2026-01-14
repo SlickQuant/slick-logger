@@ -35,5 +35,5 @@ jobs:
       if: matrix.build_type == 'Release' && matrix.os == 'ubuntu-latest'
       uses: actions/upload-artifact@v4
       with:
-        name: slick_logger-package
+        name: slick-logger-package
         path: build/dist/*.zip

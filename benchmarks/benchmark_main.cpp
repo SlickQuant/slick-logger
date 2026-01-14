@@ -93,7 +93,7 @@ private:
 class SlickLoggerScenario : public BenchmarkScenario {
 public:
     SlickLoggerScenario(MessageSize msg_size = MessageSize::SMALL)
-        : BenchmarkScenario("slick_logger"), msg_size_(msg_size) {}
+        : BenchmarkScenario("slick-logger"), msg_size_(msg_size) {}
 
     void setup() override {
         slick::logger::Logger::instance().reset();

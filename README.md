@@ -1,11 +1,11 @@
-# slick_logger
+# slick-logger
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Header-only](https://img.shields.io/badge/header--only-yes-brightgreen.svg)](#installation)
 [![Lock-free](https://img.shields.io/badge/concurrency-lock--free-orange.svg)](#architecture)
-[![CI](https://github.com/SlickQuant/slick_logger/actions/workflows/ci.yml/badge.svg)](https://github.com/SlickQuant/slick_logger/actions/workflows/ci.yml)
-[![GitHub release](https://img.shields.io/github/v/release/SlickQuant/slick_logger)](https://github.com/SlickQuant/slick_logger/releases)
+[![CI](https://github.com/SlickQuant/slick-logger/actions/workflows/ci.yml/badge.svg)](https://github.com/SlickQuant/slick-logger/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/SlickQuant/slick-logger)](https://github.com/SlickQuant/slick-logger/releases)
 
 A high-performance, cross-platform **header-only** logging library for C++20 using a multi-producer, multi-consumer ring buffer with **multi-sink support** and **log rotation** capabilities.
 
@@ -31,11 +31,11 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 ## Installation
 
 ### Option 1: Direct Copy
-For manual installation, you need both slick_logger and its dependency:
+For manual installation, you need both slick-logger and its dependency:
 
 1. Copy the `include/slick/` directory to your project
-2. Download `queue.h` from https://raw.githubusercontent.com/SlickQuant/slick_queue/main/include/slick/queue.h
-3. Place `queue.h` in your include path or alongside the slick_logger headers
+2. Download `queue.h` from https://raw.githubusercontent.com/SlickQuant/slick-queue/main/include/slick/queue.h
+3. Place `queue.h` in your include path or alongside the slick-logger headers
 
 Your project structure should look like:
 ```
@@ -62,25 +62,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
-# Disable examples, tests, and benchmarks for slick_logger
+# Disable examples, tests, and benchmarks for slick-logger
 set(BUILD_SLICK_LOGGER_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_SLICK_LOGGER_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_SLICK_LOGGER_BENCHMARKS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
-    slick_logger
-    GIT_REPOSITORY https://github.com/SlickQuant/slick_logger.git
+    slick-logger
+    GIT_REPOSITORY https://github.com/SlickQuant/slick-logger.git
     GIT_TAG main
 )
 
-FetchContent_MakeAvailable(slick_logger)
+FetchContent_MakeAvailable(slick-logger)
 
 add_executable(your_app main.cpp)
-target_link_libraries(your_app slick_logger)
+target_link_libraries(your_app slick::logger)
 ```
 
 #### Using find_package
-If you've installed slick_logger system-wide:
+If you've installed slick-logger system-wide:
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -89,10 +89,10 @@ project(your_project)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(slick_logger REQUIRED)
+find_package(slick-logger REQUIRED)
 
 add_executable(your_app main.cpp)
-target_link_libraries(your_app slick_logger)
+target_link_libraries(your_app slick::logger)
 ```
 
 #### Manual Integration
@@ -103,8 +103,8 @@ project(your_project)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Add slick_logger include directory
-include_directories(path/to/slick_logger/include, path/to/slick_queue/include)
+# Add slick-logger include directory
+include_directories(path/to/slick-logger/include, path/to/slick-queue/include)
 
 add_executable(your_app main.cpp)
 ```
@@ -135,7 +135,7 @@ int main() {
 
 ### String Formatting with std::format
 
-slick_logger uses C++20's `std::format` for type-safe and efficient string formatting:
+slick-logger uses C++20's `std::format` for type-safe and efficient string formatting:
 
 ```cpp
 #include <slick/logger.hpp>

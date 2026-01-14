@@ -34,7 +34,7 @@ This benchmark suite provides detailed performance analysis across multiple dime
 ```bash
 # Clone and build with benchmarks enabled
 git clone <your-repo-url>
-cd slick_logger
+cd slick-logger
 mkdir build && cd build
 
 # Enable benchmarks during cmake configuration
