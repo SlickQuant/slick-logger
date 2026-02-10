@@ -181,6 +181,27 @@ int main() {
 - **Extensible**: Easy to add custom formatters for user-defined types
 - **Standard**: Part of C++20 standard library, no external dependencies
 
+### Passing std::format_args
+
+You can pass a pre-built `std::format_args` object as the single argument to any log call. This lets you capture format arguments once and reuse them, or forward a pre-built arg pack from another function:
+
+```cpp
+int count = 42;
+double price = 9.99;
+std::string_view name = "widget";
+
+// Capture args once, pass to logger
+auto args = std::make_format_args(count, price, name);
+LOG_INFO("count={} price={:.2f} name={}", args);
+
+// Also works inline
+LOG_DEBUG("x={} y={}", std::make_format_args(x, y));
+```
+
+> **Note:** `std::make_format_args` requires all arguments to be lvalues. Pass temporary values via a named variable.
+
+> **Limitation:** Custom formatter types (types requiring a `std::formatter` specialization, represented as `handle` inside `std::format_args`) are not supported. They will be logged as `<handle>`. Use the normal variadic log call for custom-formatted types.
+
 ### Multi-Sink Usage
 
 ```cpp

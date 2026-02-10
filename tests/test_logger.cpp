@@ -18,6 +18,7 @@ protected:
         std::filesystem::remove("test_char_array.log");
         std::filesystem::remove("test_single_string.log");
         std::filesystem::remove("test_empty_string.log");
+        std::filesystem::remove("test_format_args.log");
     }
 };
 
@@ -368,6 +369,38 @@ TEST_F(SlickLoggerTest, EmptyStringView) {
     // Check valid formats work
     EXPECT_EQ(line.size(), 52);
     EXPECT_EQ(line.find(" [INFO] Log empty string: "), 26);
+}
+
+TEST_F(SlickLoggerTest, FormatArgsLogging) {
+    std::filesystem::remove("test_format_args.log");
+
+    slick::logger::Logger::instance().init("test_format_args.log", 1024);
+
+    int i = 42;
+    double d = 3.14;
+    std::string_view sv = "hello";
+    bool b = true;
+    void* p = &d;
+
+    // Pre-build format_args and pass to logger
+    LOG_INFO("int={} double={:.2f} str={} bool={} pointer={:p}", std::make_format_args(i, d, sv, b, p));
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_format_args.log"));
+
+    std::ifstream log_file("test_format_args.log");
+    std::string file_contents;
+    std::string line;
+    std::getline(log_file, line); // first line is the logger's version
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_NE(file_contents.find("int=42 double=3.14 str=hello bool=true"), std::string::npos);
+
+    log_file.close();
+    std::filesystem::remove("test_format_args.log");
 }
 
 int main(int argc, char **argv) {

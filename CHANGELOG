@@ -1,4 +1,11 @@
-# 
+# v1.0.5 - 02-10-2026
+- Add `std::format_args` support: pass a pre-built `std::format_args` object directly to any log call
+  - Arguments are unpacked and copied into the log entry on the calling thread (safe across thread boundary)
+  - Supports all standard `std::basic_format_arg` types: bool, char, int, unsigned, long long, unsigned long long, float, double, long double, const char*, string_view, and void*
+  - Custom formatter types (`std::formatter` handle) are not supported; they will be logged as `<handle>`
+  - Fix `const void*` handling in `enqueue_argument` (also benefits regular pointer logging)
+
+#
 - Updated cmake config template to avoid cmake config warning
 
 # v1.0.4 - 01-11-2026

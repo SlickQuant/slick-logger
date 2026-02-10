@@ -195,6 +195,16 @@ enum class ArgType : uint8_t {
     STRING_DYNAMIC   // std::string - stored in separate queue
 };
 
+// True when Args... is exactly one type convertible to std::format_args —
+// used to detect the pre-built format_args overload in log_to_sink.
+// std::make_format_args() returns an implementation-defined store type
+// (e.g. std::_Format_arg_store on MSVC) that converts to std::format_args,
+// so we check convertibility rather than exact type identity.
+template<typename... Args>
+inline constexpr bool is_single_format_args_v =
+    sizeof...(Args) == 1 &&
+    (std::is_convertible_v<std::decay_t<Args>, std::format_args> || ...);
+
 #pragma pack(push, 1)
 struct StringRef {
     const char* ptr;    // Pointer to string data
@@ -623,6 +633,8 @@ private:
     
     template<typename T>
     void enqueue_argument(LogArgument& arg, T&& value);
+
+    void enqueue_format_args(LogEntry& entry, std::format_args fa);
 
     StringRef store_string_in_queue(std::string_view str);
 
@@ -1429,13 +1441,20 @@ inline void Logger::log_to_sink(int sink_index, LogLevel level, FormatT&& format
     entry.sink_index = sink_index;
     if constexpr (IS_STRING_LITERAL(format)) {
         entry.format_ptr = format;  // String literal - safe to store pointer
-        entry.arg_count = sizeof...(args);
 
-        // push arguments
-        size_t arg_idx = 0;
-        static_assert(sizeof...(args) <= SLICK_LOGGER_MAX_ARGS, "Too many log arguments");
-        (enqueue_argument(entry.args[arg_idx++], std::forward<Args>(args)), ...);
-    } 
+        if constexpr (is_single_format_args_v<Args...>) {
+            // Pre-built std::format_args: unpack values into the entry on the
+            // calling thread (format_args holds non-owning references).
+            enqueue_format_args(entry,
+                std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...)));
+        } else {
+            // Normal path: push individual arguments
+            entry.arg_count = sizeof...(args);
+            size_t arg_idx = 0;
+            static_assert(sizeof...(args) <= SLICK_LOGGER_MAX_ARGS, "Too many log arguments");
+            (enqueue_argument(entry.args[arg_idx++], std::forward<Args>(args)), ...);
+        }
+    }
     else {
         // Store dynamic string in string queue
         static_assert(sizeof...(args) == 0, "Dynamic format strings are only supported when there are no arguments, to avoid dangling pointers.");
@@ -1559,6 +1578,10 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
         arg.type = ArgType::STRING_DYNAMIC;
         arg.value.dynamic_str = store_string_in_queue(value);
     }
+    else if constexpr (std::is_same_v<DecayedT, const void*>) {
+        arg.type = ArgType::PTR;
+        arg.value.ptr = const_cast<void*>(value);
+    }
     else if constexpr (std::is_pointer_v<DecayedT>) {
         arg.type = ArgType::PTR;
         arg.value.ptr = static_cast<void*>(value);
@@ -1588,6 +1611,29 @@ inline StringRef Logger::store_string_in_queue(std::string_view str) {
     // Publish the string data
     string_queue_->publish(start_index, len);
     return StringRef{dest, length};
+}
+
+inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
+    size_t arg_idx = 0;
+    while (arg_idx < SLICK_LOGGER_MAX_ARGS) {
+        auto arg = fa.get(arg_idx);
+        bool is_monostate = false;
+        std::visit_format_arg([&]<typename T>(T&& v) {
+            using DT = std::decay_t<T>;
+            if constexpr (std::is_same_v<DT, std::monostate>) {
+                is_monostate = true;
+            } else if constexpr (std::is_same_v<DT, typename std::basic_format_arg<std::format_context>::handle>) {
+                // Custom type via handle: std::format_context is not publicly
+                // constructible, so store a placeholder instead.
+                enqueue_argument(entry.args[arg_idx], std::string_view{"<handle>"});
+            } else {
+                enqueue_argument(entry.args[arg_idx], std::forward<T>(v));
+            }
+        }, arg);
+        if (is_monostate) break;
+        ++arg_idx;
+    }
+    entry.arg_count = static_cast<uint8_t>(arg_idx);
 }
 
 inline void Logger::shutdown(bool clear_sinks) {
