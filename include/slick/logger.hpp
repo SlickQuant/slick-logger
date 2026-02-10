@@ -55,8 +55,8 @@
 
 #define SLICK_LOGGER_VERSION_MAJOR 1
 #define SLICK_LOGGER_VERSION_MINOR 0
-#define SLICK_LOGGER_VERSION_PATCH 4
-#define SLICK_LOGGER_VERSION "1.0.4"
+#define SLICK_LOGGER_VERSION_PATCH 5
+#define SLICK_LOGGER_VERSION "1.0.5"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20
@@ -1626,6 +1626,17 @@ inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
                 // Custom type via handle: std::format_context is not publicly
                 // constructible, so store a placeholder instead.
                 enqueue_argument(entry.args[arg_idx], std::string_view{"<handle>"});
+#ifdef __SIZEOF_INT128__
+            } else if constexpr (std::is_same_v<DT, __int128>) {
+                enqueue_argument(entry.args[arg_idx], static_cast<long long>(v));
+            } else if constexpr (std::is_same_v<DT, unsigned __int128>) {
+                enqueue_argument(entry.args[arg_idx], static_cast<unsigned long long>(v));
+#endif
+#ifdef __SIZEOF_FLOAT128__
+            } else if constexpr (std::is_same_v<DT, __float128> ||
+                                  std::is_same_v<DT, _Float128>) {
+                enqueue_argument(entry.args[arg_idx], static_cast<double>(v));
+#endif
             } else {
                 enqueue_argument(entry.args[arg_idx], std::forward<T>(v));
             }
