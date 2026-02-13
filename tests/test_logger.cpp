@@ -19,6 +19,7 @@ protected:
         std::filesystem::remove("test_single_string.log");
         std::filesystem::remove("test_empty_string.log");
         std::filesystem::remove("test_format_args.log");
+        std::filesystem::remove("test_format_args_const_char.log");
     }
 };
 
@@ -398,9 +399,34 @@ TEST_F(SlickLoggerTest, FormatArgsLogging) {
     }
 
     EXPECT_NE(file_contents.find("int=42 double=3.14 str=hello bool=true"), std::string::npos);
+}
 
-    log_file.close();
-    std::filesystem::remove("test_format_args.log");
+TEST_F(SlickLoggerTest, FormatArgsConstCharBridgeLogging) {
+    std::filesystem::remove("test_format_args_const_char.log");
+
+    slick::logger::Logger::instance().init("test_format_args_const_char.log", 1024);
+
+    auto log_bridge = [](slick::logger::LogLevel level, const char* format_text, std::format_args args) {
+        slick::logger::Logger::instance().log(level, format_text, args);
+    };
+
+    int number = 7;
+    std::string_view text = "bridge";
+    log_bridge(slick::logger::LogLevel::L_INFO, "bridge value={} text={}", std::make_format_args(number, text));
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_format_args_const_char.log"));
+
+    std::ifstream log_file("test_format_args_const_char.log");
+    std::string file_contents;
+    std::string line;
+    std::getline(log_file, line); // first line is the logger's version
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_NE(file_contents.find("bridge value=7 text=bridge"), std::string::npos);
 }
 
 int main(int argc, char **argv) {

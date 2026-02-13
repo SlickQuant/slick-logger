@@ -1439,26 +1439,27 @@ inline void Logger::log_to_sink(int sink_index, LogLevel level, FormatT&& format
     entry.sink_index = sink_index;
     if constexpr (IS_STRING_LITERAL(format)) {
         entry.format_ptr = format;  // String literal - safe to store pointer
-
-        if constexpr (is_single_format_args_v<Args...>) {
-            // Pre-built std::format_args: unpack values into the entry on the
-            // calling thread (format_args holds non-owning references).
-            enqueue_format_args(entry,
-                std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...)));
-        } else {
-            // Normal path: push individual arguments
-            entry.arg_count = sizeof...(args);
-            size_t arg_idx = 0;
-            static_assert(sizeof...(args) <= SLICK_LOGGER_MAX_ARGS, "Too many log arguments");
-            (enqueue_argument(entry.args[arg_idx++], std::forward<Args>(args)), ...);
-        }
     }
     else {
-        // Store dynamic string in string queue
-        static_assert(sizeof...(args) == 0, "Dynamic format strings are only supported when there are no arguments, to avoid dangling pointers.");
-        entry.format_ptr = "{}";
-        entry.arg_count = 1;
-        enqueue_argument(entry.args[0], format);
+        // Non-literal format strings are copied into the string queue so their
+        // lifetime extends until the writer thread consumes the entry.
+        static_assert(std::is_convertible_v<FormatT, std::string_view>,
+                      "Format string type must be a string literal or convertible to std::string_view.");
+        entry.format_ptr = store_string_in_queue(
+            std::string_view{std::forward<FormatT>(format)}).ptr;
+    }
+
+    if constexpr (is_single_format_args_v<Args...>) {
+        // Pre-built std::format_args: unpack values into the entry on the
+        // calling thread (format_args holds non-owning references).
+        enqueue_format_args(entry,
+            std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...)));
+    } else {
+        // Normal path: push individual arguments
+        entry.arg_count = sizeof...(args);
+        size_t arg_idx = 0;
+        static_assert(sizeof...(args) <= SLICK_LOGGER_MAX_ARGS, "Too many log arguments");
+        (enqueue_argument(entry.args[arg_idx++], std::forward<Args>(args)), ...);
     }
 
 
@@ -1600,8 +1601,9 @@ inline StringRef Logger::store_string_in_queue(std::string_view str) {
 
     char* dest = (*string_queue_)[start_index];
     if (length) {
-        // Copy string data
-        std::memcpy(dest, str.data(), len);
+        // Copy only the string payload, then terminate explicitly.
+        std::memcpy(dest, str.data(), length);
+        dest[length] = '\0';
     } 
     else {
         *dest = '\0';

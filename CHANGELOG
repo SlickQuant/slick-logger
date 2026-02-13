@@ -1,3 +1,10 @@
+# v1.0.6 - 02-13-2026
+- Fix logging through downstream `const char*` format bridge with `std::format_args`
+  - Dynamic (non-literal) format strings are now copied into the internal string queue so they remain valid across the async writer boundary
+  - Dynamic format strings now support arguments instead of requiring zero args
+- Fix string queue copy path to null-terminate using explicit payload length
+- Add regression test for `const char* + std::format_args` bridge logging
+
 # v1.0.5 - 02-10-2026
 - Add `std::format_args` support: pass a pre-built `std::format_args` object directly to any log call
   - Arguments are unpacked and copied into the log entry on the calling thread (safe across thread boundary)
