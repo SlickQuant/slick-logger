@@ -85,6 +85,17 @@ inline constexpr const char* to_string(LogLevel level) noexcept {
     }
 }
 
+inline LogLevel to_log_level(std::string_view level_str) {
+    if (level_str == "TRACE" || level_str == "trace") return LogLevel::L_TRACE;
+    if (level_str == "DEBUG" || level_str == "debug") return LogLevel::L_DEBUG;
+    if (level_str == "INFO" || level_str == "info")  return LogLevel::L_INFO;
+    if (level_str == "WARN" || level_str == "warn")  return LogLevel::L_WARN;
+    if (level_str == "ERROR" || level_str == "error") return LogLevel::L_ERROR;
+    if (level_str == "FATAL" || level_str == "fatal") return LogLevel::L_FATAL;
+    if (level_str == "OFF" || level_str == "off")   return LogLevel::L_OFF;
+    throw std::invalid_argument("Invalid log level string: " + std::string(level_str));
+}
+
 /**
  * @brief Class to format timestamps in various formats
  */

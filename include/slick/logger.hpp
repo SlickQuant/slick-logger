@@ -55,8 +55,8 @@
 
 #define SLICK_LOGGER_VERSION_MAJOR 1
 #define SLICK_LOGGER_VERSION_MINOR 0
-#define SLICK_LOGGER_VERSION_PATCH 6
-#define SLICK_LOGGER_VERSION "1.0.6"
+#define SLICK_LOGGER_VERSION_PATCH 7
+#define SLICK_LOGGER_VERSION "1.0.7"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20
@@ -85,6 +85,17 @@ inline constexpr const char* to_string(LogLevel level) noexcept {
         case LogLevel::L_OFF:   return "OFF";
         default:              return "UNKNOWN";
     }
+}
+
+inline LogLevel to_log_level(std::string_view level_str) {
+    if (level_str == "TRACE" || level_str == "trace") return LogLevel::L_TRACE;
+    if (level_str == "DEBUG" || level_str == "debug") return LogLevel::L_DEBUG;
+    if (level_str == "INFO" || level_str == "info")  return LogLevel::L_INFO;
+    if (level_str == "WARN" || level_str == "warn")  return LogLevel::L_WARN;
+    if (level_str == "ERROR" || level_str == "error") return LogLevel::L_ERROR;
+    if (level_str == "FATAL" || level_str == "fatal") return LogLevel::L_FATAL;
+    if (level_str == "OFF" || level_str == "off")   return LogLevel::L_OFF;
+    throw std::invalid_argument("Invalid log level string: " + std::string(level_str));
 }
 
 /**
