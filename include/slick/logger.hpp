@@ -1718,7 +1718,11 @@ inline void Logger::shutdown(bool clear_sinks) {
     }
     
     if (clear_sinks) {
-        // Clear sinks to release file handles and other resources
+        // Clear sinks to release file handles and other resources.
+        // sinkname_index_map_ holds string_view keys that point into the name
+        // strings owned by each sink object — it must be cleared first so no
+        // dangling views remain after the sink shared_ptrs are destroyed.
+        sinkname_index_map_.clear();
         sinks_.clear();
     }
     log_queue_.reset();
