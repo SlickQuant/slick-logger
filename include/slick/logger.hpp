@@ -55,8 +55,8 @@
 
 #define SLICK_LOGGER_VERSION_MAJOR 1
 #define SLICK_LOGGER_VERSION_MINOR 0
-#define SLICK_LOGGER_VERSION_PATCH 7
-#define SLICK_LOGGER_VERSION "1.0.7"
+#define SLICK_LOGGER_VERSION_PATCH 8
+#define SLICK_LOGGER_VERSION "1.0.8"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20
@@ -621,10 +621,41 @@ public:
     void shutdown(bool clear_sinks = true);
 
     /**
+     * @brief Block until all log entries queued before this call have been
+     * written to all sinks. The logger keeps running — unlike shutdown(),
+     * logging can continue normally after flush() returns.
+     *
+     * Primary use case: call flush() before unloading a shared library whose
+     * string literals are referenced by queued log entries. Because LOG_* with
+     * string literals stores a raw pointer into the caller's code segment,
+     * unloading the library while entries are still queued would leave dangling
+     * pointers that the writer thread would later dereference.
+     *
+     * Does nothing if the logger has not been initialized.
+     */
+    void flush();
+
+    /**
      * @brief Reset the logger to uninitialized state
      * Note: This is primarily for testing purposes. Use with caution.
      */
     void reset();
+
+    /**
+     * @brief Redirect Logger::instance() to an external Logger.
+     *
+     * Because slick-logger is header-only, every shared library (.dll/.so) and
+     * the host executable each compile in their own copy of Logger::instance().
+     * Call this from a shared library's init function to make all LOG_* macros
+     * in that library route to the host's logger instead of the library-local one.
+     * Pass nullptr to restore the library-local singleton.
+     *
+     * Thread-safety: uses atomic store/load with acquire-release ordering, so
+     * all initialization of the target logger is visible before any LOG_* call
+     * after set_instance() returns.
+     */
+    static void set_instance(Logger* logger) noexcept;
+    static void clear_instance_override() noexcept;
 
 private:
     Logger() = default;
@@ -658,6 +689,14 @@ private:
     uint64_t read_index_{0};
     std::atomic<LogLevel> log_level_{LogLevel::L_TRACE};
     std::unordered_map<std::string_view, int> sinkname_index_map_;
+
+    // The logger instance local to this shared library / executable.
+    // override_instance_ points here by default.
+    static Logger instance_;
+    // Points to the active Logger for this shared library / executable.
+    // Defaults to &instance_. Call set_instance() to redirect to an external
+    // logger (e.g. the host application's logger when loaded as a plugin).
+    static std::atomic<Logger*> override_instance_;
 };
 
 
@@ -1253,8 +1292,18 @@ inline std::string DailyFileSink::get_date_string() const {
 }
 
 inline Logger& Logger::instance() {
-    static Logger instance;
-    return instance;
+    return *override_instance_.load(std::memory_order_acquire);
+}
+
+inline Logger Logger::instance_;
+inline std::atomic<Logger*> Logger::override_instance_{&Logger::instance_};
+
+inline void Logger::set_instance(Logger* logger) noexcept {
+    override_instance_.store(logger, std::memory_order_release);
+}
+
+inline void Logger::clear_instance_override() noexcept {
+    override_instance_.store(&instance_, std::memory_order_release);
 }
 
 inline void Logger::init(const std::filesystem::path& log_file, size_t log_queue_size, size_t string_buffer_size) {
@@ -1678,6 +1727,19 @@ inline void Logger::shutdown(bool clear_sinks) {
 
 inline Logger::~Logger() {
     shutdown();
+}
+
+inline void Logger::flush() {
+    if (!running_.load(std::memory_order_relaxed) || !log_queue_) {
+        return;
+    }
+    // Snapshot the write cursor: any entry reserved before this point has
+    // already been assigned an index below drain_target.
+    const uint64_t drain_target = log_queue_->initial_reading_index();
+    // Wait until the writer thread's read cursor reaches drain_target.
+    while (running_.load(std::memory_order_relaxed) && read_index_ < drain_target) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 inline void Logger::reset() {

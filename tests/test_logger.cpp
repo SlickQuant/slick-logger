@@ -20,6 +20,8 @@ protected:
         std::filesystem::remove("test_empty_string.log");
         std::filesystem::remove("test_format_args.log");
         std::filesystem::remove("test_format_args_const_char.log");
+        std::filesystem::remove("test_set_instance_host.log");
+        std::filesystem::remove("test_set_instance_plugin.log");
     }
 };
 
@@ -427,6 +429,162 @@ TEST_F(SlickLoggerTest, FormatArgsConstCharBridgeLogging) {
     }
 
     EXPECT_NE(file_contents.find("bridge value=7 text=bridge"), std::string::npos);
+}
+
+// set_instance() makes Logger::instance() return the supplied logger.
+// clear_instance_override() restores the library-local logger.
+TEST_F(SlickLoggerTest, SetInstanceChangesActiveLogger) {
+    // Capture the default (library-local) logger pointer before any redirect.
+    slick::logger::Logger* local = &slick::logger::Logger::instance();
+
+    // Redirect to itself — pointer must still equal local.
+    slick::logger::Logger::set_instance(local);
+    EXPECT_EQ(&slick::logger::Logger::instance(), local);
+
+    // Redirect to nullptr — clear_instance_override restores local.
+    slick::logger::Logger::clear_instance_override();
+    EXPECT_EQ(&slick::logger::Logger::instance(), local);
+}
+
+// Simulates what a plugin/shared library's init function does:
+// redirect LOG_* calls to the host logger so messages appear in the host's
+// log file, not in a separate plugin-local log.
+//
+// In production the plugin and host are separate binaries, each with their
+// own Logger::instance_. Here we model it in one process: the "host" logger
+// is Logger::instance() (writing to host.log); the "plugin" temporarily adds
+// its own sink (plugin.log), then calls set_instance() to point away from it.
+TEST_F(SlickLoggerTest, SetInstanceRedirectsLogsToHostLogger) {
+    std::filesystem::remove("test_set_instance_host.log");
+    std::filesystem::remove("test_set_instance_plugin.log");
+
+    // --- Host setup: Logger::instance() writes to host.log ---
+    slick::logger::Logger::instance().add_file_sink("test_set_instance_host.log", "host_sink");
+    slick::logger::Logger::instance().init(1024);
+
+    // --- Plugin setup: same instance gets a second sink (plugin.log) ---
+    // In a real scenario this would be the plugin's own Logger::instance_,
+    // but since we can't construct a Logger directly, we reuse the same object
+    // and differentiate by adding a dedicated plugin sink.
+    auto plugin_sink = std::make_shared<slick::logger::FileSink>("test_set_instance_plugin.log", "plugin_sink");
+    plugin_sink->set_dedicated(true); // dedicated: only receives direct writes, not LOG_* broadcasts
+    slick::logger::Logger::instance().add_sink(plugin_sink);
+
+    // --- Simulate plugin redirect: set_instance points to the host logger ---
+    // After this, LOG_* goes to host.log. plugin.log only receives direct writes.
+    slick::logger::Logger::set_instance(&slick::logger::Logger::instance());
+
+    LOG_INFO("plugin message one");
+    LOG_WARN("plugin message two");
+
+    // Write directly to plugin sink to confirm it is still alive (dedicated path).
+    plugin_sink->log_info("direct to plugin sink");
+
+    slick::logger::Logger::clear_instance_override();
+    slick::logger::Logger::instance().shutdown();
+
+    // host.log must contain the two LOG_* messages.
+    ASSERT_TRUE(std::filesystem::exists("test_set_instance_host.log"));
+    std::ifstream host_file("test_set_instance_host.log");
+    std::string host_contents, line;
+    std::getline(host_file, line); // version line
+    while (std::getline(host_file, line))
+        host_contents += line + "\n";
+
+    EXPECT_NE(host_contents.find("plugin message one"), std::string::npos);
+    EXPECT_NE(host_contents.find("plugin message two"), std::string::npos);
+
+    // plugin.log must contain only the directly-written message.
+    ASSERT_TRUE(std::filesystem::exists("test_set_instance_plugin.log"));
+    std::ifstream plugin_file("test_set_instance_plugin.log");
+    std::string plugin_contents;
+    while (std::getline(plugin_file, line))
+        plugin_contents += line + "\n";
+
+    EXPECT_NE(plugin_contents.find("direct to plugin sink"), std::string::npos);
+    // Broadcast LOG_* messages must NOT appear in plugin.log (dedicated sink ignores them).
+    EXPECT_EQ(plugin_contents.find("plugin message one"), std::string::npos);
+    EXPECT_EQ(plugin_contents.find("plugin message two"), std::string::npos);
+}
+
+// After clear_instance_override(), LOG_* calls return to the library-local
+// logger. Messages logged before and after the redirect go to different sinks.
+TEST_F(SlickLoggerTest, ClearInstanceOverrideRestoresLocalLogger) {
+    std::filesystem::remove("test_set_instance_host.log");
+    std::filesystem::remove("test_set_instance_plugin.log");
+
+    // "Host" file sink added to the local instance.
+    slick::logger::Logger::instance().add_file_sink("test_set_instance_host.log", "host_sink");
+
+    // "Plugin-local" dedicated sink — receives only direct writes, not LOG_*.
+    auto plugin_sink = std::make_shared<slick::logger::FileSink>("test_set_instance_plugin.log", "plugin_sink");
+    plugin_sink->set_dedicated(true);
+    slick::logger::Logger::instance().add_sink(plugin_sink);
+
+    slick::logger::Logger::instance().init(1024);
+
+    // Redirect to the same logger (host), log one message, then restore.
+    slick::logger::Logger::set_instance(&slick::logger::Logger::instance());
+    LOG_INFO("while redirected");
+    slick::logger::Logger::clear_instance_override();
+    LOG_INFO("after restore");
+
+    slick::logger::Logger::instance().shutdown();
+
+    // host.log must contain both messages (both went through the same instance).
+    std::ifstream host_file("test_set_instance_host.log");
+    std::string host_contents, line;
+    std::getline(host_file, line); // version line
+    while (std::getline(host_file, line))
+        host_contents += line + "\n";
+
+    EXPECT_NE(host_contents.find("while redirected"), std::string::npos);
+    EXPECT_NE(host_contents.find("after restore"),    std::string::npos);
+
+    // plugin.log must be empty (dedicated sink never received LOG_* broadcasts).
+    std::ifstream plugin_file("test_set_instance_plugin.log");
+    std::string plugin_contents;
+    while (std::getline(plugin_file, line))
+        plugin_contents += line + "\n";
+
+    EXPECT_EQ(plugin_contents.find("while redirected"), std::string::npos);
+    EXPECT_EQ(plugin_contents.find("after restore"),    std::string::npos);
+}
+
+// Simulates two plugin threads both routing LOG_* through the same host logger
+// concurrently after set_instance().
+TEST_F(SlickLoggerTest, MultipleProducersAfterSetInstance) {
+    std::filesystem::remove("test_set_instance_host.log");
+
+    slick::logger::Logger::instance().add_file_sink("test_set_instance_host.log");
+    slick::logger::Logger::instance().init(1024);
+
+    slick::logger::Logger::set_instance(&slick::logger::Logger::instance());
+
+    std::thread t1([]() {
+        for (int i = 0; i < 5; ++i)
+            LOG_INFO("plugin-thread-1: {}", i);
+    });
+    std::thread t2([]() {
+        for (int i = 0; i < 5; ++i)
+            LOG_INFO("plugin-thread-2: {}", i);
+    });
+
+    t1.join();
+    t2.join();
+
+    slick::logger::Logger::clear_instance_override();
+    slick::logger::Logger::instance().shutdown();
+
+    // All 10 messages plus the version line must be present.
+    ASSERT_TRUE(std::filesystem::exists("test_set_instance_host.log"));
+    std::ifstream host_file("test_set_instance_host.log");
+    std::string line;
+    int count = 0;
+    while (std::getline(host_file, line))
+        ++count;
+
+    EXPECT_EQ(count, 11); // 10 messages + 1 version line
 }
 
 int main(int argc, char **argv) {

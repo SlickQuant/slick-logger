@@ -365,6 +365,56 @@ int main() {
 }
 ```
 
+### Sharing the Logger Across Shared Libraries (Plugin / Strategy Pattern)
+
+Because slick-logger is header-only, each binary (EXE or `.dll`/`.so`) that includes `logger.hpp` gets its own `Logger` instance. This means `LOG_*` calls inside a dynamically-loaded plugin will not appear in the host application's log file by default.
+
+Use `Logger::set_instance()` to redirect a plugin's `LOG_*` calls to the host's logger:
+
+**Host application** — pass its logger to the plugin after loading:
+
+```cpp
+// host/main.cpp
+#include <slick/logger.hpp>
+
+// Platform-specific shared library loading omitted for brevity (LoadLibrary on Windows, dlopen on Linux)
+using StrategyInitFn = void(*)(slick::logger::Logger&);
+
+void load_strategy(void* handle) {
+    auto* init_fn = reinterpret_cast<StrategyInitFn>(get_symbol(handle, "strategy_init"));
+    if (init_fn) {
+        // Redirect the plugin's LOG_* macros to this process's logger
+        init_fn(slick::logger::Logger::instance());
+    }
+}
+```
+
+**Plugin / strategy shared library** — expose a C-linkage init function:
+
+```cpp
+// strategy/strategy.cpp
+#include <slick/logger.hpp>
+
+extern "C" void strategy_init(slick::logger::Logger& framework_logger) {
+    // All LOG_* calls in this shared library now route to the host's logger
+    slick::logger::Logger::set_instance(&framework_logger);
+    LOG_INFO("Strategy loaded — logger connected to framework");
+}
+
+extern "C" void strategy_shutdown() {
+    // Optional: restore this library's own local logger on unload
+    slick::logger::Logger::clear_instance_override();
+}
+```
+
+> **Why `extern "C"`?** C linkage prevents name-mangling differences between compilers, ensuring `get_symbol`/`GetProcAddress`/`dlsym` can reliably locate the function.
+
+> **Thread-safety:** `set_instance()` uses `std::atomic` with acquire-release ordering. Call it once during plugin initialization, before any logging threads in the plugin start.
+
+> **Unload ordering — important:** `LOG_*` with string literals stores a raw pointer to the format string, which lives in the plugin's code segment. The host must call `Logger::instance().flush()` **before** calling `FreeLibrary`/`dlclose`. `flush()` blocks until the writer thread has consumed all queued entries, then returns with the logger still running so host logging can continue normally. Using `shutdown()` instead would stop the logger entirely.
+
+> **Multiple plugins:** Each shared library (`.dll`/`.so`) holds its own copy of `override_instance_`. All plugins can independently call `set_instance()` with the same host logger — the host logger's lock-free queue is designed for concurrent producers.
+
 ## Sink Types
 
 ### ConsoleSink
