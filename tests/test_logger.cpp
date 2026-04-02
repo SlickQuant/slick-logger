@@ -8,6 +8,12 @@
 class SlickLoggerTest : public ::testing::Test {
 protected:
     void TearDown() override {
+        // Ensure the logger is fully stopped and reset between tests so that
+        // sinks (and the string_view keys in sinkname_index_map_ that point
+        // into their name strings) are destroyed before the next test starts.
+        slick::logger::Logger::instance().shutdown();
+        slick::logger::Logger::instance().reset();
+
         // Clean up all test log files
         std::filesystem::remove("test.log");
         std::filesystem::remove("test_mt.log");
