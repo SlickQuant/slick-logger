@@ -594,6 +594,17 @@ public:
     }
 
     /**
+     * @brief Fast-path level check for LOG_* macros
+     * @param level LogLevel being tested
+     * @return true if the logger is running and accepts the level
+     */
+    bool should_log(LogLevel level) const noexcept {
+        return running_.load(std::memory_order_relaxed)
+            && log_queue_
+            && level >= log_level_.load(std::memory_order_relaxed);
+    }
+
+    /**
      * @brief Log a message with a specific log level and format
      * @param level LogLevel of the message
      * @param format Format string (printf-style)
@@ -1826,9 +1837,17 @@ inline size_t Logger::round_up_to_power_of_2(size_t value) noexcept {
 } // namespace slick::logger
 
 // Macros for easy logging
-#define LOG_TRACE(...) slick::logger::Logger::instance().log(slick::logger::LogLevel::L_TRACE, __VA_ARGS__)
-#define LOG_DEBUG(...) slick::logger::Logger::instance().log(slick::logger::LogLevel::L_DEBUG, __VA_ARGS__)
-#define LOG_INFO(...) slick::logger::Logger::instance().log(slick::logger::LogLevel::L_INFO, __VA_ARGS__)
-#define LOG_WARN(...) slick::logger::Logger::instance().log(slick::logger::LogLevel::L_WARN, __VA_ARGS__)
-#define LOG_ERROR(...) slick::logger::Logger::instance().log(slick::logger::LogLevel::L_ERROR, __VA_ARGS__)
-#define LOG_FATAL(...) slick::logger::Logger::instance().log(slick::logger::LogLevel::L_FATAL, __VA_ARGS__)
+#define SLICK_LOGGER_LOG_IF_ENABLED(level, ...)                  \
+    do {                                                         \
+        auto& slick_logger_instance__ = slick::logger::Logger::instance(); \
+        if (slick_logger_instance__.should_log(level)) {         \
+            slick_logger_instance__.log(level, __VA_ARGS__);     \
+        }                                                        \
+    } while (false)
+
+#define LOG_TRACE(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_TRACE, __VA_ARGS__)
+#define LOG_DEBUG(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_DEBUG, __VA_ARGS__)
+#define LOG_INFO(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_INFO, __VA_ARGS__)
+#define LOG_WARN(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_WARN, __VA_ARGS__)
+#define LOG_ERROR(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_ERROR, __VA_ARGS__)
+#define LOG_FATAL(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_FATAL, __VA_ARGS__)

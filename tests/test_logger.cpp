@@ -88,6 +88,34 @@ TEST_F(SlickLoggerTest, LogFilter) {
     EXPECT_TRUE(line.find("This is fatal") != std::string::npos);
 }
 
+TEST_F(SlickLoggerTest, DisabledMacrosDoNotEvaluateArguments) {
+    std::filesystem::remove("test.log");
+
+    slick::logger::Logger::instance().init("test.log", 1024);
+    slick::logger::Logger::instance().set_level(slick::logger::LogLevel::L_INFO);
+
+    int evaluation_count = 0;
+    auto expensive_message = [&]() -> std::string {
+        ++evaluation_count;
+        return std::format("other format can't avoid {}", "YEAH");
+    };
+
+    LOG_DEBUG("Some format {}", expensive_message());
+    LOG_TRACE("Some format {}", expensive_message());
+    LOG_INFO("Some format {}", expensive_message());
+
+    slick::logger::Logger::instance().shutdown();
+
+    EXPECT_EQ(evaluation_count, 1);
+
+    std::ifstream log_file("test.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    std::getline(log_file, line);
+    EXPECT_TRUE(line.find("Some format other format can't avoid YEAH") != std::string::npos);
+    EXPECT_FALSE(std::getline(log_file, line));
+}
+
 TEST_F(SlickLoggerTest, MultiThreadedLogging) {
     std::filesystem::remove("test_mt.log");
 

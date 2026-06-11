@@ -1,3 +1,9 @@
+# v1.0.9 - 06-11-2026
+- Avoid evaluating `LOG_*` arguments when the message level is disabled
+  - Move the level gate to the macro boundary so expensive arguments are skipped before `Logger::log(...)` is called
+  - Add `Logger::should_log()` as a fast-path runtime check used by the macros
+  - Add regression test coverage to verify disabled `LOG_DEBUG` and `LOG_TRACE` calls do not evaluate their arguments
+
 # v1.0.8 - 04-02-2026
 - Add cross-DSO logger instance sharing via `Logger::set_instance()` and `Logger::clear_instance_override()`
   - Enables plugin/shared-library architectures where dynamically-loaded modules should route `LOG_*` calls to the host application's logger
