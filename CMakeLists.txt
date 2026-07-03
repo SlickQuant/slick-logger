@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(slick-logger
-    VERSION 1.0.9
+    VERSION 1.1.0
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -21,6 +21,8 @@ if (NOT slick-queue_FOUND)
         GIT_TAG v1.2.2
     )
     FetchContent_MakeAvailable(slick-queue)
+else()
+    message(STATUS "Found slick-queue ${slick-queue_VERSION}: ${slick-queue_DIR}")
 endif()
 
 set(WARNING_MESSAGE "// ********** THIS FILE IS AUTO-GENERATED FROM src/logger.hpp **********
@@ -47,11 +49,16 @@ add_library(slick::logger ALIAS slick-logger)
 add_library(slick_logger ALIAS slick-logger)
 add_library(slick::slick_logger ALIAS slick-logger)
 
-target_include_directories(slick-logger INTERFACE 
+option(SLICK_LOGGER_ENABLE_SOURCE_LOCATION "Enable LOG_* macro source-location capture" ON)
+
+target_include_directories(slick-logger INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 set_target_properties(slick-logger PROPERTIES EXPORT_NAME logger)
+if(NOT SLICK_LOGGER_ENABLE_SOURCE_LOCATION)
+    target_compile_definitions(slick-logger INTERFACE SLICK_LOGGER_ENABLE_SOURCE_LOCATION=0)
+endif()
 target_link_libraries(slick-logger INTERFACE slick::queue)
 
 if (MSVC)

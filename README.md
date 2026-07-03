@@ -7,15 +7,20 @@
 [![CI](https://github.com/SlickQuant/slick-logger/actions/workflows/ci.yml/badge.svg)](https://github.com/SlickQuant/slick-logger/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/SlickQuant/slick-logger)](https://github.com/SlickQuant/slick-logger/releases)
 
-A high-performance, cross-platform **header-only** logging library for C++20 using a multi-producer, multi-consumer ring buffer with **multi-sink support** and **log rotation** capabilities.
+A high-performance, cross-platform **header-only** logging library for C++20 using a multi-producer, multi-consumer ring buffer with **multi-sink support**, **source-location logging**, and **log rotation** capabilities.
 
 ## Features
 
-- **High Performance**: Asynchronous logging using slick_queue ring buffer for minimal latency
-- **Modern Formatting**: Uses C++20 `std::format` for type-safe, efficient string formatting
+- **High Performance**: Asynchronous logging using the slick-queue ring buffer for minimal latency
+- **Modern Formatting**: Uses C++20 `std::format` for type-aware, efficient string formatting
 - **Multi-Sink Architecture**: Log to multiple destinations simultaneously (console, files, custom sinks)
 - **Log Rotation**: Size-based and time-based rotation with configurable retention
 - **Colored Console Output**: ANSI color support with configurable error routing
+- **Source Locations by Default**: `LOG_*` macros include the call-site file and line, with runtime controls for basename vs full path
+- **Runtime Configuration**: Configure sinks, queue sizes, log level, source-location output, and timestamp formats
+- **Macro Fast Path**: Disabled log levels skip argument evaluation before queueing
+- **Direct Sink Logging**: Route messages to a named sink or a sink reference when a message should not be broadcast
+- **Shared-Library Redirection**: Route plugin or strategy-library logs into a host application's logger
 - **Header-Only**: No linking required - just include and use
 - **Cross-Platform**: Supports Windows, Linux, and macOS
 - **Multi-Threaded**: Safe for concurrent logging from multiple threads
@@ -26,7 +31,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 
 - **C++20 compatible compiler** with `std::format` support (GCC 11+, Clang 14+, MSVC 19.29+)
 - CMake 3.20 or higher (for building examples/tests)
-- Internet connection for downloading slick_queue header
+- Internet connection for downloading the slick-queue header when it is not already installed
 
 ## Installation
 
@@ -50,7 +55,7 @@ your_project/
 
 ### Option 2: CMake Integration (Recommended)
 
-CMake automatically handles the slick_queue dependency for you.
+CMake automatically handles the slick-queue dependency for you.
 
 #### Using FetchContent (Recommended)
 ```cmake
@@ -66,6 +71,9 @@ include(FetchContent)
 set(BUILD_SLICK_LOGGER_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_SLICK_LOGGER_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_SLICK_LOGGER_BENCHMARKS OFF CACHE BOOL "" FORCE)
+
+# Optional: disable LOG_* macro source-location capture at compile time
+set(SLICK_LOGGER_ENABLE_SOURCE_LOCATION OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     slick-logger
@@ -88,6 +96,9 @@ project(your_project)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Optional: also accepts -DSLICK_LOGGER_ENABLE_SOURCE_LOCATION=OFF on the CMake command line
+set(SLICK_LOGGER_ENABLE_SOURCE_LOCATION OFF CACHE BOOL "" FORCE)
 
 find_package(slick-logger REQUIRED)
 
@@ -133,9 +144,128 @@ int main() {
 }
 ```
 
+By default, each `LOG_*` macro entry includes the macro call-site file name and line number:
+
+```text
+2026-07-01 12:34:56.123456 [INFO] [main.cpp:8] Application started
+```
+
+### Log Macros and Levels
+
+Use the level-specific macros for normal application logging:
+
+```cpp
+LOG_TRACE("order book depth={}", depth);
+LOG_DEBUG("request id={}", request_id);
+LOG_INFO("connected to {}", endpoint);
+LOG_WARN("retrying after {} ms", delay_ms);
+LOG_ERROR("request failed: {}", reason);
+LOG_FATAL("unrecoverable error: {}", reason);
+```
+
+The macros use the singleton logger and are filtered before arguments are evaluated. If the current global level rejects a message, expensive arguments in that log call are not computed.
+
+```cpp
+using namespace slick::logger;
+
+Logger::instance().set_level(LogLevel::L_WARN);
+
+LOG_DEBUG("expensive value: {}", build_expensive_debug_value()); // not evaluated
+LOG_WARN("visible warning");
+
+auto current_level = Logger::instance().get_level();
+```
+
+The available levels are `L_TRACE`, `L_DEBUG`, `L_INFO`, `L_WARN`, `L_ERROR`, `L_FATAL`, and `L_OFF`. A log call supports up to `SLICK_LOGGER_MAX_ARGS` format arguments; define that macro before including `slick/logger.hpp` if you need a different limit.
+
+### Source Location Logging
+
+Source-location logging is enabled by default for `LOG_*` macros. The default output uses only the basename, while full-path output can be enabled at runtime:
+
+```cpp
+#include <slick/logger.hpp>
+
+int main() {
+    using namespace slick::logger;
+
+    Logger::instance().init("app.log");
+
+    LOG_INFO("uses basename by default"); // [main.cpp:8]
+
+    Logger::instance().set_source_location_full_path_enabled(true);
+    LOG_INFO("uses the full SLICK_LOGGER_FILE_PATH value"); // [C:\repo\app\main.cpp:11]
+
+    Logger::instance().set_source_location_enabled(false);
+    LOG_INFO("source location omitted");
+
+    Logger::instance().shutdown();
+}
+```
+
+You can configure the same behavior during initialization:
+
+```cpp
+using namespace slick::logger;
+
+LogConfig config;
+config.sinks.push_back(std::make_shared<FileSink>("app.log"));
+config.include_source_location = true;             // default
+config.include_source_location_full_path = false;  // default: basename only
+
+Logger::instance().init(config);
+```
+
+Compile-time controls must be defined before including `slick/logger.hpp`:
+
+When you use CMake with `FetchContent`, `add_subdirectory`, or `find_package`, disable `LOG_*` macro source-location capture through the `slick::logger` target with:
+
+```bash
+cmake -S . -B build -DSLICK_LOGGER_ENABLE_SOURCE_LOCATION=OFF
+```
+
+For a single target, you can also set the compile definition directly:
+
+```cmake
+target_compile_definitions(your_app PRIVATE SLICK_LOGGER_ENABLE_SOURCE_LOCATION=0)
+```
+
+```cpp
+// Disable source-location capture in LOG_* macros entirely.
+#define SLICK_LOGGER_ENABLE_SOURCE_LOCATION 0
+#include <slick/logger.hpp>
+```
+
+```cpp
+// Override the compile-time source path expression captured by LOG_* macros.
+// Full-path runtime output can only show what this macro provides.
+#define SLICK_LOGGER_FILE_PATH __FILE__
+#include <slick/logger.hpp>
+```
+
+For bridge code that receives source information from another logging layer, direct source-location overloads are also available. The `const char*` source path/name passed to these public overloads is copied before the entry is queued, so dynamic strings are safe:
+
+```cpp
+std::string path = "C:\\repo\\app\\bridge.cpp";
+slick::logger::Logger::instance().log_with_location(
+    slick::logger::LogLevel::L_INFO,
+    path.c_str(),
+    42,
+    "bridged message");
+
+std::string basename = "bridge.cpp";
+slick::logger::Logger::instance().log_with_location(
+    slick::logger::LogLevel::L_WARN,
+    path.c_str(),
+    basename.c_str(),
+    43,
+    "bridged message with precomputed basename");
+```
+
+Direct sink helpers such as `sink->log_info(...)` route to that sink only and do not automatically attach the caller's source location. Use `LOG_*` macros when you want automatic call-site capture.
+
 ### String Formatting with std::format
 
-slick-logger uses C++20's `std::format` for type-safe and efficient string formatting:
+slick-logger uses C++20's `std::format` for type-aware and efficient string formatting:
 
 ```cpp
 #include <slick/logger.hpp>
@@ -175,7 +305,7 @@ int main() {
 ```
 
 **Benefits of std::format:**
-- **Type Safety**: Compile-time checking of format strings and arguments
+- **Type-Aware Formatting**: Standard C++ formatting for strings, numbers, pointers, chrono values, and custom formatter-enabled types
 - **Performance**: Highly optimized formatting implementation
 - **Rich Formatting**: Support for width, precision, alignment, and custom formatters
 - **Extensible**: Easy to add custom formatters for user-defined types
@@ -273,6 +403,12 @@ int main() {
         debug_sink->log_warn("Warning only in debug.log");
     }
 
+    // You can also look up the first sink of a concrete type
+    auto first_file_sink = Logger::instance().get_sink<FileSink>();
+    if (first_file_sink) {
+        first_file_sink->log_info("Message routed to the first FileSink");
+    }
+
     Logger::instance().shutdown();
     return 0;
 }
@@ -300,7 +436,10 @@ int main() {
     Logger::instance().add_file_sink("regular.log", "regular");
 
     // Create a dedicated sink (only receives direct messages)
-    auto dedicated_sink = std::make_shared<FileSink>("dedicated.log", "dedicated");
+    auto dedicated_sink = std::make_shared<FileSink>(
+        "dedicated.log",
+        TimestampFormatter::Format::WITH_MICROSECONDS,
+        "dedicated");
     dedicated_sink->set_dedicated(true);  // Mark as dedicated
     Logger::instance().add_sink(dedicated_sink);
 
@@ -350,10 +489,13 @@ int main() {
     config.sinks.push_back(std::make_shared<RotatingFileSink>("errors.log", rotation));
     
     // Add daily log files
-    config.sinks.push_back(std::make_shared<DailyFileSink>("daily.log"));
+    config.sinks.push_back(std::make_shared<DailyFileSink>("daily.log", RotationConfig{}));
     
-    config.min_level = LogLevel::INFO;
-    config.queue_size = 16384;
+    config.min_level = LogLevel::L_INFO;
+    config.log_queue_size = 16384;
+    config.string_buffer_size = 4 * 1024 * 1024;
+    config.include_source_location = true;
+    config.include_source_location_full_path = false;
     
     Logger::instance().init(config);
     
@@ -364,6 +506,67 @@ int main() {
     return 0;
 }
 ```
+
+`LogConfig` fields:
+
+- `sinks`: console, file, rotating file, daily file, or custom sinks
+- `min_level`: global minimum level, default `LogLevel::L_TRACE`
+- `log_queue_size`: internal log-entry queue size, rounded up to a power of two
+- `string_buffer_size`: internal string-storage queue size, rounded up to a power of two
+- `include_source_location`: include file and line for `LOG_*` macro calls, default `true`
+- `include_source_location_full_path`: use the full captured path instead of the basename, default `false`
+
+### Lifecycle and Runtime Controls
+
+```cpp
+using namespace slick::logger;
+
+Logger::instance().init("app.log", 65536, 4 * 1024 * 1024);
+
+Logger::instance().set_level(LogLevel::L_DEBUG);
+Logger::instance().set_source_location_enabled(true);
+Logger::instance().set_source_location_full_path_enabled(false);
+
+LOG_INFO("queued asynchronously");
+
+Logger::instance().flush();          // wait until entries queued so far are written
+Logger::instance().shutdown();       // flush and stop the writer thread
+```
+
+Useful controls:
+
+- `init(path, log_queue_size, string_buffer_size)`: create a default file sink and start logging
+- `init(config)`: initialize from `LogConfig`
+- `init(queue_size, string_buffer_size)`: start with sinks that were already added
+- `flush()`: wait for queued entries to be written while keeping the logger running
+- `shutdown(clear_sinks = true)`: flush, stop the writer thread, and optionally clear sinks
+- `reset()`: return the singleton to an uninitialized state; mainly intended for tests
+- `set_level()` / `get_level()`: update or read the global level filter
+- `clear_sinks()`: remove all currently registered sinks before reconfiguration
+
+### Timestamp Formatting
+
+Every built-in sink supports the default microsecond timestamp format, a predefined timestamp format enum, or a custom `strftime`-style format string:
+
+```cpp
+using namespace slick::logger;
+
+Logger::instance().clear_sinks();
+RotationConfig rotation;
+Logger::instance().add_console_sink(TimestampFormatter::Format::ISO8601);
+Logger::instance().add_file_sink("milliseconds.log", TimestampFormatter::Format::WITH_MILLISECONDS);
+Logger::instance().add_rotating_file_sink("custom.log", rotation, "%Y-%m-%d %H:%M:%S");
+Logger::instance().init();
+```
+
+Available predefined formats:
+
+- `TimestampFormatter::Format::WITH_MICROSECONDS` (default)
+- `TimestampFormatter::Format::WITH_MILLISECONDS`
+- `TimestampFormatter::Format::DEFAULT`
+- `TimestampFormatter::Format::ISO8601`
+- `TimestampFormatter::Format::TIME_ONLY`
+- `TimestampFormatter::Format::CUSTOM`
 
 ### Sharing the Logger Across Shared Libraries (Plugin / Strategy Pattern)
 
@@ -459,12 +662,12 @@ config.rotation_hour = std::chrono::hours(0); // midnight for daily rotation
 - **DEBUG**: General debug information  
 - **INFO**: Informational messages
 - **WARN**: Warning messages
-- **ERR**: Error messages (internally named ERR to avoid Windows macro conflicts)
+- **ERROR**: Error messages
 - **FATAL**: Fatal error messages
 
 ## Architecture
 
-The logger uses a **multi-producer, single-consumer** ring buffer (slick_queue) with a **multi-sink architecture**:
+The logger uses a **multi-producer, single-consumer** ring buffer (slick-queue) with a **multi-sink architecture**:
 
 ```
 [Thread 1] ──┐
@@ -485,9 +688,9 @@ The logger uses a **multi-producer, single-consumer** ring buffer (slick_queue) 
 
 For optimal performance, the logger defers string formatting to the background thread:
 
-1. **Caller Thread**: Captures format string and arguments in a lambda (fast)
-2. **Lock-Free Queue**: Stores the lambda in the ring buffer (minimal latency)
-3. **Writer Thread**: Executes lambda to format string and writes to all sinks
+1. **Caller Thread**: Captures the format pointer, source location, and owned copies of any dynamic string data
+2. **Lock-Free Queue**: Stores a compact `LogEntry` in the ring buffer with minimal caller-side work
+3. **Writer Thread**: Formats the message and writes it to all matching sinks
 
 This approach moves potentially expensive formatting and I/O operations off the critical path, making logging calls extremely fast and suitable for high-frequency logging scenarios.
 
@@ -500,7 +703,7 @@ This approach moves potentially expensive formatting and I/O operations off the 
 
 ## Integration
 
-slick_queue is downloaded automatically during the build process from https://github.com/SlickQuant/slick_queue.
+slick-queue is downloaded automatically during the build process from https://github.com/SlickQuant/slick-queue.
 
 ## Header-Only Benefits
 
@@ -510,7 +713,7 @@ Being a header-only library provides several advantages:
 - **Easy Integration**: Just include the headers in your project
 - **Template Optimization**: Compiler can better optimize template instantiations
 - **No Binary Dependencies**: No need to distribute or manage .lib/.a files
-- **Immediate Usage**: Start logging with just two `#include` statements
+- **Immediate Usage**: Start logging with a single `#include <slick/logger.hpp>`
 
 ## Custom Sinks
 
@@ -554,6 +757,7 @@ The repository includes comprehensive examples:
 
 - **`logger_example.exe`**: Basic usage with console + file output
 - **`multi_sink_example.exe`**: Demonstrates all sink types, rotation, and custom sinks
+- **`timestamp_example.exe`**: Demonstrates predefined and custom timestamp formats
 
 ## Building Examples/Tests  
 
@@ -568,8 +772,11 @@ cmake --build . --config Debug
 # Run examples
 ./examples/Debug/logger_example.exe
 ./examples/Debug/multi_sink_example.exe
+./examples/Debug/timestamp_example.exe
 
 # Run tests  
-./tests/Debug/slick_logger_tests.exe         # Original tests
-./tests/Debug/slick_logger_sink_tests.exe    # Multi-sink tests
+./tests/Debug/slick_logger_tests.exe
+./tests/Debug/slick_logger_sink_tests.exe
+./tests/Debug/slick_logger_timestamp_tests.exe
+./tests/Debug/slick_logger_shared_lib_tests.exe
 ```

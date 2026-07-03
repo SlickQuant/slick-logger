@@ -27,6 +27,7 @@
 
 using PluginInitFn     = void(*)(slick::logger::Logger*);
 using PluginLogFn      = void(*)();
+using PluginLocationProbeFn = int(*)();
 using PluginShutdownFn = void(*)();
 
 static std::string read_log(const std::filesystem::path& path) {
@@ -62,15 +63,18 @@ TEST_F(SharedLibraryTest, PluginLogsRouteToHostLogger) {
 
     auto plugin_init     = reinterpret_cast<PluginInitFn>    (get_sym(handle, "plugin_init"));
     auto plugin_log      = reinterpret_cast<PluginLogFn>     (get_sym(handle, "plugin_log_messages"));
+    auto plugin_probe    = reinterpret_cast<PluginLocationProbeFn>(get_sym(handle, "plugin_log_location_probe"));
     auto plugin_shutdown = reinterpret_cast<PluginShutdownFn>(get_sym(handle, "plugin_shutdown"));
 
     ASSERT_NE(plugin_init,     nullptr) << "plugin_init not found";
     ASSERT_NE(plugin_log,      nullptr) << "plugin_log_messages not found";
+    ASSERT_NE(plugin_probe,    nullptr) << "plugin_log_location_probe not found";
     ASSERT_NE(plugin_shutdown, nullptr) << "plugin_shutdown not found";
 
     // --- Simulate plugin lifecycle ---
     plugin_init(&slick::logger::Logger::instance());
     plugin_log();
+    const int plugin_probe_line = plugin_probe();
     plugin_shutdown();
 
     // Drain the host logger's queue BEFORE unloading the plugin.
@@ -92,6 +96,8 @@ TEST_F(SharedLibraryTest, PluginLogsRouteToHostLogger) {
     EXPECT_NE(contents.find("plugin info message"),   std::string::npos);
     EXPECT_NE(contents.find("plugin warn message"),   std::string::npos);
     EXPECT_NE(contents.find("plugin error message"),  std::string::npos);
+    EXPECT_NE(contents.find("plugin source location probe"), std::string::npos);
+    EXPECT_NE(contents.find("plugin.cpp:" + std::to_string(plugin_probe_line)), std::string::npos);
 }
 
 // After plugin_shutdown() clears the override, further LOG_* calls from the

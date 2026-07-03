@@ -47,6 +47,7 @@ if(BUILD_SLICK_LOGGER_TESTING)
     # where to find the .dll/.so without relying on PATH/LD_LIBRARY_PATH.
     add_executable(slick_logger_shared_lib_tests test_shared_library.cpp)
     target_link_libraries(slick_logger_shared_lib_tests PRIVATE slick::logger GTest::gtest_main)
+    add_dependencies(slick_logger_shared_lib_tests slick_logger_test_plugin)
     target_compile_definitions(slick_logger_shared_lib_tests PRIVATE
         PLUGIN_LIB_PATH="$<TARGET_FILE:slick_logger_test_plugin>"
     )

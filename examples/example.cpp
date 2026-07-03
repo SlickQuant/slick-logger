@@ -23,6 +23,7 @@ int main() {
     int age = 30;
     double balance = 1234.56;
     LOG_INFO("User {} is {} years old with balance ${:.2f}", user, age, balance);
+    LOG_DEBUG("User {} has {} new messages", user, "5");
 
     // Simulate multi-threaded logging
     std::thread t1([]() {

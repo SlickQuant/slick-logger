@@ -26,6 +26,11 @@ protected:
         std::filesystem::remove("test_empty_string.log");
         std::filesystem::remove("test_format_args.log");
         std::filesystem::remove("test_format_args_const_char.log");
+        std::filesystem::remove("test_source_location.log");
+        std::filesystem::remove("test_source_location_disabled.log");
+        std::filesystem::remove("test_source_location_config.log");
+        std::filesystem::remove("test_source_location_full_path.log");
+        std::filesystem::remove("test_source_location_full_path_config.log");
         std::filesystem::remove("test_set_instance_host.log");
         std::filesystem::remove("test_set_instance_plugin.log");
     }
@@ -114,6 +119,224 @@ TEST_F(SlickLoggerTest, DisabledMacrosDoNotEvaluateArguments) {
     std::getline(log_file, line);
     EXPECT_TRUE(line.find("Some format other format can't avoid YEAH") != std::string::npos);
     EXPECT_FALSE(std::getline(log_file, line));
+}
+
+TEST_F(SlickLoggerTest, MacrosIncludeCallSiteSourceLocationByDefault) {
+    std::filesystem::remove("test_source_location.log");
+
+    EXPECT_STREQ(slick::logger::source_location_file_name(
+        "C:\\repo\\slick-logger\\tests\\test_logger.cpp"), "test_logger.cpp");
+    EXPECT_STREQ(slick::logger::source_location_file_name(
+        "/repo/slick-logger/tests/test_logger.cpp"), "test_logger.cpp");
+
+    slick::logger::Logger::instance().init("test_source_location.log", 1024);
+
+    const int expected_line = __LINE__ + 1;
+    LOG_INFO("Source location message");
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_source_location.log"));
+
+    std::ifstream log_file("test_source_location.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    ASSERT_TRUE(std::getline(log_file, line));
+    EXPECT_NE(line.find("test_logger.cpp:" + std::to_string(expected_line)), std::string::npos);
+    EXPECT_NE(line.find("Source location message"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, SourceLocationCanBeDisabledAtRuntime) {
+    std::filesystem::remove("test_source_location_disabled.log");
+
+    slick::logger::Logger::instance().init("test_source_location_disabled.log", 1024);
+    slick::logger::Logger::instance().set_source_location_enabled(false);
+
+    LOG_INFO("No source location message");
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_source_location_disabled.log"));
+
+    std::ifstream log_file("test_source_location_disabled.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    ASSERT_TRUE(std::getline(log_file, line));
+    EXPECT_EQ(line.find("test_logger.cpp:"), std::string::npos);
+    EXPECT_NE(line.find("No source location message"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, DynamicSourceLocationIsCopiedForDirectCalls) {
+    std::filesystem::remove("test_source_location.log");
+
+    slick::logger::Logger::instance().init("test_source_location.log", 1024);
+
+    std::string source_path = "C:\\repo\\slick-logger\\tests\\dynamic_source.cpp";
+    slick::logger::Logger::instance().log_with_location(
+        slick::logger::LogLevel::L_INFO,
+        source_path.c_str(),
+        777,
+        "Dynamic source location message");
+    source_path.assign("overwritten.cpp");
+
+    std::string split_source_path = "C:\\repo\\slick-logger\\tests\\split_source.cpp";
+    std::string split_source_name = "split_source.cpp";
+    slick::logger::Logger::instance().log_with_location(
+        slick::logger::LogLevel::L_WARN,
+        split_source_path.c_str(),
+        split_source_name.c_str(),
+        778,
+        "Dynamic split source location message");
+    split_source_path.assign("overwritten_path.cpp");
+    split_source_name.assign("overwritten_name.cpp");
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_source_location.log"));
+
+    std::ifstream log_file("test_source_location.log");
+    std::string file_contents;
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_NE(file_contents.find("dynamic_source.cpp:777"), std::string::npos);
+    EXPECT_NE(file_contents.find("Dynamic source location message"), std::string::npos);
+    EXPECT_NE(file_contents.find("split_source.cpp:778"), std::string::npos);
+    EXPECT_NE(file_contents.find("Dynamic split source location message"), std::string::npos);
+    EXPECT_EQ(file_contents.find("overwritten.cpp"), std::string::npos);
+    EXPECT_EQ(file_contents.find("overwritten_path.cpp"), std::string::npos);
+    EXPECT_EQ(file_contents.find("overwritten_name.cpp"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, EmptySourceLocationIsSuppressed) {
+    std::filesystem::remove("test_source_location.log");
+
+    slick::logger::Logger::instance().init("test_source_location.log", 1024);
+
+    slick::logger::Logger::instance().log_with_location(
+        slick::logger::LogLevel::L_INFO,
+        "",
+        42,
+        "Empty source location message");
+    slick::logger::Logger::instance().log_with_location(
+        slick::logger::LogLevel::L_WARN,
+        "/",
+        43,
+        "Root source location message");
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_source_location.log"));
+
+    std::ifstream log_file("test_source_location.log");
+    std::string file_contents;
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_EQ(file_contents.find(" [:42]"), std::string::npos);
+    EXPECT_EQ(file_contents.find(" [:43]"), std::string::npos);
+    EXPECT_NE(file_contents.find("Empty source location message"), std::string::npos);
+    EXPECT_NE(file_contents.find("Root source location message"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, SourceLocationFullPathCanBeEnabledAtRuntime) {
+    std::filesystem::remove("test_source_location_full_path.log");
+
+    slick::logger::Logger::instance().init("test_source_location_full_path.log", 1024);
+    slick::logger::Logger::instance().set_source_location_full_path_enabled(true);
+
+    std::string source_path = "C:\\repo\\slick-logger\\tests\\test_logger.cpp";
+    slick::logger::Logger::instance().log_with_location(
+        slick::logger::LogLevel::L_INFO,
+        source_path.c_str(),
+        321,
+        "Full path source location message");
+    source_path.assign("overwritten.cpp");
+
+    std::string split_source_path = "C:\\repo\\slick-logger\\tests\\split_full_path.cpp";
+    std::string split_source_name = "split_full_path.cpp";
+    slick::logger::Logger::instance().log_with_location(
+        slick::logger::LogLevel::L_WARN,
+        split_source_path.c_str(),
+        split_source_name.c_str(),
+        322,
+        "Full path split source location message");
+    split_source_path.assign("overwritten_path.cpp");
+    split_source_name.assign("overwritten_name.cpp");
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_source_location_full_path.log"));
+
+    std::ifstream log_file("test_source_location_full_path.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    ASSERT_TRUE(std::getline(log_file, line));
+    EXPECT_NE(line.find("C:\\repo\\slick-logger\\tests\\test_logger.cpp:321"), std::string::npos);
+    EXPECT_NE(line.find("Full path source location message"), std::string::npos);
+    EXPECT_EQ(line.find("overwritten.cpp"), std::string::npos);
+
+    ASSERT_TRUE(std::getline(log_file, line));
+    EXPECT_NE(line.find("C:\\repo\\slick-logger\\tests\\split_full_path.cpp:322"), std::string::npos);
+    EXPECT_NE(line.find("Full path split source location message"), std::string::npos);
+    EXPECT_EQ(line.find("overwritten_path.cpp"), std::string::npos);
+    EXPECT_EQ(line.find("overwritten_name.cpp"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, LogConfigCanDisableSourceLocation) {
+    std::filesystem::remove("test_source_location_config.log");
+
+    slick::logger::LogConfig config;
+    config.sinks.push_back(std::make_shared<slick::logger::FileSink>("test_source_location_config.log"));
+    config.include_source_location = false;
+
+    slick::logger::Logger::instance().init(config);
+
+    LOG_WARN("Config disabled source location message");
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_source_location_config.log"));
+
+    std::ifstream log_file("test_source_location_config.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    ASSERT_TRUE(std::getline(log_file, line));
+    EXPECT_EQ(line.find("test_logger.cpp:"), std::string::npos);
+    EXPECT_NE(line.find("Config disabled source location message"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, LogConfigCanEnableFullPathSourceLocation) {
+    std::filesystem::remove("test_source_location_full_path_config.log");
+
+    slick::logger::LogConfig config;
+    config.sinks.push_back(std::make_shared<slick::logger::FileSink>("test_source_location_full_path_config.log"));
+    config.include_source_location_full_path = true;
+
+    slick::logger::Logger::instance().init(config);
+
+    slick::logger::Logger::instance().log_with_location(
+        slick::logger::LogLevel::L_WARN,
+        "/repo/slick-logger/tests/test_logger.cpp",
+        654,
+        "Config enabled full path source location message");
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_source_location_full_path_config.log"));
+
+    std::ifstream log_file("test_source_location_full_path_config.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    ASSERT_TRUE(std::getline(log_file, line));
+    EXPECT_NE(line.find("/repo/slick-logger/tests/test_logger.cpp:654"), std::string::npos);
+    EXPECT_NE(line.find("Config enabled full path source location message"), std::string::npos);
 }
 
 TEST_F(SlickLoggerTest, MultiThreadedLogging) {
@@ -257,6 +480,8 @@ TEST_F(SlickLoggerTest, MixedValidAndInvalidFormats) {
     LOG_INFO("Invalid: Too many placeholders {} {} {}", "only_one");  // 3 placeholders, 1 argument
     LOG_INFO("JSON: {\"status\":\"ok\",\"code\":200}");
     LOG_INFO("Valid again: Temperature is {:.1f}°C", 23.5);
+    LOG_INFO("Escaped braces: value={{{}}} tail={{done}}", 42);
+    LOG_INFO("Invalid stray close brace: } {}", 42);
     LOG_INFO("Broken: {invalid} format {"); // just a string literal
     
     slick::logger::Logger::instance().shutdown();
@@ -274,12 +499,15 @@ TEST_F(SlickLoggerTest, MixedValidAndInvalidFormats) {
     // Check valid formats work
     EXPECT_TRUE(file_contents.find("Valid: User Alice has 100 points") != std::string::npos);
     EXPECT_TRUE(file_contents.find("Temperature is 23.5°C") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("Escaped braces: value={42} tail={done}") != std::string::npos);
     
     // Check JSON is preserved
     EXPECT_TRUE(file_contents.find("JSON: {\"status\":\"ok\",\"code\":200}") != std::string::npos);
     
     // Check error handling for invalid formats
     EXPECT_TRUE(file_contents.find("<MISSING_ARG> <MISSING_ARG>") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("[FORMAT_ERROR: unmatched '}' in format string]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("Invalid stray close brace: } 42") == std::string::npos);
 }
 
 TEST_F(SlickLoggerTest, ConstCharArrayLogging) {
@@ -403,9 +631,8 @@ TEST_F(SlickLoggerTest, EmptyStringView) {
     std::string line;
     std::getline(log_file, line);   // first line is the logger's version
     EXPECT_TRUE(std::getline(log_file, line));
-    // Check valid formats work
-    EXPECT_EQ(line.size(), 52);
-    EXPECT_EQ(line.find(" [INFO] Log empty string: "), 26);
+    EXPECT_NE(line.find(" [INFO] "), std::string::npos);
+    EXPECT_NE(line.find("Log empty string: "), std::string::npos);
 }
 
 TEST_F(SlickLoggerTest, FormatArgsLogging) {

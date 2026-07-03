@@ -1,3 +1,20 @@
+# v1.1.0 - 07-02-2026
+- Add source-location logging for `LOG_*` macros
+  - Capture the macro call-site file and line by default
+  - Add runtime controls for source-location output and basename vs full-path formatting
+  - Add `LogConfig` fields for source-location defaults during logger initialization
+  - Add CMake and compile-time controls for disabling source-location capture and overriding the captured file path expression
+- Make public direct source-location logging overloads safe for dynamic `const char*` inputs by copying source path data before queueing
+- Improve source-location formatting behavior
+  - Suppress empty source names instead of emitting empty `[:line]` locations
+  - Avoid torn runtime source-location option reads by storing source-location options together
+  - Reserve built-in sink output capacity for source-location text to avoid an extra string reallocation
+- Fix brace handling in formatted log messages, including escaped braces such as `value={{{}}}` and stray closing-brace errors
+- Increase the default string buffer size from 4 MB to 16 MB for queued dynamic string data
+- Update the installed CMake package config to require the exported `slick-queue` package and propagate source-location compile definitions through `slick::logger`
+- Add regression coverage for source-location defaults, runtime/config controls, dynamic source path copies, empty source suppression, escaped braces, and shared-library plugin call sites
+- Update README coverage for source-location logging, runtime controls, timestamp formats, sink lookup, lifecycle APIs, and current example/test targets
+
 # v1.0.9 - 06-11-2026
 - Avoid evaluating `LOG_*` arguments when the message level is disabled
   - Move the level gate to the macro boundary so expensive arguments are skipped before `Logger::log(...)` is called

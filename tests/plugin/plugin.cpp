@@ -40,6 +40,16 @@ PLUGIN_EXPORT void plugin_log_messages() {
 }
 
 /**
+ * Logs a probe message and returns the source line used by the LOG_* macro.
+ * The host test verifies that the queued entry records this plugin call site.
+ */
+PLUGIN_EXPORT int plugin_log_location_probe() {
+    const int source_line = __LINE__ + 1;
+    LOG_INFO("plugin source location probe");
+    return source_line;
+}
+
+/**
  * Called by the host before unloading this shared library.
  * Restores this library's own local logger so that any logging after
  * unload does not dereference the (potentially destroyed) host logger.
