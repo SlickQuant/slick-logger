@@ -1,3 +1,13 @@
+# v1.1.1 - 07-06-2026
+- Use compiler-provided `__FILE_NAME__` for `LOG_*` call-site filenames when predefined
+  - Falls back to the internal constexpr basename helper for older GCC/Clang-compatible C++20 compilers and MSVC
+  - Keeps `LOG_*` macro source locations in a `static constexpr` call-site path without requiring GCC 12+
+- Replace the public `source_location_file_name()` helper with internal `detail::file_name_from_path()` basename handling
+  - Preserves dynamic direct-call path support while avoiding an extra public helper API
+- Clarify the direct `log_with_location(level, path, line, ...)` overload by treating the argument as a file path
+  - Only derives the basename when source-location output is enabled and full-path output is disabled
+- Make `log_to_sink_with_location()` public so callers can log to a specific sink while supplying source-location metadata
+
 # v1.1.0 - 07-02-2026
 - Add source-location logging for `LOG_*` macros
   - Capture the macro call-site file and line by default

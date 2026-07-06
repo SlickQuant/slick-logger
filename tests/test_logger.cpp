@@ -124,11 +124,6 @@ TEST_F(SlickLoggerTest, DisabledMacrosDoNotEvaluateArguments) {
 TEST_F(SlickLoggerTest, MacrosIncludeCallSiteSourceLocationByDefault) {
     std::filesystem::remove("test_source_location.log");
 
-    EXPECT_STREQ(slick::logger::source_location_file_name(
-        "C:\\repo\\slick-logger\\tests\\test_logger.cpp"), "test_logger.cpp");
-    EXPECT_STREQ(slick::logger::source_location_file_name(
-        "/repo/slick-logger/tests/test_logger.cpp"), "test_logger.cpp");
-
     slick::logger::Logger::instance().init("test_source_location.log", 1024);
 
     const int expected_line = __LINE__ + 1;

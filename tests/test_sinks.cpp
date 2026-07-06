@@ -26,6 +26,7 @@ protected:
             "rotating_test_1.log", "rotating_test_2.log", "rotating_test_3.log",
             "daily_test.log", "daily_rotation_test.log", "daily_rotation_test_2025-08-25.log",
             "daily_size_test.log", "args_sink.log", "dedicated_sink.log", "filtered_sink.log",
+            "location_sink1.log", "location_sink2.log",
             "named_sink1.log", "named_sink2.log", "regular_sink.log", "daily_no_size_rotation.log",
             "daily_multi_rotation.log", "daily_restart_test.log", "daily_restart_existing.log"
         };
@@ -448,6 +449,47 @@ TEST_F(SinkTest, NamedSinkDirectLogging) {
     // Should NOT contain messages meant for other sinks
     EXPECT_FALSE(sink2_content.find("Info message to sink1 only") != std::string::npos);
     EXPECT_FALSE(sink2_content.find("Warning to console only") != std::string::npos);
+}
+
+TEST_F(SinkTest, LogToSinkWithLocationTargetsSpecificSink) {
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("location_sink1.log", "location_sink1");
+    slick::logger::Logger::instance().add_file_sink("location_sink2.log", "location_sink2");
+    slick::logger::Logger::instance().init(1024);
+
+    auto sink1 = slick::logger::Logger::instance().get_sink("location_sink1");
+    auto sink2 = slick::logger::Logger::instance().get_sink("location_sink2");
+    ASSERT_TRUE(sink1 != nullptr);
+    ASSERT_TRUE(sink2 != nullptr);
+
+    std::string source_file = "public_sink_source.cpp";
+    slick::logger::Logger::instance().log_to_sink_with_location(
+        sink2->index(),
+        slick::logger::LogLevel::L_INFO,
+        source_file.c_str(),
+        456,
+        true,
+        "Specific sink source-location message {}", 7);
+    source_file.assign("overwritten.cpp");
+
+    slick::logger::Logger::instance().reset();
+
+    ASSERT_TRUE(std::filesystem::exists("location_sink1.log"));
+    std::ifstream sink1_file("location_sink1.log");
+    std::string sink1_content((std::istreambuf_iterator<char>(sink1_file)),
+                              std::istreambuf_iterator<char>());
+    sink1_file.close();
+
+    ASSERT_TRUE(std::filesystem::exists("location_sink2.log"));
+    std::ifstream sink2_file("location_sink2.log");
+    std::string sink2_content((std::istreambuf_iterator<char>(sink2_file)),
+                              std::istreambuf_iterator<char>());
+    sink2_file.close();
+
+    EXPECT_EQ(sink1_content.find("Specific sink source-location message 7"), std::string::npos);
+    EXPECT_NE(sink2_content.find("public_sink_source.cpp:456"), std::string::npos);
+    EXPECT_NE(sink2_content.find("Specific sink source-location message 7"), std::string::npos);
+    EXPECT_EQ(sink2_content.find("overwritten.cpp"), std::string::npos);
 }
 
 TEST_F(SinkTest, SinkDirectLoggingWithArgs) {
