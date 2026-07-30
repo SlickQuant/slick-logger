@@ -1,3 +1,12 @@
+# v1.1.2 - 07-30-2026
+- Remove full file path logging option
+  - `LOG_*` macros and `log_with_location()` now always use the basename; the full-path runtime toggle is gone
+  - Remove `LogConfig::include_source_location_full_path`
+  - Remove `Logger::set_source_location_full_path_enabled()` and `Logger::source_location_full_path_enabled()`
+  - Remove the two-parameter `log_with_location(level, file_path, file_name, line, ...)` overload
+  - Remove `StaticSourceLocation::file_path` field and the `SLICK_LOGGER_FILE_PATH` macro
+  - Simplify `StaticSourceLocation` constructor and `static_source_location()` to accept only a file name
+
 # v1.1.1 - 07-06-2026
 - Use compiler-provided `__FILE_NAME__` for `LOG_*` call-site filenames when predefined
   - Falls back to the internal constexpr basename helper for older GCC/Clang-compatible C++20 compilers and MSVC

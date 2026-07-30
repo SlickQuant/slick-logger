@@ -180,7 +180,7 @@ The available levels are `L_TRACE`, `L_DEBUG`, `L_INFO`, `L_WARN`, `L_ERROR`, `L
 
 ### Source Location Logging
 
-Source-location logging is enabled by default for `LOG_*` macros. The default output uses only the basename, while full-path output can be enabled at runtime:
+Source-location logging is enabled by default for `LOG_*` macros. The output always uses only the basename (e.g. `main.cpp:8`):
 
 ```cpp
 #include <slick/logger.hpp>
@@ -191,9 +191,6 @@ int main() {
     Logger::instance().init("app.log");
 
     LOG_INFO("uses basename by default"); // [main.cpp:8]
-
-    Logger::instance().set_source_location_full_path_enabled(true);
-    LOG_INFO("uses the full SLICK_LOGGER_FILE_PATH value"); // [C:\repo\app\main.cpp:11]
 
     Logger::instance().set_source_location_enabled(false);
     LOG_INFO("source location omitted");
@@ -209,8 +206,7 @@ using namespace slick::logger;
 
 LogConfig config;
 config.sinks.push_back(std::make_shared<FileSink>("app.log"));
-config.include_source_location = true;             // default
-config.include_source_location_full_path = false;  // default: basename only
+config.include_source_location = true;  // default
 
 Logger::instance().init(config);
 ```
@@ -235,14 +231,7 @@ target_compile_definitions(your_app PRIVATE SLICK_LOGGER_ENABLE_SOURCE_LOCATION=
 #include <slick/logger.hpp>
 ```
 
-```cpp
-// Override the compile-time source path expression captured by LOG_* macros.
-// Full-path runtime output can only show what this macro provides.
-#define SLICK_LOGGER_FILE_PATH __FILE__
-#include <slick/logger.hpp>
-```
-
-For bridge code that receives source information from another logging layer, direct source-location overloads are also available. The `const char*` source path/name passed to these public overloads is copied before the entry is queued, so dynamic strings are safe:
+For bridge code that receives source information from another logging layer, a direct source-location overload is also available. The `const char*` path passed is copied before the entry is queued, so dynamic strings are safe, and the basename is extracted automatically:
 
 ```cpp
 std::string path = "C:\\repo\\app\\bridge.cpp";
@@ -250,15 +239,7 @@ slick::logger::Logger::instance().log_with_location(
     slick::logger::LogLevel::L_INFO,
     path.c_str(),
     42,
-    "bridged message");
-
-std::string basename = "bridge.cpp";
-slick::logger::Logger::instance().log_with_location(
-    slick::logger::LogLevel::L_WARN,
-    path.c_str(),
-    basename.c_str(),
-    43,
-    "bridged message with precomputed basename");
+    "bridged message"); // logged as [bridge.cpp:42]
 ```
 
 Direct sink helpers such as `sink->log_info(...)` route to that sink only and do not automatically attach the caller's source location. Use `LOG_*` macros when you want automatic call-site capture.
@@ -495,7 +476,6 @@ int main() {
     config.log_queue_size = 16384;
     config.string_buffer_size = 4 * 1024 * 1024;
     config.include_source_location = true;
-    config.include_source_location_full_path = false;
     
     Logger::instance().init(config);
     
@@ -514,7 +494,6 @@ int main() {
 - `log_queue_size`: internal log-entry queue size, rounded up to a power of two
 - `string_buffer_size`: internal string-storage queue size, rounded up to a power of two
 - `include_source_location`: include file and line for `LOG_*` macro calls, default `true`
-- `include_source_location_full_path`: use the full captured path instead of the basename, default `false`
 
 ### Lifecycle and Runtime Controls
 
@@ -525,7 +504,6 @@ Logger::instance().init("app.log", 65536, 4 * 1024 * 1024);
 
 Logger::instance().set_level(LogLevel::L_DEBUG);
 Logger::instance().set_source_location_enabled(true);
-Logger::instance().set_source_location_full_path_enabled(false);
 
 LOG_INFO("queued asynchronously");
 

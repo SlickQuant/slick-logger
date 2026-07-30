@@ -43,5 +43,7 @@
 build/
 .vscode/
 .claude/
+.codex/
+.agents/
 *.log
 benchmark_logs/

@@ -64,15 +64,11 @@
 #define SLICK_LOGGER_ENABLE_SOURCE_LOCATION 1
 #endif
 
-#ifndef SLICK_LOGGER_FILE_PATH
-#define SLICK_LOGGER_FILE_PATH __FILE__
-#endif
-
 #ifndef SLICK_LOGGER_FILE_NAME
 #if defined(__FILE_NAME__)
 #define SLICK_LOGGER_FILE_NAME __FILE_NAME__
 #else
-#define SLICK_LOGGER_FILE_NAME slick::logger::detail::file_name_from_path(SLICK_LOGGER_FILE_PATH)
+#define SLICK_LOGGER_FILE_NAME slick::logger::detail::file_name_from_path(__FILE__)
 #endif
 #endif
 
@@ -462,7 +458,6 @@ struct LogConfig {
     size_t log_queue_size = 65536;
     size_t string_buffer_size = 1 << 24; // 16MB
     bool include_source_location = true;
-    bool include_source_location_full_path = false;
 };
 
 /**
@@ -639,7 +634,7 @@ public:
      * @param enabled True to include source location, false to omit it
      */
     void set_source_location_enabled(bool enabled) noexcept {
-        set_source_location_option(kSourceLocationEnabled, enabled);
+        set_source_location_options(enabled);
     }
 
     /**
@@ -648,22 +643,6 @@ public:
      */
     bool source_location_enabled() const noexcept {
         return (source_location_options_.load(std::memory_order_relaxed) & kSourceLocationEnabled) != 0;
-    }
-
-    /**
-     * @brief Set whether LOG_* source locations use the full __FILE__ path
-     * @param enabled True to include the full path, false to include only the file name
-     */
-    void set_source_location_full_path_enabled(bool enabled) noexcept {
-        set_source_location_option(kSourceLocationFullPath, enabled);
-    }
-
-    /**
-     * @brief Check whether LOG_* source locations use the full __FILE__ path
-     * @return true if full path output is enabled
-     */
-    bool source_location_full_path_enabled() const noexcept {
-        return (source_location_options_.load(std::memory_order_relaxed) & kSourceLocationFullPath) != 0;
     }
 
     /**
@@ -690,42 +669,27 @@ public:
      * @brief Compile-time source location data used by the LOG_* macro fast path
      */
     struct StaticSourceLocation {
-        const char* file_path;
         const char* file_name;
 
-        consteval StaticSourceLocation(const char* static_file_path, const char* static_file_name) noexcept
-            : file_path(static_file_path)
-            , file_name(static_file_name) {
+        consteval StaticSourceLocation(const char* static_file_name) noexcept
+            : file_name(static_file_name) {
         }
     };
 
-    static consteval StaticSourceLocation static_source_location(const char* file_path, const char* file_name) noexcept {
-        return StaticSourceLocation{file_path, file_name};
+    static consteval StaticSourceLocation static_source_location(const char* file_name) noexcept {
+        return StaticSourceLocation{file_name};
     }
 
     /**
      * @brief Log a message with a source location
      * @param level LogLevel of the message
-     * @param file_name Source file path; copied before the entry is queued
+     * @param file_path Source file path; basename extracted and copied before the entry is queued
      * @param line Source line
      * @param format Format string (printf-style)
      * @param args Arguments for the format string
      */
     template<typename FormatT, typename... Args>
-    void log_with_location(LogLevel level, const char* file_name, uint32_t line, FormatT&& format, Args&&... args);
-
-    /**
-     * @brief Log a message with a source path and precomputed file name
-     * @param level LogLevel of the message
-     * @param file_path Source file path; copied before the entry is queued when full path output is enabled
-     * @param file_name Source file name; copied before the entry is queued when basename output is enabled
-     * @param line Source line
-     * @param format Format string (printf-style)
-     * @param args Arguments for the format string
-     */
-    template<typename FormatT, typename... Args>
-    void log_with_location(LogLevel level, const char* file_path, const char* file_name, uint32_t line,
-                           FormatT&& format, Args&&... args);
+    void log_with_location(LogLevel level, const char* file_path, uint32_t line, FormatT&& format, Args&&... args);
 
     /**
      * @brief Log a message with static-lifetime source path data from a LOG_* macro call site
@@ -819,8 +783,7 @@ private:
     void start();
     void writer_thread_func();
     void write_log_entry(const LogEntry* entry_ptr, uint32_t count);
-    void set_source_location_options(bool enabled, bool full_path) noexcept;
-    void set_source_location_option(uint8_t option, bool enabled) noexcept;
+    void set_source_location_options(bool enabled) noexcept;
     
     // Helper function to round up to next power of 2
     static size_t round_up_to_power_of_2(size_t value) noexcept;
@@ -841,7 +804,6 @@ private:
     uint64_t read_index_{0};
     std::atomic<LogLevel> log_level_{LogLevel::L_TRACE};
     static constexpr uint8_t kSourceLocationEnabled = 0x01;
-    static constexpr uint8_t kSourceLocationFullPath = 0x02;
     std::atomic<uint8_t> source_location_options_{kSourceLocationEnabled};
     std::unordered_map<std::string_view, int> sinkname_index_map_;
 
@@ -1521,18 +1483,8 @@ inline void Logger::clear_instance_override() noexcept {
     override_instance_.store(&instance_, std::memory_order_release);
 }
 
-inline void Logger::set_source_location_options(bool enabled, bool full_path) noexcept {
-    uint8_t val = (enabled   ? kSourceLocationEnabled  : 0)
-                | (full_path ? kSourceLocationFullPath : 0);
-    source_location_options_.store(val, std::memory_order_release);
-}
-
-inline void Logger::set_source_location_option(uint8_t option, bool enabled) noexcept {
-    if (enabled) {
-        source_location_options_.fetch_or(option, std::memory_order_release);
-    } else {
-        source_location_options_.fetch_and(static_cast<uint8_t>(~option), std::memory_order_release);
-    }
+inline void Logger::set_source_location_options(bool enabled) noexcept {
+    source_location_options_.store(enabled ? kSourceLocationEnabled : 0, std::memory_order_release);
 }
 
 inline void Logger::init(const std::filesystem::path& log_file, size_t log_queue_size, size_t string_buffer_size) {
@@ -1574,7 +1526,7 @@ inline void Logger::init(const LogConfig& config) {
     }
     
     set_level(config.min_level);
-    set_source_location_options(config.include_source_location, config.include_source_location_full_path);
+    set_source_location_options(config.include_source_location);
     
     // Ensure queue_size is power of 2
     size_t log_queue_size = round_up_to_power_of_2(config.log_queue_size);
@@ -1692,31 +1644,8 @@ inline void Logger::log(LogLevel level, FormatT&& format, Args&&... args) {
 
 template<typename FormatT, typename... Args>
 inline void Logger::log_with_location(LogLevel level, const char* file_path, uint32_t line, FormatT&& format, Args&&... args) {
-    const uint8_t source_options = source_location_options_.load(std::memory_order_relaxed);
-    const bool include_source_location = (source_options & kSourceLocationEnabled) != 0;
-    const char* source_file = nullptr;
-    if (include_source_location) {
-        const bool include_full_path = (source_options & kSourceLocationFullPath) != 0;
-        source_file = include_full_path ? file_path : detail::file_name_from_path(file_path);
-    }
-    log_to_sink_with_location(-1, level,
-                              source_file,
-                              include_source_location ? line : 0,
-                              true,
-                              std::forward<FormatT>(format),
-                              std::forward<Args>(args)...);
-}
-
-template<typename FormatT, typename... Args>
-inline void Logger::log_with_location(LogLevel level, const char* file_path, const char* file_name, uint32_t line,
-                                      FormatT&& format, Args&&... args) {
-    const uint8_t source_options = source_location_options_.load(std::memory_order_relaxed);
-    const bool include_source_location = (source_options & kSourceLocationEnabled) != 0;
-    const char* source_file = nullptr;
-    if (include_source_location) {
-        const bool include_full_path = (source_options & kSourceLocationFullPath) != 0;
-        source_file = include_full_path ? file_path : file_name;
-    }
+    const bool include_source_location = (source_location_options_.load(std::memory_order_relaxed) & kSourceLocationEnabled) != 0;
+    const char* source_file = include_source_location ? detail::file_name_from_path(file_path) : nullptr;
     log_to_sink_with_location(-1, level,
                               source_file,
                               include_source_location ? line : 0,
@@ -1728,15 +1657,9 @@ inline void Logger::log_with_location(LogLevel level, const char* file_path, con
 template<typename FormatT, typename... Args>
 inline void Logger::log_with_static_location(LogLevel level, StaticSourceLocation location, uint32_t line,
                                              FormatT&& format, Args&&... args) {
-    const uint8_t source_options = source_location_options_.load(std::memory_order_relaxed);
-    const bool include_source_location = (source_options & kSourceLocationEnabled) != 0;
-    const char* source_file = nullptr;
-    if (include_source_location) {
-        const bool include_full_path = (source_options & kSourceLocationFullPath) != 0;
-        source_file = include_full_path ? location.file_path : location.file_name;
-    }
+    const bool include_source_location = (source_location_options_.load(std::memory_order_relaxed) & kSourceLocationEnabled) != 0;
     log_to_sink_with_location(-1, level,
-                              source_file,
+                              include_source_location ? location.file_name : nullptr,
                               include_source_location ? line : 0,
                               false,
                               std::forward<FormatT>(format),
@@ -2112,7 +2035,7 @@ inline size_t Logger::round_up_to_power_of_2(size_t value) noexcept {
         static constexpr const char* slick_logger_file_name__ = SLICK_LOGGER_FILE_NAME; \
         (logger_instance).log_with_static_location( \
             level, \
-            slick::logger::Logger::static_source_location(SLICK_LOGGER_FILE_PATH, slick_logger_file_name__), \
+            slick::logger::Logger::static_source_location(slick_logger_file_name__), \
             __LINE__, __VA_ARGS__); \
     } while (false)
 #else
