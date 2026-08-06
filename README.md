@@ -292,6 +292,8 @@ int main() {
 - **Extensible**: Easy to add custom formatters for user-defined types
 - **Standard**: Part of C++20 standard library, no external dependencies
 
+> **Caveat — format string must be a true string literal (or otherwise outlive processing):** slick-logger detects "safe to store pointer" format strings by checking whether the argument's type is `const char(&)[N]` — the type category string literals have. This is only a heuristic: any other `const char[N]` lvalue (e.g. a `const char` array **class member**, or a local `const char buf[N]`) has the exact same type and will be misidentified as a literal too. In that case only the pointer is queued, not a copy of the contents, so if the array is mutated or destroyed before the writer thread consumes the log entry, the logged output is corrupted or reads freed memory. Only pass genuine string literals this way; for a `const char` array member variable, pass it as `std::string_view{member}` (or another type convertible to `std::string_view`) instead, so its contents are copied into the queue.
+
 ### Passing std::format_args
 
 You can pass a pre-built `std::format_args` object as the single argument to any log call. This lets you capture format arguments once and reuse them, or forward a pre-built arg pack from another function:

@@ -1,8 +1,10 @@
 #include <slick/logger.hpp>
 #include <gtest/gtest.h>
+#include <cstring>
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 
 class SlickLoggerTest : public ::testing::Test {
@@ -22,6 +24,9 @@ protected:
         std::filesystem::remove("test_no_args.log");
         std::filesystem::remove("test_mixed.log");
         std::filesystem::remove("test_char_array.log");
+        std::filesystem::remove("test_char_array_struct.log");
+        std::filesystem::remove("test_volatile_char_array.log");
+        std::filesystem::remove("test_cv_pointer.log");
         std::filesystem::remove("test_single_string.log");
         std::filesystem::remove("test_empty_string.log");
         std::filesystem::remove("test_format_args.log");
@@ -544,6 +549,103 @@ TEST_F(SlickLoggerTest, CharArrayLogging) {
     
     // Check valid formats work
     EXPECT_TRUE(file_contents.find("Log char array: test char array") != std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, CopiesConstViewOfStructCharArrayArgument) {
+    struct Msg {
+        char msg_[32];
+    };
+
+    std::filesystem::remove("test_char_array_struct.log");
+
+    slick::logger::Logger::instance().init("test_char_array_struct.log", 1024);
+
+    Msg msg;
+    std::strcpy(msg.msg_, "struct member text");
+    const Msg& const_msg = msg;
+
+    LOG_INFO("Log char array: {}", const_msg.msg_);
+
+    // enqueue_argument copies the array into the string queue synchronously,
+    // before LOG_INFO returns, so mutating the source afterwards must not
+    // change what was logged.
+    std::strcpy(msg.msg_, "mutated member text");
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_char_array_struct.log"));
+
+    std::ifstream log_file("test_char_array_struct.log");
+    std::string file_contents;
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_TRUE(file_contents.find("Log char array: struct member text") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("mutated member text") == std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, LogsVolatileCharArrayArgument) {
+    struct Msg {
+        volatile char msg_[32];
+    };
+
+    std::filesystem::remove("test_volatile_char_array.log");
+
+    slick::logger::Logger::instance().init("test_volatile_char_array.log", 1024);
+
+    Msg msg;
+    std::strcpy(const_cast<char*>(msg.msg_), "volatile member text");
+
+    LOG_INFO("Log volatile char array: {}", msg.msg_);
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_volatile_char_array.log"));
+
+    std::ifstream log_file("test_volatile_char_array.log");
+    std::string file_contents;
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_TRUE(file_contents.find("Log volatile char array: volatile member text") != std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, LogsConstAndVolatileQualifiedPointerArguments) {
+    std::filesystem::remove("test_cv_pointer.log");
+
+    slick::logger::Logger::instance().init("test_cv_pointer.log", 1024);
+
+    int value = 42;
+    const int* const_ptr = &value;
+    volatile int* volatile_ptr = &value;
+    const volatile int* const_volatile_ptr = &value;
+    void* addr = const_cast<void*>(static_cast<const volatile void*>(&value));
+
+    LOG_INFO("const={:p} volatile={:p} const_volatile={:p}", const_ptr, volatile_ptr, const_volatile_ptr);
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_cv_pointer.log"));
+
+    std::ifstream log_file("test_cv_pointer.log");
+    std::string file_contents;
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    // All three pointers alias the same address, so the logger's internal
+    // normalization to a plain void* must format all three identically.
+    const std::string expected = std::format(
+        "const={:p} volatile={:p} const_volatile={:p}", addr, addr, addr);
+    EXPECT_TRUE(file_contents.find(expected) != std::string::npos);
 }
 
 TEST_F(SlickLoggerTest, EmptyStringView) {

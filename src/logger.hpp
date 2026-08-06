@@ -44,6 +44,7 @@
 #include <utility>
 #include <vector>
 #include <string_view>
+#include <type_traits>
 #include <slick/queue.h>
 
 // For time functions on some platforms
@@ -1734,6 +1735,7 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
 template<typename T>
 inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
     using DecayedT = std::decay_t<T>;
+    using BareT = std::remove_reference_t<T>;
 
     if constexpr (std::is_same_v<DecayedT, bool>) {
         arg.type = ArgType::BOOL;
@@ -1815,17 +1817,21 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
         arg.type = ArgType::INT64_T;
         arg.value.i64 = std::chrono::duration_cast<std::chrono::nanoseconds>(value.time_since_epoch()).count();
     }
-    else if constexpr (IS_STRING_LITERAL(value)) {
-        arg.type = ArgType::STRING_LITERAL;
-        arg.value.literal_ptr = value;
+    else if constexpr (std::is_array_v<BareT> &&
+                       std::is_same_v<std::remove_cv_t<std::remove_extent_t<BareT>>, char>) {
+        // value may be cv-qualified (e.g. a volatile struct member); strip
+        // qualifiers for the read since we only need a defensive snapshot.
+        const char* data = const_cast<const char*>(static_cast<const volatile char*>(value));
+        constexpr size_t extent = std::extent_v<BareT>;
+        size_t length = strnlen(data, extent);
+        arg.type = ArgType::STRING_DYNAMIC;
+        arg.value.dynamic_str = store_string_in_queue(std::string_view{data, length});
     }
     else if constexpr (std::is_same_v<DecayedT, const char*>) {
-        // Assume string literal - store pointer directly
         arg.type = ArgType::STRING_DYNAMIC;
         arg.value.dynamic_str = store_string_in_queue(value);
     }
     else if constexpr (std::is_same_v<DecayedT, char*>) {
-        // Assume string literal - store pointer directly
         arg.type = ArgType::STRING_DYNAMIC;
         arg.value.dynamic_str = store_string_in_queue(value);
     }
@@ -1845,7 +1851,9 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
     }
     else if constexpr (std::is_pointer_v<DecayedT>) {
         arg.type = ArgType::PTR;
-        arg.value.ptr = static_cast<void*>(value);
+        // Strip any cv-qualification on the pointee; we only store the
+        // address, never dereference it, so const/volatile don't matter.
+        arg.value.ptr = const_cast<void*>(static_cast<const volatile void*>(value));
     }
     else {
         // custom type - convert to string
