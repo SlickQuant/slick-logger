@@ -1,3 +1,11 @@
+# v1.1.4 - 08-15-2026
+- Create missing parent directories for file sinks instead of failing to open the log file
+  - `FileSink`, `RotatingFileSink`, and `DailyFileSink` now create any missing parent directories before opening their file, matching the "Auto-Creation" behavior the README already documented
+  - Previously the `std::ofstream` open failed and the sink constructor threw `Failed to open log file: <path>`, which propagated out of `Logger::init()` / `add_*_file_sink()`
+  - Applies to rotation and daily-rollover reopen paths as well, so a directory removed while the logger is running is recreated instead of throwing on the writer thread
+  - Directory creation is non-throwing and skipped for paths with no directory component; a genuinely unopenable file still reports the original error
+  - Add regression coverage for all three sink types plus `Logger::init(path)` and bare filenames
+
 # v1.1.3 - 08-05-2026
 - Fix forwarded `char[]` log arguments being misclassified as string literals
   - Copy `char[N]` and `const char[N]` arguments into the string queue after forwarding so struct member arrays do not leave dangling pointers for the async writer

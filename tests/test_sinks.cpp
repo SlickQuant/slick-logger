@@ -51,6 +51,9 @@ protected:
                 }
             }
         }
+
+        // Directory trees created by the missing-directory tests
+        std::filesystem::remove_all("missing_dir_test", ec);
     }
 };
 
@@ -858,6 +861,102 @@ TEST_F(SinkTest, DailyFileSinkRestartWithExistingRotatedFiles) {
         // Print warning that rotation didn't happen
         std::cout << "Warning: Rotation with existing files did not occur. This might be a timestamp precision issue." << std::endl;
     }
+}
+
+TEST_F(SinkTest, FileSinkCreatesMissingDirectories) {
+    // Nested path where no component of the parent directory exists yet
+    const std::filesystem::path log_path = "missing_dir_test/nested/deeper/file_sink.log";
+    ASSERT_FALSE(std::filesystem::exists("missing_dir_test"));
+
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink(log_path);
+    slick::logger::Logger::instance().init(1024);
+
+    LOG_INFO("Message into a directory that did not exist");
+
+    slick::logger::Logger::instance().reset();
+
+    ASSERT_TRUE(std::filesystem::exists(log_path));
+
+    std::ifstream log_file(log_path);
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    std::getline(log_file, line);
+    EXPECT_TRUE(line.find("Message into a directory that did not exist") != std::string::npos);
+}
+
+TEST_F(SinkTest, RotatingFileSinkCreatesMissingDirectories) {
+    const std::filesystem::path log_path = "missing_dir_test/rotating/rotating_sink.log";
+    ASSERT_FALSE(std::filesystem::exists("missing_dir_test"));
+
+    slick::logger::RotationConfig rotation_config;
+    rotation_config.max_file_size = 100; // Very small so rotation triggers
+    rotation_config.max_files = 3;
+
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_rotating_file_sink(log_path, rotation_config);
+    slick::logger::Logger::instance().init(1024);
+
+    for (int i = 0; i < 20; ++i) {
+        LOG_INFO("Rotation test message number {} with extra text to reach size limit", i);
+    }
+
+    slick::logger::Logger::instance().reset();
+
+    EXPECT_TRUE(std::filesystem::exists(log_path));
+    // Rotated siblings land in the same created directory
+    EXPECT_TRUE(std::filesystem::exists("missing_dir_test/rotating/rotating_sink_1.log"));
+}
+
+TEST_F(SinkTest, DailyFileSinkCreatesMissingDirectories) {
+    const std::filesystem::path log_path = "missing_dir_test/daily/daily_sink.log";
+    ASSERT_FALSE(std::filesystem::exists("missing_dir_test"));
+
+    slick::logger::RotationConfig daily_config;
+
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_daily_file_sink(log_path, daily_config);
+    slick::logger::Logger::instance().init(1024);
+
+    LOG_INFO("Daily message into a directory that did not exist");
+
+    slick::logger::Logger::instance().reset();
+
+    ASSERT_TRUE(std::filesystem::exists(log_path));
+
+    std::ifstream log_file(log_path);
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    std::getline(log_file, line);
+    EXPECT_TRUE(line.find("Daily message into a directory that did not exist") != std::string::npos);
+}
+
+TEST_F(SinkTest, InitCreatesMissingDirectories) {
+    // Logger::init(path) constructs the FileSink internally
+    const std::filesystem::path log_path = "missing_dir_test/init/init_sink.log";
+    ASSERT_FALSE(std::filesystem::exists("missing_dir_test"));
+
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().init(log_path, 1024);
+
+    LOG_INFO("Init created the log directory");
+
+    slick::logger::Logger::instance().reset();
+
+    ASSERT_TRUE(std::filesystem::exists(log_path));
+}
+
+TEST_F(SinkTest, FileSinkWithoutDirectoryComponentStillWorks) {
+    // A bare filename has an empty parent_path() - must not be treated as a directory
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("regular_sink.log");
+    slick::logger::Logger::instance().init(1024);
+
+    LOG_INFO("Bare filename message");
+
+    slick::logger::Logger::instance().reset();
+
+    ASSERT_TRUE(std::filesystem::exists("regular_sink.log"));
 }
 
 int main(int argc, char **argv) {

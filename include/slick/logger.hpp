@@ -47,6 +47,7 @@
 #include <vector>
 #include <string_view>
 #include <type_traits>
+#include <system_error>
 #include <slick/queue.h>
 
 // For time functions on some platforms
@@ -56,8 +57,8 @@
 
 #define SLICK_LOGGER_VERSION_MAJOR 1
 #define SLICK_LOGGER_VERSION_MINOR 1
-#define SLICK_LOGGER_VERSION_PATCH 3
-#define SLICK_LOGGER_VERSION "1.1.3"
+#define SLICK_LOGGER_VERSION_PATCH 4
+#define SLICK_LOGGER_VERSION "1.1.4"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20
@@ -398,7 +399,16 @@ public:
 
 protected:
     std::string format_log_entry(const LogEntry& entry);
-    
+
+    /**
+     * @brief Open file_stream_ on path, creating any missing parent directories first.
+     *
+     * Callers check file_stream_ afterwards to report failures in their own terms.
+     * Directory creation is best-effort: if it fails the open fails too, which the
+     * caller already handles.
+     */
+    void open_stream(const std::filesystem::path& path, std::ios::openmode mode);
+
     std::filesystem::path file_path_;
     std::ofstream file_stream_;
     TimestampFormatter timestamp_formatter_;
@@ -1091,10 +1101,19 @@ inline std::string ConsoleSink::get_reset_code() {
     return "\033[0m";
 }
 
+inline void FileSink::open_stream(const std::filesystem::path& path, std::ios::openmode mode) {
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec); // no-op when it already exists
+    }
+    file_stream_.open(path, mode);
+}
+
 inline FileSink::FileSink(const std::filesystem::path& file_path,
                           TimestampFormatter::Format timestamp_format, std::string&& name)
     : ISink(std::move(name)), file_path_(file_path), timestamp_formatter_(timestamp_format) {
-    file_stream_.open(file_path_, std::ios::app);
+    open_stream(file_path_, std::ios::app);
     if (!file_stream_) {
         throw std::runtime_error("Failed to open log file: " + file_path_.string());
     }
@@ -1103,7 +1122,7 @@ inline FileSink::FileSink(const std::filesystem::path& file_path,
 inline FileSink::FileSink(const std::filesystem::path& file_path,
                           const std::string& custom_timestamp_format, std::string&& name)
     : ISink(std::move(name)), file_path_(file_path), timestamp_formatter_(custom_timestamp_format) {
-    file_stream_.open(file_path_, std::ios::app);
+    open_stream(file_path_, std::ios::app);
     if (!file_stream_) {
         throw std::runtime_error("Failed to open log file: " + file_path_.string());
     }
@@ -1192,7 +1211,7 @@ inline void RotatingFileSink::rotate_files() {
     }
     
     // Create new current file
-    file_stream_.open(base_path_, std::ios::out | std::ios::trunc);
+    open_stream(base_path_, std::ios::out | std::ios::trunc);
     current_file_size_ = 0;
 }
 
@@ -1243,7 +1262,7 @@ inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, cons
                 }
 
                 // Reopen file for today
-                file_stream_.open(base_path_, std::ios::out | std::ios::trunc);
+                open_stream(base_path_, std::ios::out | std::ios::trunc);
                 if (!file_stream_) {
                     throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
                 }
@@ -1304,7 +1323,7 @@ inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, cons
                 }
 
                 // Reopen file for today
-                file_stream_.open(base_path_, std::ios::out | std::ios::trunc);
+                open_stream(base_path_, std::ios::out | std::ios::trunc);
                 if (!file_stream_) {
                     throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
                 }
@@ -1354,7 +1373,7 @@ inline void DailyFileSink::check_rotation() {
         }
 
         // Reopen base file for new day's logs
-        file_stream_.open(base_path_, std::ios::out | std::ios::trunc); // Start fresh for new day
+        open_stream(base_path_, std::ios::out | std::ios::trunc); // Start fresh for new day
         if (!file_stream_) {
             throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
         }
@@ -1434,7 +1453,7 @@ inline void DailyFileSink::rotate_daily_files() {
     }
 
     // Create new current file
-    file_stream_.open(base_path_, std::ios::out | std::ios::trunc);
+    open_stream(base_path_, std::ios::out | std::ios::trunc);
     if (!file_stream_) {
         throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
     }
