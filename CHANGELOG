@@ -29,6 +29,9 @@
   - `enqueue_format_args` is a non-template inline function, so it compiles in every translation unit: no Clang-on-Linux build of any file including `slick/logger.hpp` succeeded
   - Replaced with a feature-tested `is_float128_v<T>` trait plus `SLICK_LOGGER_HAS_FLOAT128_T`, keeping the condition well formed everywhere. GCC still matches both `__float128` and `_Float128`; Clang matches `__float128` and never names the unsupported spelling
   - Pre-existing since v1.0.5; CI missed it because Linux used g++, macOS AppleClang on arm64 (where the macro is undefined) and Windows MSVC. A Clang-on-Linux job now covers it
+- Fix Release links failing under Clang on Linux
+  - `-flto=auto` is a GCC spelling, and Clang's LTO emits LLVM bitcode that GNU ld can only read through a gold plugin built from a matching LLVM version. Distributions routinely ship a mismatched pair, and the link then fails with "LLVM gold plugin has failed to create LTO module: Unknown attribute kind"
+  - Clang on Linux now uses ThinLTO through LLD when LLD is present, and skips LTO otherwise. GCC keeps `-flto=auto` and AppleClang keeps LTO through ld64, both unchanged
 - Truncate strings longer than 65534 bytes in `store_string_in_queue` instead of overflowing slick-queue's 16-bit reservation size field
 - Require slick-queue 1.5.0 or newer, which provides the slick-shm based shared-memory implementation
 - CI now builds the collector on every platform, and runs a dedicated ASan/UBSan job with `halt_on_error` so a sanitizer finding fails the build instead of only printing

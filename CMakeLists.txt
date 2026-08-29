@@ -68,9 +68,31 @@ if (MSVC)
     add_definitions(-D_WIN32_WINNT=0x0A00)
     set(CMAKE_SUPPRESS_REGENERATION true)   # supress zero_check
 else()
-    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto=auto")
     set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer")
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
+
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT APPLE)
+        # -flto=auto is a GCC spelling, and Clang's LTO emits LLVM bitcode that GNU
+        # ld can only read through a gold plugin built from a matching LLVM version.
+        # Distributions routinely ship a plugin older than the compiler (clang 18
+        # against an LLVM 16 plugin, say), and the link then fails with
+        # "LLVM gold plugin has failed to create LTO module: Unknown attribute kind".
+        # LLD always matches its compiler, so use ThinLTO through LLD where it
+        # exists and simply skip LTO where it does not: a slightly less optimized
+        # Release build beats one that cannot link.
+        find_program(SLICK_LOGGER_LLD NAMES ld.lld lld)
+        if (SLICK_LOGGER_LLD)
+            set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto=thin")
+            set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto=thin -fuse-ld=lld")
+            message(STATUS "slick-logger: Clang ThinLTO via ${SLICK_LOGGER_LLD}")
+        else()
+            set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
+            message(STATUS "slick-logger: LLD not found, building Release without LTO")
+        endif()
+    else()
+        # GCC, and AppleClang whose ld64 handles LTO natively.
+        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto=auto")
+    endif()
 endif()
 
 # Add tests (placeholder)
