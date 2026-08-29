@@ -1035,11 +1035,26 @@ inline void ISink::log_fatal(FormatT&& format, Args&&... args) {
  * @note Only valid on entries whose references have been resolved to addresses,
  *       which is always the case by the time a sink sees them.
  */
-inline std::string_view view_string_ref(const StringRef& ref) noexcept {
+inline std::string_view view_string_ref(StringRef ref) noexcept {
     if (!ref.ptr) {
         return {};
     }
     return ref.length ? std::string_view{ref.ptr, ref.length} : std::string_view{ref.ptr};
+}
+
+/**
+ * @brief Format a single log argument against one "{...}" spec
+ * @note The value is taken BY VALUE on purpose. LogEntry and LogArgument are
+ *       "#pragma pack(1)", so their members can sit at misaligned addresses,
+ *       and std::make_format_args binds a reference to whatever it is handed.
+ *       Binding that reference directly to a packed member is undefined
+ *       behavior - UBSan reports "reference binding to misaligned address".
+ *       Reading a packed member into a by-value parameter is well defined, and
+ *       the parameter itself is always suitably aligned.
+ */
+template<typename T>
+inline std::string format_one_arg(std::string_view format_spec, T value) {
+    return std::vformat(format_spec, std::make_format_args(value));
 }
 
 inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& entry) {
@@ -1110,60 +1125,61 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
             const auto& arg = entry.args[arg_index];
             std::string formatted_arg;
 
+            // Every case passes the union member by value through format_one_arg:
+            // these members are packed and may be misaligned, so a reference must
+            // never be bound directly to one. See format_one_arg.
             switch (arg.type) {
                 case ArgType::BOOL:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.b));
+                    formatted_arg = format_one_arg(format_spec, arg.value.b);
                     break;
                 case ArgType::CHAR:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.c));
+                    formatted_arg = format_one_arg(format_spec, arg.value.c);
                     break;
                 case ArgType::U_CHAR:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.uc));
+                    formatted_arg = format_one_arg(format_spec, arg.value.uc);
                     break;
                 // case ArgType::WCHAR:
-                //     formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.wc));
+                //     formatted_arg = format_one_arg(format_spec, arg.value.wc);
                 //     break;
                 case ArgType::INT8_T:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.i8));
+                    formatted_arg = format_one_arg(format_spec, arg.value.i8);
                     break;
                 case ArgType::UINT8_T:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.u8));
+                    formatted_arg = format_one_arg(format_spec, arg.value.u8);
                     break;
                 case ArgType::INT16_T:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.i16));
+                    formatted_arg = format_one_arg(format_spec, arg.value.i16);
                     break;
                 case ArgType::UINT16_T:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.u16));
+                    formatted_arg = format_one_arg(format_spec, arg.value.u16);
                     break;
                 case ArgType::INT32_T:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.i32));
+                    formatted_arg = format_one_arg(format_spec, arg.value.i32);
                     break;
                 case ArgType::UINT32_T:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.u32));
+                    formatted_arg = format_one_arg(format_spec, arg.value.u32);
                     break;
                 case ArgType::INT64_T:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.i64));
+                    formatted_arg = format_one_arg(format_spec, arg.value.i64);
                     break;
                 case ArgType::UINT64_T:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.u64));
+                    formatted_arg = format_one_arg(format_spec, arg.value.u64);
                     break;
                 case ArgType::FLOAT:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.f));
+                    formatted_arg = format_one_arg(format_spec, arg.value.f);
                     break;
                 case ArgType::DOUBLE:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.d));
+                    formatted_arg = format_one_arg(format_spec, arg.value.d);
                     break;
                 case ArgType::PTR:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.ptr));
+                    formatted_arg = format_one_arg(format_spec, arg.value.ptr);
                     break;
                 case ArgType::STRING_LITERAL:
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.literal_ptr));
+                    formatted_arg = format_one_arg(format_spec, arg.value.literal_ptr);
                     break;
-                case ArgType::STRING_DYNAMIC: {
-                    auto sv = view_string_ref(arg.value.dynamic_str);
-                    formatted_arg = std::vformat(format_spec, std::make_format_args(sv));
+                case ArgType::STRING_DYNAMIC:
+                    formatted_arg = format_one_arg(format_spec, view_string_ref(arg.value.dynamic_str));
                     break;
-                }
                 default:
                     formatted_arg = "<UNKNOWN>";
                     break;

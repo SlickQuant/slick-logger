@@ -16,6 +16,10 @@
   - In shared mode format strings and source file names are copied into the shared string ring instead of stored as pointers into the producer's read-only data
   - The collector resolves indices back to addresses before dispatching, so sinks always receive resolved pointers and custom sinks need no changes
   - Local mode keeps the zero-copy string-literal fast path; the added producer-side work is a predictable branch on a cached flag
+- Fix undefined behavior when formatting log arguments
+  - `std::make_format_args` binds a reference to its argument, and `LogArgument` lives in a `#pragma pack(1)` struct, so the reference could bind to a misaligned address (UBSan: "reference binding to misaligned address")
+  - Argument values now go through `format_one_arg()`, which takes them by value so the reference binds to an aligned parameter; `view_string_ref()` likewise takes its `StringRef` by value
+  - Pre-existing, and reachable from any log call with a multi-byte argument; previously unreported because UBSan only printed rather than failing the build
 - Truncate strings longer than 65534 bytes in `store_string_in_queue` instead of overflowing slick-queue's 16-bit reservation size field
 - Require slick-queue 1.5.0 or newer, which provides the slick-shm based shared-memory implementation
 - CI now builds the collector on every platform, and runs a dedicated ASan/UBSan job with `halt_on_error` so a sanitizer finding fails the build instead of only printing
