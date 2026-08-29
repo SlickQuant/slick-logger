@@ -1,4 +1,4 @@
-# v1.2.0
+# v1.2.0 - 08-29-2026
 - Add multi-process logging over a shared-memory slick-queue
   - New `LogConfig::mode` selects `QueueMode::Local` (default, unchanged behavior), `QueueMode::SharedProducer`, or `QueueMode::SharedCollector`
   - A collector process owns the sinks and the writer thread; producer processes have neither and only enqueue entries into the shared ring
