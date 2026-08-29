@@ -9,7 +9,74 @@ permissions:
   contents: write
 
 jobs:
+  # The library itself is header-only, but the multi-process collector is a real
+  # executable, so it has to be built per platform and attached to the release.
+  build-collector:
+    name: Build collector (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: macos-latest
+            platform: macos-arm64
+          - os: windows-latest
+            platform: windows-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: get_version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_SLICK_LOGGER_COLLECTOR=ON
+          -DBUILD_SLICK_LOGGER_TESTING=OFF
+          -DBUILD_SLICK_LOGGER_EXAMPLES=OFF
+
+      - name: Build collector
+        run: cmake --build build --config Release --target slick_log_collector
+
+      # Installing normalizes the output path: single-config generators put the
+      # binary in build/tools, multi-config ones in build/tools/Release.
+      - name: Stage binary
+        run: cmake --install build --config Release --prefix stage
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          chmod +x stage/bin/slick_log_collector
+          tar -czf "slick-log-collector-${{ steps.get_version.outputs.VERSION }}-${{ matrix.platform }}.tar.gz" \
+            -C stage/bin slick_log_collector
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path stage/bin/slick_log_collector.exe `
+            -DestinationPath "slick-log-collector-${{ steps.get_version.outputs.VERSION }}-${{ matrix.platform }}.zip"
+
+      - name: Upload collector artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collector-${{ matrix.platform }}
+          path: |
+            slick-log-collector-*.tar.gz
+            slick-log-collector-*.zip
+          if-no-files-found: error
+
   create-release:
+    needs: build-collector
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -47,6 +114,12 @@ jobs:
           zip -r ./slick-logger-${{ steps.get_version.outputs.VERSION }}.zip include/
           tar -czf ./slick-logger-${{ steps.get_version.outputs.VERSION }}.tar.gz include/
 
+      - name: Download collector binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: collector-*
+          merge-multiple: true
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -56,9 +129,21 @@ jobs:
 
             ${{ steps.changelog.outputs.CHANGELOG_CONTENT }}
 
+            ## Downloads
+
+            The library is header-only: take `slick-logger-${{ steps.get_version.outputs.VERSION }}.zip`
+            or `.tar.gz` and add `include/` to your include path.
+
+            `slick-log-collector-*` contains the prebuilt standalone collector for
+            [multi-process logging](https://github.com/SlickQuant/slick-logger#multi-process-logging-shared-memory).
+            It is optional; you only need it to collect log entries from several
+            processes into one set of sinks.
+
           draft: true
           prerelease: false
           generate_release_notes: false
           files: |
             slick-logger-${{ steps.get_version.outputs.VERSION }}.zip
             slick-logger-${{ steps.get_version.outputs.VERSION }}.tar.gz
+            slick-log-collector-*.tar.gz
+            slick-log-collector-*.zip

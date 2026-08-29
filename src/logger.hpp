@@ -29,6 +29,7 @@
 #include <string>
 #include <cstring>
 #include <cstdint>
+#include <algorithm>
 #include <thread>
 #include <atomic>
 #include <filesystem>
@@ -53,6 +54,13 @@
 #include <time.h>
 #endif
 
+// Process id lookup, used to stamp entries in multi-process (shared memory) mode
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #define SLICK_LOGGER_VERSION_MAJOR @slick-logger_VERSION_MAJOR@
 #define SLICK_LOGGER_VERSION_MINOR @slick-logger_VERSION_MINOR@
 #define SLICK_LOGGER_VERSION_PATCH @slick-logger_VERSION_PATCH@
@@ -60,6 +68,13 @@
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20
+#endif
+
+// Size of the inline per-entry process tag, including the terminating NUL.
+// Stored inline rather than in the string ring because the ring is lossy: a tag
+// written once at init would be silently overwritten when the ring wraps.
+#ifndef SLICK_LOGGER_TAG_SIZE
+#define SLICK_LOGGER_TAG_SIZE 16
 #endif
 
 #ifndef SLICK_LOGGER_ENABLE_SOURCE_LOCATION
@@ -249,10 +264,53 @@ inline constexpr bool is_single_format_args_v =
     sizeof...(Args) == 1 &&
     (std::is_convertible_v<std::decay_t<Args>, std::format_args> || ...);
 
+/**
+ * @brief Where a Logger's ring buffers live and what role it plays
+ *
+ * Local            - process-private heap queues; the logger owns a writer thread and sinks.
+ * SharedProducer   - queues live in named shared memory; the logger only enqueues entries.
+ *                    It has no writer thread and no sinks; a collector process owns those.
+ * SharedCollector  - queues live in named shared memory; this logger owns the writer thread
+ *                    and the sinks, and drains entries produced by every attached process
+ *                    (including its own).
+ */
+enum class QueueMode : uint8_t {
+    Local,
+    SharedProducer,
+    SharedCollector
+};
+
+/**
+ * @brief Per-entry flags stored in LogEntry::flags
+ */
+// String references in this entry are ring-buffer indices, not addresses.
+// Set by producers whose queues live in shared memory, because the segment maps
+// at a different base address in every process.
+inline constexpr uint8_t kEntryOffsets = 0x01;
+// The entry carries a valid source file/line. Needed as an explicit flag because
+// ring index 0 is a legitimate string reference and cannot double as a null sentinel.
+inline constexpr uint8_t kEntryHasSourceLocation = 0x02;
+
 #pragma pack(push, 1)
+/**
+ * @brief Reference to a string, either by address or by ring-buffer index
+ *
+ * In Local mode `ptr` addresses either a string literal in the caller's read-only
+ * data or a copy inside the process-private string ring. In shared-memory mode
+ * `offset` holds the slick-queue reserve index of a copy inside the shared string
+ * ring, which the collector resolves against its own mapping of that segment.
+ */
 struct StringRef {
-    const char* ptr;    // Pointer to string data
-    uint32_t length;    // String length
+    union {
+        const char* ptr;    // Pointer to string data (entry without kEntryOffsets)
+        uint64_t offset;    // String ring reserve index (entry with kEntryOffsets)
+    };
+    uint32_t length;    // String length; 0 means "NUL-terminated, length unknown"
+
+    // Deliberately left as an aggregate with no user-provided constructors:
+    // LogArgument stores a StringRef inside a union, and any non-trivial default
+    // constructor here would delete that union's (and therefore LogEntry's)
+    // default constructor. Build one with braces, e.g. StringRef{"text"}.
 };
 
 struct LogArgument {
@@ -279,16 +337,28 @@ struct LogArgument {
 };
 
 struct LogEntry {
-    const char* format_ptr; // Format string
+    StringRef format; // Format string
     uint64_t timestamp; // nanoseconds since epoch
-    const char* file_name = nullptr; // Source file name captured by LOG_* macros
+    StringRef file{}; // Source file name captured by LOG_* macros
+    uint32_t pid = 0; // Producing process id; 0 in single-process (Local) mode
     uint32_t line = 0; // Source line captured by LOG_* macros
     int sink_index = -1; // Optional sink index, logged by that sink only
     LogLevel level;
+    uint8_t flags = 0; // kEntryOffsets / kEntryHasSourceLocation
     uint8_t arg_count = 0; // Number of arguments
+    char tag[SLICK_LOGGER_TAG_SIZE] = {}; // NUL-padded producer tag; empty in Local mode
     LogArgument args[SLICK_LOGGER_MAX_ARGS];
+
+    // Sinks always receive entries whose string references have been resolved to
+    // addresses, so these accessors are safe from any sink implementation.
+    const char* format_ptr() const noexcept { return format.ptr; }
+    const char* file_name() const noexcept { return file.ptr; }
 };
 #pragma pack(pop)
+
+inline constexpr bool has_source_location(const LogEntry& entry) noexcept {
+    return (entry.flags & kEntryHasSourceLocation) != 0;
+}
 
 class ISink {
 public:
@@ -469,6 +539,30 @@ struct LogConfig {
     size_t log_queue_size = 65536;
     size_t string_buffer_size = 1 << 24; // 16MB
     bool include_source_location = true;
+
+    // ---- Multi-process (shared memory) settings; ignored when mode is Local ----
+
+    /// Where the ring buffers live and what role this logger plays.
+    QueueMode mode = QueueMode::Local;
+    /// Name of the shared memory segment. Required when mode is not Local.
+    /// Must be 1-24 characters of [A-Za-z0-9_]; a "_str" suffixed companion
+    /// segment holds the string ring, and the combined name has to stay within
+    /// the shortest platform limit (31 characters on macOS).
+    std::string shared_memory_name;
+    /// Optional short label identifying this process in the output, e.g. "feed".
+    /// Truncated to SLICK_LOGGER_TAG_SIZE - 1 characters.
+    std::string process_tag;
+    /// Collector only. When true, a collector attaching to a segment that already
+    /// holds entries picks up everything still resident in the ring instead of
+    /// starting at the current write cursor. This is what makes it safe to start
+    /// producers before the collector. Set false when a restarting collector must
+    /// not re-emit entries a previous instance already wrote.
+    bool collect_backlog = true;
+    /// Collector only. A producer that is killed between reserve() and publish()
+    /// leaves a hole that would stall the collector forever. After this long with
+    /// no progress while entries are known to be reserved ahead, the collector
+    /// skips the stalled slot. Zero disables the recovery.
+    uint32_t stalled_entry_timeout_ms = 5000;
 };
 
 /**
@@ -489,8 +583,24 @@ public:
     /**
      * @brief Initialize the logger with a configuration struct
      * @param config LogConfig struct with sinks and settings
+     *
+     * Also the entry point for multi-process logging: set config.mode to
+     * QueueMode::SharedCollector in the process that owns the sinks and
+     * QueueMode::SharedProducer in every process that only emits log entries,
+     * with the same config.shared_memory_name in all of them. Startup order does
+     * not matter; whichever process gets there first creates the segments.
      */
     void init(const LogConfig& config);
+
+    /**
+     * @brief Get the queue mode this logger was initialized with
+     */
+    QueueMode mode() const noexcept { return mode_; }
+
+    /**
+     * @brief Get the shared memory segment name, empty unless mode() is a shared role
+     */
+    const std::string& shared_memory_name() const noexcept { return shm_name_; }
 
     /**
      * @brief Initialize logger with pre-added sinks - sinks should be added before calling this
@@ -791,20 +901,56 @@ private:
     Logger(Logger&&) = delete;
     Logger& operator=(Logger&&) = delete;
 
+    /// Outcome of a single writer-thread step, see drain_pending().
+    enum class DrainResult : uint8_t {
+        Wrote,           // entries were handed to the sinks
+        Idle,            // nothing available and the read cursor has caught up
+        WaitingOnStall,  // a slot ahead of us is reserved but still unpublished
+        SkippedStalled   // that slot was abandoned after stalled_entry_timeout_ms
+    };
+
     void start();
     void writer_thread_func();
+    /// Perform one read/dispatch step, including stalled-slot recovery.
+    /// Shared by the running loop and the shutdown drain so the two cannot diverge.
+    DrainResult drain_pending();
     void write_log_entry(const LogEntry* entry_ptr, uint32_t count);
+    void dispatch_entry(const LogEntry& entry);
     void set_source_location_options(bool enabled) noexcept;
-    
+
     // Helper function to round up to next power of 2
     static size_t round_up_to_power_of_2(size_t value) noexcept;
-    
+
     template<typename T>
     void enqueue_argument(LogArgument& arg, T&& value);
 
     void enqueue_format_args(LogEntry& entry, std::format_args fa);
 
     StringRef store_string_in_queue(std::string_view str);
+
+    // ---- Multi-process helpers ----
+
+    /// Create the shared-memory backed queues and cache the per-entry stamp
+    /// (pid, tag, kEntryOffsets) for the requested role.
+    void setup_shared_queues(const LogConfig& config, uint32_t queue_size, uint32_t string_buffer_size);
+
+    /// Validate a segment name and throw a descriptive error when it is unusable.
+    static void validate_shared_memory_name(const std::string& name);
+
+    /// Attach to an existing segment when one is there, otherwise create it.
+    /// This is what makes producer and collector startup order irrelevant, and it
+    /// lets a producer inherit the collector's sizing when the collector went first.
+    template<typename T>
+    static std::unique_ptr<slick::SlickQueue<T>> open_shared_queue(const std::string& name, uint32_t size);
+
+    /// Turn an entry's ring indices back into addresses valid in this process.
+    void rebase_entry(LogEntry& entry) const noexcept;
+
+    /// Record a shared-memory queue this process created and must never destroy,
+    /// see shutdown(). The registry is itself never freed, which keeps the
+    /// retained queues reachable: leak detectors report unreachable allocations,
+    /// so an intentional retention must stay visible to avoid a false positive.
+    static void retain_shared_queue(void* queue) noexcept;
 
     std::unique_ptr<slick::SlickQueue<LogEntry>> log_queue_;
     std::unique_ptr<slick::SlickQueue<char>> string_queue_;
@@ -817,6 +963,23 @@ private:
     static constexpr uint8_t kSourceLocationEnabled = 0x01;
     std::atomic<uint8_t> source_location_options_{kSourceLocationEnabled};
     std::unordered_map<std::string_view, int> sinkname_index_map_;
+
+    // ---- Multi-process state; all inert while mode_ is Local ----
+    QueueMode mode_ = QueueMode::Local;
+    // Cached per-entry stamp, applied on the caller thread by log_to_sink_with_location.
+    // Holding these as members keeps the hot path to a load plus a fixed-size copy.
+    uint8_t entry_flags_ = 0;
+    uint32_t pid_ = 0;
+    char tag_[SLICK_LOGGER_TAG_SIZE] = {};
+    std::string shm_name_;
+    bool collect_backlog_ = true;
+    uint32_t stalled_entry_timeout_ms_ = 0;
+    // Scratch used by the writer thread to rebase shared-memory entries. Owned by
+    // that thread alone, so no synchronization is needed.
+    LogEntry rebase_scratch_{};
+    // When the writer thread first noticed an unpublished slot blocking progress.
+    // Writer-thread-only, like rebase_scratch_.
+    std::chrono::steady_clock::time_point stalled_since_{};
 
     // The logger instance local to this shared library / executable.
     // override_instance_ points here by default.
@@ -867,16 +1030,28 @@ inline void ISink::log_fatal(FormatT&& format, Args&&... args) {
     log(LogLevel::L_FATAL, std::forward<FormatT>(format), std::forward<Args>(args)...);
 }
 
+/**
+ * @brief View a resolved StringRef, preferring the stored length over a strlen scan
+ * @note Only valid on entries whose references have been resolved to addresses,
+ *       which is always the case by the time a sink sees them.
+ */
+inline std::string_view view_string_ref(const StringRef& ref) noexcept {
+    if (!ref.ptr) {
+        return {};
+    }
+    return ref.length ? std::string_view{ref.ptr, ref.length} : std::string_view{ref.ptr};
+}
+
 inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& entry) {
     if (entry.arg_count == 0) {
-        return std::make_pair(entry.format_ptr, true);
+        return std::make_pair(std::string{view_string_ref(entry.format)}, true);
     }
 
     // Since std::make_format_args doesn't work with custom types in MSVC,
     // we'll use a manual implementation that preserves std::format functionality
     // by manually parsing format specifiers and applying them to each argument
     try {
-        std::string format_str = entry.format_ptr;
+        std::string format_str{view_string_ref(entry.format)};
         std::string result;
         result.reserve(format_str.length() + 256); // Reserve some space for formatting
 
@@ -985,7 +1160,7 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                     formatted_arg = std::vformat(format_spec, std::make_format_args(arg.value.literal_ptr));
                     break;
                 case ArgType::STRING_DYNAMIC: {
-                    auto sv = std::string_view(arg.value.dynamic_str.ptr, arg.value.dynamic_str.length);
+                    auto sv = view_string_ref(arg.value.dynamic_str);
                     formatted_arg = std::vformat(format_spec, std::make_format_args(sv));
                     break;
                 }
@@ -1009,27 +1184,60 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
 }
 
 inline void append_source_location(std::string& result, const LogEntry& entry) {
-    if (!has_source_location(entry.file_name, entry.line)) {
+    if (!has_source_location(entry)) {
         return;
     }
     result += " [";
-    result += entry.file_name;
+    result += view_string_ref(entry.file);
     result += ':';
     result += std::to_string(entry.line);
     result += ']';
 }
 
+inline size_t decimal_digits(uint32_t value) noexcept {
+    size_t digits = 1;
+    for (uint32_t v = value; v >= 10; v /= 10) {
+        ++digits;
+    }
+    return digits;
+}
+
 inline size_t source_location_size(const LogEntry& entry) {
-    if (!has_source_location(entry.file_name, entry.line)) {
+    if (!has_source_location(entry)) {
         return 0;
     }
 
-    size_t line_digits = 1;
-    for (uint32_t line = entry.line; line >= 10; line /= 10) {
-        ++line_digits;
-    }
+    return view_string_ref(entry.file).size() + decimal_digits(entry.line) + 4; // " [", ':', ']'
+}
 
-    return std::strlen(entry.file_name) + line_digits + 4; // " [", ':', ']'
+/**
+ * @brief Append the producing process id (and tag, when set) to a formatted line
+ *
+ * Only multi-process entries carry a pid, so single-process output is unaffected.
+ */
+inline void append_process_id(std::string& result, const LogEntry& entry) {
+    if (entry.pid == 0) {
+        return;
+    }
+    result += " [";
+    result += std::to_string(entry.pid);
+    if (entry.tag[0] != '\0') {
+        result += ':';
+        result.append(entry.tag, strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE));
+    }
+    result += ']';
+}
+
+inline size_t process_id_size(const LogEntry& entry) {
+    if (entry.pid == 0) {
+        return 0;
+    }
+    size_t size = decimal_digits(entry.pid) + 3; // " [", ']'
+    const size_t tag_length = strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE);
+    if (tag_length) {
+        size += tag_length + 1; // ':'
+    }
+    return size;
 }
 
 inline ConsoleSink::ConsoleSink(bool use_colors, bool use_stderr_for_errors,
@@ -1067,15 +1275,17 @@ inline std::string ConsoleSink::format_log_entry(const LogEntry& entry) {
         level_str = "ERROR";
     }
     std::string result;
-    result.reserve(timestamp.size() + level_str.size() + source_location_size(entry) + message.size() + 4);
+    result.reserve(timestamp.size() + level_str.size() + process_id_size(entry)
+                   + source_location_size(entry) + message.size() + 4);
     result += timestamp;
     result += " [";
     result += level_str;
     result += ']';
+    append_process_id(result, entry);
     append_source_location(result, entry);
     result += ' ';
     result += message;
-    
+
     if (use_colors_) {
         return get_color_code(entry.level) + result + get_reset_code();
     }
@@ -1146,11 +1356,13 @@ inline std::string FileSink::format_log_entry(const LogEntry& entry) {
         level_str = "ERROR";
     }
     std::string result;
-    result.reserve(timestamp.size() + level_str.size() + source_location_size(entry) + message.size() + 4);
+    result.reserve(timestamp.size() + level_str.size() + process_id_size(entry)
+                   + source_location_size(entry) + message.size() + 4);
     result += timestamp;
     result += " [";
     result += level_str;
     result += ']';
+    append_process_id(result, entry);
     append_source_location(result, entry);
     result += ' ';
     result += message;
@@ -1523,38 +1735,138 @@ inline void Logger::init(const std::filesystem::path& log_file, size_t log_queue
 
 inline void Logger::start() {
     running_ = true;
-    
-    // Initialize read_index_ before starting the thread
-    read_index_ = log_queue_->initial_reading_index();
-    
-    writer_thread_ = std::thread([this]() { writer_thread_func(); });
-    
-    // Give a small delay to ensure writer thread is started
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    // A shared-memory producer has no sinks and no writer thread: the collector
+    // process owns both and drains the shared queue on everyone's behalf.
+    if (mode_ != QueueMode::SharedProducer) {
+        // Initialize read_index_ before starting the thread
+        read_index_ = log_queue_->initial_reading_index();
+        if (mode_ == QueueMode::SharedCollector && collect_backlog_) {
+            // Producers may already have published into this segment before the
+            // collector attached. Rewind to the oldest slot the ring can still
+            // hold so nothing buffered is dropped; anything older than that has
+            // been overwritten already.
+            const uint64_t capacity = log_queue_->size();
+            read_index_ = read_index_ > capacity ? read_index_ - capacity : 0;
+        }
+
+        writer_thread_ = std::thread([this]() { writer_thread_func(); });
+
+        // Give a small delay to ensure writer thread is started
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     log(LogLevel::L_INFO, "SlickLogger v{}", SLICK_LOGGER_VERSION);
 }
 
 inline void Logger::init(const LogConfig& config) {
     shutdown(); // make sure the logger is stopped
 
-    if (config.sinks.empty()) {
+    if (config.mode == QueueMode::SharedProducer) {
+        // The collector process owns the sinks; a producer that also held sinks
+        // would write the same entry twice and defeat the point of centralizing.
+        if (!config.sinks.empty()) {
+            throw std::runtime_error(
+                "SharedProducer mode must not define sinks. The collector process owns the sinks.");
+        }
+    }
+    else if (config.sinks.empty()) {
         throw std::runtime_error("No sink. Sinks should be added in the config.");
     }
-    
+
     for (auto& sink : config.sinks) {
         add_sink(sink);
     }
-    
+
     set_level(config.min_level);
     set_source_location_options(config.include_source_location);
-    
+
     // Ensure queue_size is power of 2
     size_t log_queue_size = round_up_to_power_of_2(config.log_queue_size);
     size_t string_buffer_size = round_up_to_power_of_2(config.string_buffer_size);
 
-    log_queue_ = std::make_unique<slick::SlickQueue<LogEntry>>(static_cast<uint32_t>(log_queue_size));
-    string_queue_ = std::make_unique<slick::SlickQueue<char>>(static_cast<uint32_t>(string_buffer_size));
+    if (config.mode == QueueMode::Local) {
+        log_queue_ = std::make_unique<slick::SlickQueue<LogEntry>>(static_cast<uint32_t>(log_queue_size));
+        string_queue_ = std::make_unique<slick::SlickQueue<char>>(static_cast<uint32_t>(string_buffer_size));
+    }
+    else {
+        setup_shared_queues(config, static_cast<uint32_t>(log_queue_size),
+                            static_cast<uint32_t>(string_buffer_size));
+    }
     start();
+}
+
+inline void Logger::validate_shared_memory_name(const std::string& name) {
+    // The string ring lives in a companion segment named "<name>_str", and macOS
+    // caps shm_open names at 31 characters, so the base name has to leave room.
+    constexpr size_t kMaxNameLength = 24;
+
+    if (name.empty()) {
+        throw std::runtime_error("shared_memory_name is required when mode is not QueueMode::Local.");
+    }
+    if (name.size() > kMaxNameLength) {
+        throw std::runtime_error("shared_memory_name '" + name + "' is longer than "
+                                 + std::to_string(kMaxNameLength) + " characters.");
+    }
+    for (char c : name) {
+        const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                          || (c >= '0' && c <= '9') || c == '_';
+        if (!allowed) {
+            throw std::runtime_error("shared_memory_name '" + name +
+                                     "' may only contain characters in [A-Za-z0-9_].");
+        }
+    }
+}
+
+template<typename T>
+inline std::unique_ptr<slick::SlickQueue<T>> Logger::open_shared_queue(const std::string& name, uint32_t size) {
+    try {
+        // Attach to a segment somebody else already created. Sizing then comes
+        // from its header, so a producer automatically matches the collector.
+        return std::make_unique<slick::SlickQueue<T>>(name.c_str());
+    }
+    catch (const std::exception&) {
+        // Nothing there yet: create it (still create-or-attach, so a process that
+        // loses the race to another creator simply attaches instead).
+        return std::make_unique<slick::SlickQueue<T>>(size, name.c_str());
+    }
+}
+
+inline void Logger::setup_shared_queues(const LogConfig& config, uint32_t queue_size, uint32_t string_buffer_size) {
+    validate_shared_memory_name(config.shared_memory_name);
+
+    shm_name_ = config.shared_memory_name;
+    mode_ = config.mode;
+    collect_backlog_ = config.collect_backlog;
+    stalled_entry_timeout_ms_ = config.stalled_entry_timeout_ms;
+
+    try {
+        log_queue_ = open_shared_queue<LogEntry>(shm_name_, queue_size);
+        string_queue_ = open_shared_queue<char>(shm_name_ + "_str", string_buffer_size);
+    }
+    catch (const std::exception& e) {
+        log_queue_.reset();
+        string_queue_.reset();
+        mode_ = QueueMode::Local;
+        shm_name_.clear();
+        // A size or element-size mismatch means another process attached to the
+        // same name with different settings or a different build of the header.
+        throw std::runtime_error("Failed to attach shared log queue '" + config.shared_memory_name
+                                 + "': " + e.what()
+                                 + ". All processes must agree on slick-logger version, "
+                                   "SLICK_LOGGER_MAX_ARGS, log_queue_size and string_buffer_size.");
+    }
+
+    // String references become ring indices so the collector can resolve them
+    // against its own mapping of the segment.
+    entry_flags_ = kEntryOffsets;
+#ifdef _WIN32
+    pid_ = static_cast<uint32_t>(::_getpid());
+#else
+    pid_ = static_cast<uint32_t>(::getpid());
+#endif
+    std::memset(tag_, 0, sizeof(tag_));
+    const size_t tag_length = std::min(config.process_tag.size(), sizeof(tag_) - 1);
+    std::memcpy(tag_, config.process_tag.data(), tag_length);
 }
 
 inline void Logger::add_sink(std::shared_ptr<ISink> sink) {
@@ -1711,24 +2023,39 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
     auto now = std::chrono::system_clock::now();
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 
+    // In shared-memory mode every string reference must be a ring index, because
+    // the segment maps at a different base address in each attached process.
+    const bool use_offsets = (entry_flags_ & kEntryOffsets) != 0;
+
     LogEntry entry;
     entry.level = level;
     entry.timestamp = ns;
+    entry.flags = entry_flags_;
+    entry.pid = pid_;
+    std::memcpy(entry.tag, tag_, sizeof(entry.tag));
     if (has_source_location(file_name, line)) {
-        entry.file_name = copy_file_name ? store_string_in_queue(file_name).ptr : file_name;
+        // A static file name lives in the caller's read-only data, which no other
+        // process can address, so shared mode always copies it into the ring.
+        entry.file = (copy_file_name || use_offsets)
+            ? store_string_in_queue(file_name)
+            : StringRef{file_name, 0};
         entry.line = line;
+        entry.flags |= kEntryHasSourceLocation;
     }
     entry.sink_index = sink_index;
     if constexpr (IS_STRING_LITERAL(format)) {
-        entry.format_ptr = format;  // String literal - safe to store pointer
+        constexpr uint32_t format_length = static_cast<uint32_t>(sizeof(format) - 1);
+        entry.format = use_offsets
+            ? store_string_in_queue(std::string_view{format, format_length})
+            : StringRef{format, format_length};  // String literal - safe to store pointer
     }
     else {
         // Non-literal format strings are copied into the string queue so their
         // lifetime extends until the writer thread consumes the entry.
         static_assert(std::is_convertible_v<FormatT, std::string_view>,
                       "Format string type must be a string literal or convertible to std::string_view.");
-        entry.format_ptr = store_string_in_queue(
-            std::string_view{std::forward<FormatT>(format)}).ptr;
+        entry.format = store_string_in_queue(
+            std::string_view{std::forward<FormatT>(format)});
     }
 
     if constexpr (is_single_format_args_v<Args...>) {
@@ -1882,7 +2209,10 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
 }
 
 inline StringRef Logger::store_string_in_queue(std::string_view str) {
-    uint32_t length = str.length();
+    // slick-queue packs the reservation size into 16 bits, so an over-long string
+    // would corrupt the write cursor. Truncate instead.
+    constexpr uint32_t kMaxStringLength = 65534;
+    uint32_t length = static_cast<uint32_t>(std::min<size_t>(str.length(), kMaxStringLength));
     auto len = length + 1; // +1 for null terminator
 
     // Reserve space in string queue
@@ -1892,14 +2222,22 @@ inline StringRef Logger::store_string_in_queue(std::string_view str) {
     if (length) {
         // Copy only the string payload, then terminate explicitly.
         std::memcpy(dest, str.data(), length);
-        dest[length] = '\0';
-    } 
-    else {
-        *dest = '\0';
-    } 
+    }
+    dest[length] = '\0';
     // Publish the string data
     string_queue_->publish(start_index, len);
-    return StringRef{dest, length};
+
+    StringRef ref;
+    if (entry_flags_ & kEntryOffsets) {
+        // Shared memory: hand out the ring index, which every attached process
+        // can resolve against its own mapping.
+        ref.offset = start_index;
+    }
+    else {
+        ref.ptr = dest;
+    }
+    ref.length = length;
+    return ref;
 }
 
 inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
@@ -1936,6 +2274,32 @@ inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
     entry.arg_count = static_cast<uint8_t>(arg_idx);
 }
 
+inline void Logger::retain_shared_queue(void* queue) noexcept {
+    if (!queue) {
+        return;
+    }
+    struct RetainedQueue {
+        void* queue;
+        RetainedQueue* next;
+    };
+    // Never emptied, and the head is a static so leak detectors treat it as a
+    // root: that is what keeps the retained queues reachable rather than looking
+    // like lost allocations. A by-value container would be destroyed at exit, and
+    // its ordering against the detector's final scan is not guaranteed.
+    static std::atomic<RetainedQueue*> head{nullptr};
+
+    auto* node = new (std::nothrow) RetainedQueue{queue, nullptr};
+    if (!node) {
+        // The queue is retained regardless; the registry only records it.
+        return;
+    }
+    node->next = head.load(std::memory_order_relaxed);
+    while (!head.compare_exchange_weak(node->next, node,
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed)) {
+    }
+}
+
 inline void Logger::shutdown(bool clear_sinks) {
     if (running_.load(std::memory_order_relaxed)) {
         running_.store(false, std::memory_order_release);
@@ -1952,8 +2316,38 @@ inline void Logger::shutdown(bool clear_sinks) {
         sinkname_index_map_.clear();
         sinks_.clear();
     }
+#ifndef _WIN32
+    // POSIX only: slick-queue's destructor shm_unlink()s a segment this process
+    // created. Unlinking frees the NAME while existing mappings stay valid, so any
+    // process still attached would keep draining memory that newcomers can no
+    // longer reach - they would create a fresh segment under the same name and
+    // their entries would silently vanish. Producer-first startup makes this easy
+    // to hit: a short-lived first producer would strand the collector.
+    //
+    // Nobody can safely unlink while others might still attach, so the creating
+    // handle is retained for the life of the process instead of destroyed. The OS
+    // reclaims the mapping at exit; the name persists until removed (see the POSIX
+    // cleanup note in the README).
+    //
+    // use_shm() must be checked as well: a local heap queue also reports
+    // own_buffer() == true, and retaining that one would hold the whole buffer.
+    if (log_queue_ && log_queue_->use_shm() && log_queue_->own_buffer()) {
+        retain_shared_queue(log_queue_.release());
+    }
+    if (string_queue_ && string_queue_->use_shm() && string_queue_->own_buffer()) {
+        retain_shared_queue(string_queue_.release());
+    }
+#endif
     log_queue_.reset();
     string_queue_.reset();
+
+    mode_ = QueueMode::Local;
+    entry_flags_ = 0;
+    pid_ = 0;
+    std::memset(tag_, 0, sizeof(tag_));
+    shm_name_.clear();
+    collect_backlog_ = true;
+    stalled_entry_timeout_ms_ = 0;
 }
 
 inline Logger::~Logger() {
@@ -1962,6 +2356,12 @@ inline Logger::~Logger() {
 
 inline void Logger::flush() {
     if (!running_.load(std::memory_order_relaxed) || !log_queue_) {
+        return;
+    }
+    if (mode_ == QueueMode::SharedProducer) {
+        // No local writer thread: entries are published to the shared queue the
+        // moment log() returns, and only the collector process can observe them
+        // reaching a sink. Publishing is all this process can guarantee.
         return;
     }
     // Snapshot the write cursor: any entry reserved before this point has
@@ -1982,52 +2382,127 @@ inline void Logger::reset() {
     source_location_options_.store(kSourceLocationEnabled, std::memory_order_relaxed);
 }
 
-inline void Logger::writer_thread_func() {
-    while (running_.load(std::memory_order_relaxed)) {
-        auto [entry_ptr, count] = log_queue_->read(read_index_);
-        if (entry_ptr) {
-            write_log_entry(entry_ptr, count);
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Small delay if no data
-        }
+inline Logger::DrainResult Logger::drain_pending() {
+    auto [entry_ptr, count] = log_queue_->read(read_index_);
+    if (entry_ptr && count) {
+        write_log_entry(entry_ptr, count);
+        stalled_since_ = {};
+        return DrainResult::Wrote;
     }
-    
-    // Drain remaining messages after running_ becomes false
-    while (true) {
-        auto [entry_ptr, count] = log_queue_->read(read_index_);
-        if (!entry_ptr || count == 0) {
+
+    // A producer process killed between reserve() and publish() leaves a hole that
+    // read() will never return, stalling every entry behind it. Only shared queues
+    // can be orphaned this way, so the recovery is scoped to the collector role.
+    const bool recover_stalls = (mode_ == QueueMode::SharedCollector) && stalled_entry_timeout_ms_ > 0;
+    if (!recover_stalls || log_queue_->initial_reading_index() <= read_index_) {
+        stalled_since_ = {};
+        return DrainResult::Idle;
+    }
+
+    // Entries are reserved ahead of us but this slot never got published.
+    const auto now = std::chrono::steady_clock::now();
+    if (stalled_since_ == std::chrono::steady_clock::time_point{}) {
+        stalled_since_ = now;
+        return DrainResult::WaitingOnStall;
+    }
+    if (now - stalled_since_ < std::chrono::milliseconds(stalled_entry_timeout_ms_)) {
+        return DrainResult::WaitingOnStall;
+    }
+
+    ++read_index_;
+    stalled_since_ = {};
+    return DrainResult::SkippedStalled;
+}
+
+inline void Logger::writer_thread_func() {
+    stalled_since_ = {};
+
+    while (running_.load(std::memory_order_relaxed)) {
+        switch (drain_pending()) {
+        case DrainResult::Wrote:
+            break;
+        case DrainResult::SkippedStalled:
+            log(LogLevel::L_WARN, "SlickLogger: skipped an unpublished log entry, "
+                                  "a producer process likely died mid-write");
+            break;
+        case DrainResult::WaitingOnStall:
+        case DrainResult::Idle:
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Small delay if no data
             break;
         }
-        write_log_entry(entry_ptr, count);
     }
+
+    // Drain remaining messages after running_ becomes false. A hole must be
+    // abandoned here too, not just waited out: entries published behind it are
+    // still valid and would otherwise be lost on shutdown. Skipping cannot loop
+    // forever because every skip advances read_index_ toward the write cursor.
+    // Nothing is logged about a skip during the drain, because running_ is already
+    // false and the entry could never be consumed.
+    stalled_since_ = {};
+    while (true) {
+        const DrainResult result = drain_pending();
+        if (result == DrainResult::Idle) {
+            break;
+        }
+        if (result == DrainResult::WaitingOnStall) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
+
+inline void Logger::rebase_entry(LogEntry& entry) const noexcept {
+    entry.format.ptr = (*string_queue_)[entry.format.offset];
+    if (entry.flags & kEntryHasSourceLocation) {
+        entry.file.ptr = (*string_queue_)[entry.file.offset];
+    }
+    for (uint8_t i = 0; i < entry.arg_count; ++i) {
+        LogArgument& arg = entry.args[i];
+        if (arg.type == ArgType::STRING_DYNAMIC || arg.type == ArgType::STRING_LITERAL) {
+            arg.value.dynamic_str.ptr = (*string_queue_)[arg.value.dynamic_str.offset];
+        }
+    }
+    entry.flags &= static_cast<uint8_t>(~kEntryOffsets);
 }
 
 inline void Logger::write_log_entry(const LogEntry* entry_ptr, uint32_t count) {
     for (uint32_t i = 0; i < count; ++i) {
         const LogEntry& entry = entry_ptr[i];
-        if (entry.sink_index >= 0 && static_cast<size_t>(entry.sink_index) < sinks_.size()) {
-            // Write to specific sink
-            auto &sink = sinks_[entry.sink_index];
-            if (entry.level < sink->min_level()) {
-                continue; // Skip if log level is below sink's minimum level
-            }
-            sink->write(entry);
+        if (entry.flags & kEntryOffsets) {
+            // Came from shared memory: copy it out and turn the ring indices into
+            // addresses valid here, so sinks always see resolved pointers.
+            rebase_scratch_ = entry;
+            rebase_entry(rebase_scratch_);
+            dispatch_entry(rebase_scratch_);
         }
         else {
-            // Write to all non-dedicated sinks
-            for (auto& sink : sinks_) {
-                if (entry.level < sink->min_level() || sink->is_dedicated()) {
-                    continue; // Skip if log level is below sink's minimum level or sink is dedicated
-                }
-                sink->write(entry);
-            }
+            dispatch_entry(entry);
         }
     }
-    
+
     // Flush all sinks
     for (auto& sink : sinks_) {
         if (sink) {
             sink->flush();
+        }
+    }
+}
+
+inline void Logger::dispatch_entry(const LogEntry& entry) {
+    if (entry.sink_index >= 0 && static_cast<size_t>(entry.sink_index) < sinks_.size()) {
+        // Write to specific sink
+        auto& sink = sinks_[entry.sink_index];
+        if (entry.level < sink->min_level()) {
+            return; // Skip if log level is below sink's minimum level
+        }
+        sink->write(entry);
+    }
+    else {
+        // Write to all non-dedicated sinks
+        for (auto& sink : sinks_) {
+            if (entry.level < sink->min_level() || sink->is_dedicated()) {
+                continue; // Skip if log level is below sink's minimum level or sink is dedicated
+            }
+            sink->write(entry);
         }
     }
 }

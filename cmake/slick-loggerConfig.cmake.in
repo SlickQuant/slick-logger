@@ -3,7 +3,7 @@
 include(CMakeFindDependencyMacro)
 
 # Find slick-queue dependency
-find_dependency(slick-queue 1.2.2 CONFIG)
+find_dependency(slick-queue 1.5.0 CONFIG)
 
 include("${CMAKE_CURRENT_LIST_DIR}/slick-loggerTargets.cmake")
 

@@ -22,7 +22,7 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_SLICK_LOGGER_COLLECTOR=ON
 
     - name: Build
       run: cmake --build build --config ${{ matrix.build_type }}
@@ -37,3 +37,34 @@ jobs:
       with:
         name: slick-logger-package
         path: build/dist/*.zip
+
+  # Debug builds on GCC/Clang already compile with -fsanitize=address,undefined
+  # (see CMakeLists.txt). This job runs them with options that make a finding fail
+  # the build: UBSan only prints and continues by default, so without
+  # halt_on_error a real error would pass CI unnoticed.
+  sanitizers:
+    name: Sanitizers (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_SLICK_LOGGER_COLLECTOR=ON
+
+    - name: Build
+      run: cmake --build build --config Debug
+
+    - name: Run tests under ASan/UBSan
+      working-directory: build
+      env:
+        # LeakSanitizer is on by default with ASan on Linux and unsupported on
+        # macOS, so detect_leaks is deliberately left at its platform default.
+        ASAN_OPTIONS: abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1
+        UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      run: ctest -C Debug --output-on-failure

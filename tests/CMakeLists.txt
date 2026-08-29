@@ -53,6 +53,21 @@ if(BUILD_SLICK_LOGGER_TESTING)
     )
     add_test(NAME slick_logger_shared_lib_tests COMMAND slick_logger_shared_lib_tests)
 
+    # --- Multi-process (shared memory) integration test ---
+    # Build a producer as a separate executable, then launch it from the test
+    # process (which acts as the collector) to verify that log entries cross a
+    # real process boundary. Same path-injection trick as the plugin test above.
+    add_executable(slick_logger_test_producer shm_producer/producer_main.cpp)
+    target_link_libraries(slick_logger_test_producer PRIVATE slick::logger)
+
+    add_executable(slick_logger_shm_tests test_shared_memory.cpp)
+    target_link_libraries(slick_logger_shm_tests PRIVATE slick::logger GTest::gtest_main)
+    add_dependencies(slick_logger_shm_tests slick_logger_test_producer)
+    target_compile_definitions(slick_logger_shm_tests PRIVATE
+        SHM_PRODUCER_EXE_PATH="$<TARGET_FILE:slick_logger_test_producer>"
+    )
+    add_test(NAME slick_logger_shm_tests COMMAND slick_logger_shm_tests)
+
 else()
     message(STATUS "Testing disabled - skipping slick-logger tests")
 endif()

@@ -1,3 +1,28 @@
+# v1.2.0 - 08-28-2026
+- Add multi-process logging over a shared-memory slick-queue
+  - New `LogConfig::mode` selects `QueueMode::Local` (default, unchanged behavior), `QueueMode::SharedProducer`, or `QueueMode::SharedCollector`
+  - A collector process owns the sinks and the writer thread; producer processes have neither and only enqueue entries into the shared ring
+  - New `LogConfig` fields: `shared_memory_name`, `process_tag`, `collect_backlog`, `stalled_entry_timeout_ms`
+  - New `Logger::mode()` and `Logger::shared_memory_name()` accessors
+  - Startup order does not matter: whichever process starts first creates the segments and fixes their sizes; later processes attach and inherit them
+  - A collector attaching to a segment that already holds entries replays whatever is still resident in the ring (`collect_backlog`, default true)
+  - A producer killed between reserve and publish no longer stalls the collector forever; the slot is abandoned after `stalled_entry_timeout_ms` (default 5s) and a warning is logged. The shutdown drain abandons such a slot too, so entries published behind it are not lost
+  - No process ever `shm_unlink`s a shared segment on POSIX. Unlinking frees the name while existing mappings stay valid, which would strand attached processes and silently misroute later producers into a fresh segment of the same name. Segments persist in `/dev/shm/` and are removed manually
+  - Entries carry the producing process id and optional tag, rendered as `[pid]` or `[pid:tag]` after the level. Single-process output is unchanged because Local-mode entries carry no pid
+  - Optional `slick_log_collector` executable, built with `-DBUILD_SLICK_LOGGER_COLLECTOR=ON` (OFF by default). Prebuilt Linux, macOS, and Windows binaries are attached to each release
+  - New `multi_process_example` demonstrating both roles
+- Make log entry string references position independent
+  - `StringRef` now holds either a pointer (local mode) or a string-ring index (shared mode), so entries stay meaningful across address spaces
+  - In shared mode format strings and source file names are copied into the shared string ring instead of stored as pointers into the producer's read-only data
+  - The collector resolves indices back to addresses before dispatching, so sinks always receive resolved pointers and custom sinks need no changes
+  - Local mode keeps the zero-copy string-literal fast path; the added producer-side work is a predictable branch on a cached flag
+- Truncate strings longer than 65534 bytes in `store_string_in_queue` instead of overflowing slick-queue's 16-bit reservation size field
+- Require slick-queue 1.5.0 or newer, which provides the slick-shm based shared-memory implementation
+- CI now builds the collector on every platform, and runs a dedicated ASan/UBSan job with `halt_on_error` so a sanitizer finding fails the build instead of only printing
+- Breaking: `LogEntry::format_ptr` and `LogEntry::file_name` are now `StringRef` members named `format` and `file`, with `format_ptr()` and `file_name()` accessors
+  - Only affects code that reads or writes those fields directly; sinks built on `format_log_message()` are unaffected
+  - Assigning a literal still works via braces, e.g. `entry.format = {"text"};`
+
 # v1.1.4 - 08-15-2026
 - Create missing parent directories for file sinks instead of failing to open the log file
   - `FileSink`, `RotatingFileSink`, and `DailyFileSink` now create any missing parent directories before opening their file, matching the "Auto-Creation" behavior the README already documented

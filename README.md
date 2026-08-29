@@ -7,7 +7,7 @@
 [![CI](https://github.com/SlickQuant/slick-logger/actions/workflows/ci.yml/badge.svg)](https://github.com/SlickQuant/slick-logger/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/SlickQuant/slick-logger)](https://github.com/SlickQuant/slick-logger/releases)
 
-A high-performance, cross-platform **header-only** logging library for C++20 using a multi-producer, multi-consumer ring buffer with **multi-sink support**, **source-location logging**, and **log rotation** capabilities.
+A high-performance, cross-platform **header-only** logging library for C++20 using a multi-producer, multi-consumer ring buffer with **multi-sink support**, **source-location logging**, **multi-process logging**, and **log rotation** capabilities.
 
 ## Features
 
@@ -21,6 +21,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 - **Macro Fast Path**: Disabled log levels skip argument evaluation before queueing
 - **Direct Sink Logging**: Route messages to a named sink or a sink reference when a message should not be broadcast
 - **Shared-Library Redirection**: Route plugin or strategy-library logs into a host application's logger
+- **Multi-Process Logging**: Several processes can log into one shared-memory queue drained by a single collector process
 - **Header-Only**: No linking required - just include and use
 - **Cross-Platform**: Supports Windows, Linux, and macOS
 - **Multi-Threaded**: Safe for concurrent logging from multiple threads
@@ -31,6 +32,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 
 - **C++20 compatible compiler** with `std::format` support (GCC 11+, Clang 14+, MSVC 19.29+)
 - CMake 3.20 or higher (for building examples/tests)
+- slick-queue 1.5.0 or newer (multi-process logging relies on its shared-memory support)
 - Internet connection for downloading the slick-queue header when it is not already installed
 
 ## Installation
@@ -41,6 +43,7 @@ For manual installation, you need both slick-logger and its dependency:
 1. Copy the `include/slick/` directory to your project
 2. Download `queue.h` from https://raw.githubusercontent.com/SlickQuant/slick-queue/main/include/slick/queue.h
 3. Place `queue.h` in your include path or alongside the slick-logger headers
+4. Copy the `slick/shm/` headers from [slick-shm](https://github.com/SlickQuant/slick-shm) as well — slick-queue includes them for its shared-memory support
 
 Your project structure should look like:
 ```
@@ -49,9 +52,12 @@ your_project/
 │   ├── slick/
 │       └── logger.hpp
 │       └── queue.h
+│       └── shm/
 └── src/
     └── main.cpp
 ```
+
+The CMake options below handle all of this automatically, and are the recommended path.
 
 ### Option 2: CMake Integration (Recommended)
 
@@ -74,6 +80,10 @@ set(BUILD_SLICK_LOGGER_BENCHMARKS OFF CACHE BOOL "" FORCE)
 
 # Optional: disable LOG_* macro source-location capture at compile time
 set(SLICK_LOGGER_ENABLE_SOURCE_LOCATION OFF CACHE BOOL "" FORCE)
+
+# Optional: build the standalone multi-process collector executable (OFF by default).
+# The shared-memory feature itself is header-only and always available.
+set(BUILD_SLICK_LOGGER_COLLECTOR ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     slick-logger
@@ -598,6 +608,149 @@ extern "C" void strategy_shutdown() {
 
 > **Multiple plugins:** Each shared library (`.dll`/`.so`) holds its own copy of `override_instance_`. All plugins can independently call `set_instance()` with the same host logger — the host logger's lock-free queue is designed for concurrent producers.
 
+### Multi-Process Logging (Shared Memory)
+
+Several processes can log into a single shared-memory ring buffer that one **collector**
+process drains. The collector owns the sinks and the writer thread; **producer** processes
+own neither and only enqueue entries.
+
+```
+Process A ──┐
+Process B ──┼──► [Shared Memory Ring] ──► [Collector Process] ──┬──► ConsoleSink
+Process C ──┘                                                   └──► FileSink
+```
+
+#### Collector
+
+The collector needs at least one sink, exactly like a single-process logger:
+
+```cpp
+#include <slick/logger.hpp>
+using namespace slick::logger;
+
+LogConfig config;
+config.mode = QueueMode::SharedCollector;
+config.shared_memory_name = "myapp_log";
+config.sinks.push_back(std::make_shared<ConsoleSink>());
+config.sinks.push_back(std::make_shared<FileSink>("collected.log"));
+
+Logger::instance().init(config);
+// ... run until stopped ...
+Logger::instance().shutdown();   // drains queued entries, then closes the sinks
+```
+
+#### Producer
+
+A producer must **not** define sinks — `init()` throws if it does, since the collector owns them:
+
+```cpp
+LogConfig config;
+config.mode = QueueMode::SharedProducer;
+config.shared_memory_name = "myapp_log";   // same name as the collector
+config.process_tag = "feed";               // optional, shows up as [pid:feed]
+
+Logger::instance().init(config);
+
+LOG_INFO("order {} filled at {}", order_id, price);   // goes to the collector
+
+Logger::instance().shutdown();
+```
+
+All the usual `LOG_*` macros, sinks-by-index, log levels, and source locations work unchanged.
+
+#### Output
+
+Multi-process entries carry the producing process id and optional tag, right after the level:
+
+```
+2026-08-28 16:37:53.673071 [INFO] [103836:app1] [main.cpp:81] work item 1 of 4
+2026-08-28 16:37:53.683942 [INFO] [72176:app2] [main.cpp:81] work item 1 of 4
+```
+
+Single-process (`QueueMode::Local`) output is unchanged — local entries carry no process id,
+so nothing extra is printed.
+
+#### Standalone collector executable
+
+Rather than embedding a collector, you can run the bundled one. Prebuilt binaries for Linux,
+macOS, and Windows are attached to each [release](https://github.com/SlickQuant/slick-logger/releases)
+as `slick-log-collector-<version>-<platform>`.
+
+To build it from source instead — it is **not built by default**:
+
+```bash
+cmake -S . -B build -DBUILD_SLICK_LOGGER_COLLECTOR=ON
+cmake --build build
+
+./build/tools/slick_log_collector --name myapp_log --console --file collected.log
+```
+
+```
+slick_log_collector --name <shm-name>
+                    [--console] [--file PATH] [--rotating PATH] [--daily PATH]
+                    [--max-size BYTES] [--max-files N]
+                    [--level trace|debug|info|warn|error|fatal]
+                    [--queue-size N] [--string-buffer-size N]
+                    [--stall-timeout-ms N]
+```
+
+It stops on Ctrl-C (`SIGINT`/`SIGTERM`), draining whatever is still queued before exiting.
+
+#### Configuration
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `QueueMode::Local` | `Local`, `SharedProducer`, or `SharedCollector` |
+| `shared_memory_name` | `""` | Segment name, required for the shared modes. 1-24 characters of `[A-Za-z0-9_]` |
+| `process_tag` | `""` | Optional short process label, truncated to 15 characters |
+| `collect_backlog` | `true` | Collector replays entries already resident in the ring when it attaches |
+| `stalled_entry_timeout_ms` | `5000` | Collector abandons an unpublished slot after this long; `0` disables |
+
+#### Startup order and sizing
+
+Startup order does not matter. Whichever process starts first creates the segments and fixes
+their capacity from its `log_queue_size` / `string_buffer_size`; every later process attaches
+and **inherits** those sizes, so mismatched settings between processes are harmless.
+
+A collector that attaches to a segment already holding entries replays whatever is still
+resident in the ring, so producers can run before any collector exists. Set
+`collect_backlog = false` if a restarting collector must not re-emit entries a previous
+instance already wrote.
+
+#### Constraints
+
+- **All processes must use the same slick-logger version, the same `SLICK_LOGGER_MAX_ARGS`,
+  and the same architecture.** `sizeof(LogEntry)` is recorded in the shared-memory header, so a
+  mismatch throws at attach time rather than corrupting data.
+- **The ring is lossy with no backpressure.** A collector that cannot keep up loses entries, and
+  string data can be overwritten before the entry referencing it is read. Size
+  `string_buffer_size` generously for high-volume logging.
+- **Pointer arguments** (`ArgType::PTR`) print addresses that are only meaningful inside the
+  producing process.
+- **Sink indices** used by `log_to_sink()` and `ISink::log()` are resolved against the
+  *collector's* sink list.
+- **A producer killed between reserve and publish** leaves a hole. The collector abandons it
+  after `stalled_entry_timeout_ms` and logs a warning, rather than stalling forever.
+- **Every attached collector sees every entry** — the ring is a broadcast. Running two collectors
+  on one segment writes each entry twice.
+- **POSIX cleanup is manual, by design.** slick-logger never `shm_unlink`s a segment. Unlinking
+  frees the *name* while existing mappings stay valid, so whichever process did it would strand
+  everyone still attached: newcomers would create a fresh segment under the same name and their
+  entries would silently vanish. Since any process may create the segment, none of them can know
+  it is the last user. Segments therefore persist in `/dev/shm/` until removed:
+
+  ```bash
+  rm -f /dev/shm/myapp_log /dev/shm/myapp_log_str
+  ```
+
+  Remove them only when no participant is running. A stale segment from a previous run is
+  attached to rather than recreated, and `collect_backlog` will replay whatever entries it still
+  holds — clear it between unrelated runs, or set `collect_backlog = false`. On Windows the
+  mapping is refcounted by the kernel and disappears once the last handle closes, so nothing
+  needs cleaning up.
+
+See `examples/multi_process_example.cpp` for a runnable version of both roles.
+
 ## Sink Types
 
 ### ConsoleSink
@@ -657,12 +810,23 @@ The logger uses a **multi-producer, single-consumer** ring buffer (slick-queue) 
                                                           └──► DailyFileSink
 ```
 
+The same structure spans processes when the queue is placed in shared memory — the producers
+become other processes and the writer thread lives in the collector. See
+[Multi-Process Logging](#multi-process-logging-shared-memory).
+
+```
+[Process A] ──┐
+[Process B] ──┼──► [Shared Memory Queue] ──► [Collector: Writer Thread] ──► Sinks
+[Process C] ──┘
+```
+
 ### Key Design Principles
 
 1. **Single Writer Thread**: One dedicated thread handles all sink operations
 2. **Lock-Free Logging**: Caller threads never block on I/O operations  
 3. **Flexible Sinks**: Easy to add custom sink implementations
 4. **Atomic Operations**: Thread-safe queue and sink management
+5. **Position-Independent Entries**: In shared-memory mode, string references are ring indices rather than addresses, so an entry stays meaningful in any attached process
 
 ### Deferred Formatting
 
@@ -738,6 +902,7 @@ The repository includes comprehensive examples:
 - **`logger_example.exe`**: Basic usage with console + file output
 - **`multi_sink_example.exe`**: Demonstrates all sink types, rotation, and custom sinks
 - **`timestamp_example.exe`**: Demonstrates predefined and custom timestamp formats
+- **`multi_process_example.exe`**: Collector and producer roles logging across process boundaries
 
 ## Building Examples/Tests  
 
@@ -746,6 +911,7 @@ If you want to build the provided examples and tests:
 ```bash
 mkdir build
 cd build
+# Add -DBUILD_SLICK_LOGGER_COLLECTOR=ON to also build the standalone collector
 cmake ..
 cmake --build . --config Debug
 
@@ -754,9 +920,14 @@ cmake --build . --config Debug
 ./examples/Debug/multi_sink_example.exe
 ./examples/Debug/timestamp_example.exe
 
+# Multi-process example: run the collector in one terminal and producers in others
+./examples/Debug/multi_process_example.exe --collector --name demo_log
+./examples/Debug/multi_process_example.exe --producer --name demo_log --tag app1
+
 # Run tests  
 ./tests/Debug/slick_logger_tests.exe
 ./tests/Debug/slick_logger_sink_tests.exe
 ./tests/Debug/slick_logger_timestamp_tests.exe
 ./tests/Debug/slick_logger_shared_lib_tests.exe
+./tests/Debug/slick_logger_shm_tests.exe
 ```

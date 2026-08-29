@@ -1,13 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(slick-logger
-    VERSION 1.1.4
+    VERSION 1.2.0
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(slick-queue 1.2.2 CONFIG QUIET)
+# 1.5.0 or newer is required: multi-process logging relies on the slick-shm based
+# shared-memory implementation introduced in slick-queue 1.3.0.
+find_package(slick-queue 1.5.0 CONFIG QUIET)
 
 if (NOT slick-queue_FOUND)
     message(STATUS "Fetching slick-queue...")
@@ -18,7 +20,7 @@ if (NOT slick-queue_FOUND)
     FetchContent_Declare(
         slick-queue
         GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-        GIT_TAG v1.2.2
+        GIT_TAG v1.5.0
     )
     FetchContent_MakeAvailable(slick-queue)
 else()
@@ -77,6 +79,13 @@ add_subdirectory(tests)
 
 # Add examples (placeholder)
 add_subdirectory(examples)
+
+# Add tools (optional). The multi-process collector is a convenience executable;
+# the shared-memory feature itself is header-only and always available.
+option(BUILD_SLICK_LOGGER_COLLECTOR "Build the standalone slick_log_collector executable" OFF)
+if(BUILD_SLICK_LOGGER_COLLECTOR)
+    add_subdirectory(tools)
+endif()
 
 # Add benchmarks (optional)
 option(BUILD_SLICK_LOGGER_BENCHMARKS "Build performance benchmarks" OFF)
