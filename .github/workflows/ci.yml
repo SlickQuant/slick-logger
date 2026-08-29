@@ -12,6 +12,7 @@ permissions:
 jobs:
   build-and-test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         build_type: [Debug, Release]
@@ -37,6 +38,36 @@ jobs:
       with:
         name: slick-logger-package
         path: build/dist/*.zip
+
+  # The default matrix covers g++ on Linux, AppleClang on macOS and MSVC on
+  # Windows. Clang on x86-64 Linux is its own case: it is the only combination
+  # that defines __SIZEOF_FLOAT128__ without providing _Float128 in C++ mode, so
+  # nothing above catches a header assuming those two go together.
+  clang-linux:
+    name: Clang (${{ matrix.build_type }})
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    runs-on: ubuntu-latest
+
+    env:
+      CC: clang
+      CXX: clang++
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_SLICK_LOGGER_COLLECTOR=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ matrix.build_type }}
+
+    - name: Run Tests
+      working-directory: build
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure
 
   # Debug builds on GCC/Clang already compile with -fsanitize=address,undefined
   # (see CMakeLists.txt). This job runs them with options that make a finding fail

@@ -254,6 +254,39 @@ enum class ArgType : uint8_t {
     STRING_DYNAMIC   // std::string - stored in separate queue
 };
 
+// Whether `_Float128` is usable as a type name in C++.
+//
+// It is a distinct type from `__float128` on GCC, and libstdc++ can hand it to a
+// format-arg visitor, so it cannot simply be dropped. It needs its own feature
+// test though: `__SIZEOF_FLOAT128__` says the target has a 128-bit float, not
+// that this spelling exists. Clang defines that macro on x86-64 yet has no
+// `_Float128` in C++ mode, and GCC only accepts it in C++ from version 13.
+#ifndef SLICK_LOGGER_HAS_FLOAT128_T
+#  if defined(__STDCPP_FLOAT128_T__) || \
+      (defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER) && __GNUC__ >= 13)
+#    define SLICK_LOGGER_HAS_FLOAT128_T 1
+#  else
+#    define SLICK_LOGGER_HAS_FLOAT128_T 0
+#  endif
+#endif
+
+// True for the target's 128-bit binary floating point types, and false (rather
+// than ill-formed) wherever they do not exist. Keeping the preprocessor here
+// instead of inside the if-constexpr chain matters: an ill-formed condition
+// there stops the chain from discarding later branches, which is what made the
+// `_Float128` spelling break every translation unit under clang.
+template<typename T>
+inline constexpr bool is_float128_v =
+#if defined(__SIZEOF_FLOAT128__)
+    std::is_same_v<T, __float128>
+#  if SLICK_LOGGER_HAS_FLOAT128_T
+    || std::is_same_v<T, _Float128>
+#  endif
+    ;
+#else
+    false;
+#endif
+
 // True when Args... is exactly one type convertible to std::format_args —
 // used to detect the pre-built format_args overload in log_to_sink.
 // std::make_format_args() returns an implementation-defined store type
@@ -937,6 +970,10 @@ private:
     /// Validate a segment name and throw a descriptive error when it is unusable.
     static void validate_shared_memory_name(const std::string& name);
 
+    /// Bytes of `tag` that fit the inline per-entry tag, without splitting a
+    /// multi-byte UTF-8 sequence.
+    static size_t truncated_tag_length(std::string_view tag) noexcept;
+
     /// Attach to an existing segment when one is there, otherwise create it.
     /// This is what makes producer and collector startup order irrelevant, and it
     /// lets a producer inherit the collector's sizing when the collector went first.
@@ -950,6 +987,12 @@ private:
     /// see shutdown(). The registry is itself never freed, which keeps the
     /// retained queues reachable: leak detectors report unreachable allocations,
     /// so an intentional retention must stay visible to avoid a false positive.
+    ///
+    /// Each init()/shutdown() cycle that CREATED its segments retains one more
+    /// mapping, so repeatedly re-initializing in a shared role grows memory
+    /// monotonically. Fine for the usual one-shot process lifecycle; a process
+    /// that cycles the logger many times should attach to a segment created
+    /// elsewhere, which is never retained.
     static void retain_shared_queue(void* queue) noexcept;
 
     std::unique_ptr<slick::SlickQueue<LogEntry>> log_queue_;
@@ -1833,17 +1876,46 @@ inline void Logger::validate_shared_memory_name(const std::string& name) {
     }
 }
 
+inline size_t Logger::truncated_tag_length(std::string_view tag) noexcept {
+    constexpr size_t kMaxTagBytes = SLICK_LOGGER_TAG_SIZE - 1; // leave room for the NUL
+    if (tag.size() <= kMaxTagBytes) {
+        return tag.size(); // fits whole, nothing to cut
+    }
+    // Never cut in the middle of a UTF-8 sequence: walk back from the cut point
+    // over continuation bytes (0b10xxxxxx) so the stored tag stays printable.
+    // tag[length] is in range here because tag.size() > kMaxTagBytes.
+    size_t length = kMaxTagBytes;
+    while (length > 0 && (static_cast<unsigned char>(tag[length]) & 0xC0) == 0x80) {
+        --length;
+    }
+    return length;
+}
+
 template<typename T>
 inline std::unique_ptr<slick::SlickQueue<T>> Logger::open_shared_queue(const std::string& name, uint32_t size) {
+    std::string attach_error;
     try {
         // Attach to a segment somebody else already created. Sizing then comes
         // from its header, so a producer automatically matches the collector.
         return std::make_unique<slick::SlickQueue<T>>(name.c_str());
     }
-    catch (const std::exception&) {
-        // Nothing there yet: create it (still create-or-attach, so a process that
-        // loses the race to another creator simply attaches instead).
+    catch (const std::exception& e) {
+        // Usually just "nothing there yet". Keep the reason: if creating fails too,
+        // reporting only the second error hides why the attach did not work, which
+        // matters when the real cause was a creator still initializing rather than
+        // a missing segment.
+        attach_error = e.what();
+    }
+
+    try {
+        // Create it. Still create-or-attach, so a process that loses the race to
+        // another creator simply attaches instead.
         return std::make_unique<slick::SlickQueue<T>>(size, name.c_str());
+    }
+    catch (const std::exception& e) {
+        throw std::runtime_error(std::string(e.what())
+                                 + " (attaching to the existing segment first failed with: "
+                                 + attach_error + ")");
     }
 }
 
@@ -1881,8 +1953,7 @@ inline void Logger::setup_shared_queues(const LogConfig& config, uint32_t queue_
     pid_ = static_cast<uint32_t>(::getpid());
 #endif
     std::memset(tag_, 0, sizeof(tag_));
-    const size_t tag_length = std::min(config.process_tag.size(), sizeof(tag_) - 1);
-    std::memcpy(tag_, config.process_tag.data(), tag_length);
+    std::memcpy(tag_, config.process_tag.data(), truncated_tag_length(config.process_tag));
 }
 
 inline void Logger::add_sink(std::shared_ptr<ISink> sink) {
@@ -2275,11 +2346,8 @@ inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
             } else if constexpr (std::is_same_v<DT, unsigned __int128>) {
                 enqueue_argument(entry.args[arg_idx], static_cast<unsigned long long>(v));
 #endif
-#ifdef __SIZEOF_FLOAT128__
-            } else if constexpr (std::is_same_v<DT, __float128> ||
-                                  std::is_same_v<DT, _Float128>) {
+            } else if constexpr (is_float128_v<DT>) {
                 enqueue_argument(entry.args[arg_idx], static_cast<double>(v));
-#endif
             } else {
                 enqueue_argument(entry.args[arg_idx], std::forward<T>(v));
             }

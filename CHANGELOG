@@ -1,4 +1,4 @@
-# v1.2.0 - 08-28-2026
+# v1.2.0
 - Add multi-process logging over a shared-memory slick-queue
   - New `LogConfig::mode` selects `QueueMode::Local` (default, unchanged behavior), `QueueMode::SharedProducer`, or `QueueMode::SharedCollector`
   - A collector process owns the sinks and the writer thread; producer processes have neither and only enqueue entries into the shared ring
@@ -8,7 +8,10 @@
   - A collector attaching to a segment that already holds entries replays whatever is still resident in the ring (`collect_backlog`, default true)
   - A producer killed between reserve and publish no longer stalls the collector forever; the slot is abandoned after `stalled_entry_timeout_ms` (default 5s) and a warning is logged. The shutdown drain abandons such a slot too, so entries published behind it are not lost
   - No process ever `shm_unlink`s a shared segment on POSIX. Unlinking frees the name while existing mappings stay valid, which would strand attached processes and silently misroute later producers into a fresh segment of the same name. Segments persist in `/dev/shm/` and are removed manually
+    - Consequently each `init()`/`shutdown()` cycle that created its segments retains one more mapping for the life of the process. This suits the usual one-shot lifecycle; a process that cycles the logger repeatedly should attach to a segment created elsewhere, which is never retained
   - Entries carry the producing process id and optional tag, rendered as `[pid]` or `[pid:tag]` after the level. Single-process output is unchanged because Local-mode entries carry no pid
+    - `process_tag` is capped at 15 bytes and truncated on a UTF-8 character boundary, so a multi-byte tag is never cut mid-sequence
+  - When attaching to an existing segment fails and creating one fails too, the reported error carries both reasons, so a creator that was still initializing is not misreported as a size or element-size mismatch
   - Optional `slick_log_collector` executable, built with `-DBUILD_SLICK_LOGGER_COLLECTOR=ON` (OFF by default). Prebuilt Linux, macOS, and Windows binaries are attached to each release
   - New `multi_process_example` demonstrating both roles
 - Make log entry string references position independent
@@ -20,6 +23,12 @@
   - `std::make_format_args` binds a reference to its argument, and `LogArgument` lives in a `#pragma pack(1)` struct, so the reference could bind to a misaligned address (UBSan: "reference binding to misaligned address")
   - Argument values now go through `format_one_arg()`, which takes them by value so the reference binds to an aligned parameter; `view_string_ref()` likewise takes its `StringRef` by value
   - Pre-existing, and reachable from any log call with a multi-byte argument; previously unreported because UBSan only printed rather than failing the build
+- Fix the header failing to compile under Clang on x86-64 Linux
+  - `enqueue_format_args` tested `std::is_same_v<DT, _Float128>` behind `#ifdef __SIZEOF_FLOAT128__`, but that macro only says the target has a 128-bit float. Clang defines it on x86-64 while providing no `_Float128` type name in C++, and GCC only accepts that spelling in C++ from version 13
+  - The ill-formed `if constexpr` condition stopped the chain from discarding later branches, so the `static_cast<double>` was instantiated for every argument type and cascaded into further errors
+  - `enqueue_format_args` is a non-template inline function, so it compiles in every translation unit: no Clang-on-Linux build of any file including `slick/logger.hpp` succeeded
+  - Replaced with a feature-tested `is_float128_v<T>` trait plus `SLICK_LOGGER_HAS_FLOAT128_T`, keeping the condition well formed everywhere. GCC still matches both `__float128` and `_Float128`; Clang matches `__float128` and never names the unsupported spelling
+  - Pre-existing since v1.0.5; CI missed it because Linux used g++, macOS AppleClang on arm64 (where the macro is undefined) and Windows MSVC. A Clang-on-Linux job now covers it
 - Truncate strings longer than 65534 bytes in `store_string_in_queue` instead of overflowing slick-queue's 16-bit reservation size field
 - Require slick-queue 1.5.0 or newer, which provides the slick-shm based shared-memory implementation
 - CI now builds the collector on every platform, and runs a dedicated ASan/UBSan job with `halt_on_error` so a sanitizer finding fails the build instead of only printing

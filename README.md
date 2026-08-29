@@ -733,6 +733,13 @@ instance already wrote.
   after `stalled_entry_timeout_ms` and logs a warning, rather than stalling forever.
 - **Every attached collector sees every entry** — the ring is a broadcast. Running two collectors
   on one segment writes each entry twice.
+- **`process_tag` is truncated to 15 bytes**, on a UTF-8 character boundary so a multi-byte tag is
+  never cut mid-sequence.
+- **Re-initializing in a shared role is not free on POSIX.** Because a created segment is never
+  unlinked (see below), each `init()`/`shutdown()` cycle that *created* its segments retains one
+  more mapping for the life of the process. That suits the normal one-shot lifecycle; a process
+  that cycles the logger many times should attach to a segment created elsewhere, which is never
+  retained. Windows is unaffected.
 - **POSIX cleanup is manual, by design.** slick-logger never `shm_unlink`s a segment. Unlinking
   frees the *name* while existing mappings stay valid, so whichever process did it would strand
   everyone still attached: newcomers would create a fresh segment under the same name and their

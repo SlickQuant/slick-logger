@@ -340,7 +340,10 @@ TEST_F(SharedMemoryTest, ShutdownDrainsEntriesBehindAStalledSlot) {
     config.shared_memory_name = segment;
     config.log_queue_size = 1024;
     config.string_buffer_size = 1 << 16;
-    config.stalled_entry_timeout_ms = 200;
+    // Generous relative to the microseconds the body below needs. If the running
+    // loop skipped the hole first, the drain path would go untested and the test
+    // would still pass, so the margin exists to keep it honest under CI jitter.
+    config.stalled_entry_timeout_ms = 1000;
     config.sinks.push_back(std::make_shared<slick::logger::FileSink>(log_path));
     Logger::instance().init(config);
 
@@ -348,7 +351,7 @@ TEST_F(SharedMemoryTest, ShutdownDrainsEntriesBehindAStalledSlot) {
 
     {
         // Punch a hole, then publish behind it and shut down immediately, well
-        // inside the 200 ms timeout so the running loop cannot skip it first.
+        // inside the timeout so the running loop cannot skip it first.
         slick::SlickQueue<slick::logger::LogEntry> raw(segment.c_str());
         (void)raw.reserve();
 
@@ -359,6 +362,147 @@ TEST_F(SharedMemoryTest, ShutdownDrainsEntriesBehindAStalledSlot) {
     EXPECT_NE(read_all(log_path).find("queued behind the hole"), std::string::npos)
         << "shutdown dropped entries published behind an unpublished slot:\n"
         << read_all(log_path);
+}
+
+// collect_backlog = false is the escape hatch for a restarting collector that
+// must not re-emit what a previous instance already wrote.
+TEST_F(SharedMemoryTest, CollectBacklogFalseSkipsEntriesAlreadyInTheRing) {
+    const auto first_path = temp_log("test_shm_backlog_first.log");
+    const auto second_path = temp_log("test_shm_backlog_second.log");
+    const auto segment = unique_segment_name("slt_nb_");
+
+    auto make_config = [&](const std::filesystem::path& path, bool collect_backlog) {
+        LogConfig config;
+        config.mode = QueueMode::SharedCollector;
+        config.shared_memory_name = segment;
+        config.log_queue_size = 1024;
+        config.string_buffer_size = 1 << 16;
+        config.collect_backlog = collect_backlog;
+        config.sinks.push_back(std::make_shared<slick::logger::FileSink>(path));
+        return config;
+    };
+
+    // A first collector creates the segment and logs something into it.
+    Logger::instance().init(make_config(first_path, true));
+    LOG_INFO("entry from the first collector");
+    ASSERT_TRUE(wait_for([&] {
+        return read_all(first_path).find("entry from the first collector") != std::string::npos;
+    }));
+    Logger::instance().shutdown();
+
+    // A second collector attaches to the same segment with the backlog disabled.
+    Logger::instance().reset();
+    Logger::instance().init(make_config(second_path, false));
+    LOG_INFO("entry from the second collector");
+    ASSERT_TRUE(wait_for([&] {
+        return read_all(second_path).find("entry from the second collector") != std::string::npos;
+    }));
+    Logger::instance().shutdown();
+
+    const std::string second = read_all(second_path);
+    EXPECT_EQ(second.find("entry from the first collector"), std::string::npos)
+        << "collect_backlog = false still replayed the earlier entry:\n" << second;
+}
+
+// Strings are copied into a ring whose reservation size is a 16-bit field, so an
+// over-long one must be truncated rather than overflowing the write cursor.
+TEST_F(SharedMemoryTest, OverlongStringsAreTruncatedNotCorrupting) {
+    const auto log_path = temp_log("test_shm_overlong.log");
+    const auto segment = unique_segment_name("slt_ov_");
+
+    LogConfig config;
+    config.mode = QueueMode::SharedCollector;
+    config.shared_memory_name = segment;
+    config.log_queue_size = 1024;
+    config.string_buffer_size = 1 << 20;
+    config.sinks.push_back(std::make_shared<slick::logger::FileSink>(log_path));
+    Logger::instance().init(config);
+
+    // One byte past the 65534 cap, so the tail must be dropped.
+    const std::string huge(70000, 'x');
+    LOG_INFO("huge[{}]", huge);
+    LOG_INFO("still alive after the huge entry");
+
+    ASSERT_TRUE(wait_for([&] {
+        return read_all(log_path).find("still alive after the huge entry") != std::string::npos;
+    })) << "the queue did not survive an over-long string";
+    Logger::instance().shutdown();
+
+    const auto lines = read_lines(log_path);
+    size_t huge_line_length = 0;
+    for (const auto& line : lines) {
+        if (line.find("huge[") != std::string::npos) {
+            huge_line_length = line.size();
+        }
+    }
+    ASSERT_GT(huge_line_length, 0u) << "the over-long entry was dropped entirely";
+    // Truncated to the cap, not the original 70000 bytes.
+    EXPECT_LT(huge_line_length, 70000u);
+    EXPECT_GT(huge_line_length, 65000u);
+}
+
+// The inline tag field is 16 bytes including the NUL, so a longer tag is cut.
+// The cut must land on a character boundary or the output becomes mojibake.
+TEST_F(SharedMemoryTest, LongUtf8TagIsTruncatedOnACharacterBoundary) {
+    const auto log_path = temp_log("test_shm_utf8_tag.log");
+    const auto segment = unique_segment_name("slt_u8_");
+
+    LogConfig config;
+    config.mode = QueueMode::SharedCollector;
+    config.shared_memory_name = segment;
+    // Ten two-byte characters (U+00E9) = 20 bytes. Two-byte characters matter
+    // here: the 15-byte cap is odd, so a byte-based cut lands mid-character and
+    // leaves a dangling lead byte. A three-byte character would divide 15 evenly
+    // and the naive cut would look correct by accident.
+    config.process_tag = "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9"
+                         "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9";
+    config.log_queue_size = 1024;
+    config.string_buffer_size = 1 << 16;
+    config.sinks.push_back(std::make_shared<slick::logger::FileSink>(log_path));
+    Logger::instance().init(config);
+
+    LOG_INFO("tagged entry");
+    ASSERT_TRUE(wait_for([&] { return read_all(log_path).find("tagged entry") != std::string::npos; }));
+    Logger::instance().shutdown();
+
+    // Pull the tag back out of "[<pid>:<tag>]".
+    const std::string contents = read_all(log_path);
+    const std::string needle = ":";
+    const size_t stamp = contents.find("[" + std::to_string(SLICK_TEST_GETPID()) + ":");
+    ASSERT_NE(stamp, std::string::npos) << contents;
+    const size_t tag_begin = contents.find(':', stamp) + 1;
+    const size_t tag_end = contents.find(']', tag_begin);
+    ASSERT_NE(tag_end, std::string::npos);
+    const std::string tag = contents.substr(tag_begin, tag_end - tag_begin);
+
+    // Whole characters only: 14 bytes, i.e. seven complete two-byte characters,
+    // rather than the 15 a byte-based cut would keep.
+    EXPECT_EQ(tag.size(), 14u) << "expected a cut back to a character boundary, got " << tag.size();
+    ASSERT_EQ(tag.size() % 2, 0u) << "tag was cut mid-character";
+    for (size_t i = 0; i < tag.size(); i += 2) {
+        EXPECT_EQ(tag.compare(i, 2, "\xC3\xA9"), 0) << "damaged character at byte " << i;
+    }
+}
+
+TEST_F(SharedMemoryTest, ReportsModeAndSegmentName) {
+    const auto log_path = temp_log("test_shm_accessors.log");
+    const auto segment = unique_segment_name("slt_ac_");
+
+    LogConfig config;
+    config.mode = QueueMode::SharedCollector;
+    config.shared_memory_name = segment;
+    config.log_queue_size = 1024;
+    config.string_buffer_size = 1 << 16;
+    config.sinks.push_back(std::make_shared<slick::logger::FileSink>(log_path));
+    Logger::instance().init(config);
+
+    EXPECT_EQ(Logger::instance().mode(), QueueMode::SharedCollector);
+    EXPECT_EQ(Logger::instance().shared_memory_name(), segment);
+
+    // shutdown() returns the logger to the Local defaults.
+    Logger::instance().shutdown();
+    EXPECT_EQ(Logger::instance().mode(), QueueMode::Local);
+    EXPECT_TRUE(Logger::instance().shared_memory_name().empty());
 }
 
 TEST_F(SharedMemoryTest, RejectsInvalidConfiguration) {
