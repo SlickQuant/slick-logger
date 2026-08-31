@@ -1,3 +1,39 @@
+# Unreleased
+- Clear the wake and flush state in `reset()`
+  - `reset()` left `flush_request_`, `flush_done_`, `wake_token_` and `writer_parked_` at whatever the previous run had reached, so a reused `Logger` was not equivalent to a fresh one
+  - Purely for clarity, not correctness: the counters are monotonic, the writer compares `flush_request_` against `flush_done_` for inequality rather than order so it resynchronises on its first iteration whatever they hold, and `wake_token_` is only ever compared for change. `reset()` calls `shutdown()` first, so the writer thread is joined before any of this is touched
+- Fix a data race on the writer thread's queue cursor
+  - `read_index_` was a plain `uint64_t` written by the writer thread and read by `flush()` on the caller's thread. That is a data race under the memory model - undefined behaviour, and reported by ThreadSanitizer - even though it is benign on x86 in practice. Pre-existing, but `flush()` now documents a guarantee built on that read, so the cursor is a `std::atomic<uint64_t>`
+  - Relaxed ordering throughout: the cursor carries no data, only progress. What makes `flush()` a real guarantee is the acquire/release `flush_request_`/`flush_done_` handshake, not this value
+  - `SlickQueue::read()` is overloaded on `uint64_t&` and `std::atomic<uint64_t>&`, and the atomic overload claims slots with different multi-consumer semantics. The cursor is therefore round-tripped through a local so the single-consumer overload is still the one selected
+  - No measurable cost: relaxed loads and stores are ordinary moves on x86. Over interleaved runs of both builds, throughput was 635k vs 650k msg/s and log-call-to-sink latency was mean 25.4us vs 24.2us, p50 22.5us vs 22.4us - unchanged within run-to-run noise
+  - Worth keeping: with a plain `uint64_t` the compiler was entitled to hoist the load in `wait_until_ready()` out of its loop and spin on a stale register, so this was not only a sanitizer complaint
+- Drop the startup delay in `init()`
+  - `init()` slept "to ensure writer thread is started" after launching it. A sleep cannot ensure that, and none was needed: `running_` is already true before the thread is created and the queue is lock-free, so entries logged before the thread is scheduled simply wait in the ring to be drained
+  - On Windows the ~15.6ms timer resolution made that nominal 1ms delay the single largest avoidable cost in startup. `init()` p50 65.5ms -> 50.4ms, with the remainder being the queue and string-buffer allocation
+- Stop the idle writer thread from sleeping between polls
+  - The writer thread called `sleep_for(1ms)` whenever it found no data. Windows' default timer resolution is ~15.6ms, so that request really parked the thread for ~15.6ms; asking for 100us made no difference. Every entry logged into an idle logger waited out that interval before reaching its sink
+  - The thread now stays hot for a short burst of `yield()`, which covers the gaps in an active logging stream, and then parks on an atomic until a producer, a flush request, or shutdown releases it. Idle CPU use stays at zero and no timer resolution is involved
+  - Producers pay an atomic load and a predictable branch: the wake-up is only signalled when the writer has advertised itself as parked. The load is `seq_cst`, paired with the writer's `seq_cst` store of the same flag - that pairing is what stops the writer's park and a producer's publish from stepping past each other and losing a wake-up on a weakly-ordered CPU. On x86 it still compiles to a plain load
+  - `flush()` no longer polls on a coarse sleep either, and both it and `shutdown()` explicitly release a parked writer - `atomic::wait` has no timeout, so a missed wake-up there would block the caller rather than merely delay an entry
+  - Parking is limited to `QueueMode::Local`. `writer_parked_` lives in one address space and neither `WaitOnAddress` nor a futex on a private mapping can be signalled from another process, so a collector keeps polling for entries that cross a process boundary
+  - Measured from the log call to the sink receiving the entry, on an otherwise idle logger: mean 10986 us -> 25 us, p50 15078 us -> 22 us. `flush()` on an idle logger: p50 16519 us -> 112 us
+- Stop flushing sinks after every drained batch
+  - The writer thread flushed every sink at the end of each batch. `SlickQueue::read()` hands back one reserved entry at a time, so whenever the writer kept up with its producers that was one `fflush` - and one write syscall - per log entry, costing about 11 us and dwarfing everything else the writer thread did
+  - Sinks are now flushed when the queue runs dry and on request, so a burst shares a single flush. What a caller can observe is unchanged: once the logger is caught up, everything logged is on disk
+  - `Logger::flush()` previously only waited for the queue cursor to reach the entries it had snapshotted. The cursor advances when the writer *claims* a batch, not when it finishes writing it, so this could return while a sink was still mid-write, and relied on the per-batch flush to get the data out. It now asks the writer thread - the only thread allowed to touch the sinks - for a flush and waits for that specific request to be acknowledged
+  - `FileSink` and its subclasses install an explicit 64 KiB stream buffer instead of relying on the default
+  - Measured with a file sink: writer-thread cost per entry 13.73 us -> 1.86 us, and end-to-end throughput for 200k messages ~61k -> ~570k msg/s
+- Speed up timestamp formatting on the writer thread
+  - `TimestampFormatter::format_timestamp` no longer builds every timestamp through `std::ostringstream`/`std::put_time`, which paid for a locale lookup and a stream allocation on every log entry
+  - The broken-down time is now converted once per whole second and cached, so a burst of entries inside the same second costs no `localtime` call at all
+  - The digits are written directly into a stack buffer with a two-digit lookup table instead of going through `snprintf`, whose format-string parsing dominated what was left
+  - The cache is `thread_local` rather than per formatter: its contents do not depend on the output format, so all sinks on the writer thread share one `localtime` call per second, and a `TimestampFormatter` shared between threads stays safe to use
+  - Measured on the built-in formats: ~8-10x faster on a realistic log stream, ~3.4x when consecutive entries fall in different seconds. `Format::CUSTOM` still goes through `std::put_time` and is unchanged
+  - Output is byte-for-byte identical to the previous implementation, verified across all formats over the epoch, leap days, DST transitions, year boundaries, and every microsecond decade
+- Use `std::localtime_s`/`localtime_r` instead of `std::localtime`, which returns a pointer to a shared static buffer and was a data race between threads formatting concurrently
+- Stop writing log lines with `std::endl` in the file sinks, which flushed the file stream on every entry; `FileSink`, `RotatingFileSink`, and `DailyFileSink` now write `"\n"` and are flushed when the queue runs dry and on `flush()`. `ConsoleSink` deliberately keeps `std::endl`: `std::cerr` is unit-buffered anyway, an interactive terminal is line-buffered, and when stdout is redirected to a file or pipe a per-line flush is what keeps each line immediately visible to the capturing process (CI logs, `docker logs`, process supervisors) - so the only thing a per-line flush would buy the file sinks is exactly what the batch flush now provides at a fraction of the cost
+
 # v1.2.0 - 08-29-2026
 - Add multi-process logging over a shared-memory slick-queue
   - New `LogConfig::mode` selects `QueueMode::Local` (default, unchanged behavior), `QueueMode::SharedProducer`, or `QueueMode::SharedCollector`

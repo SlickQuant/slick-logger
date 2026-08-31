@@ -106,6 +106,86 @@ inline constexpr const char* file_name_from_path(const char* path) noexcept {
     return file_name;
 }
 
+/**
+ * @brief Write a value in [0, 99] as two ASCII digits, without division by 10.
+ */
+inline void write_2_digits(char* out, uint32_t value) noexcept {
+    static constexpr char kDigits[201] =
+        "00010203040506070809101112131415161718192021222324"
+        "25262728293031323334353637383940414243444546474849"
+        "50515253545556575859606162636465666768697071727374"
+        "75767778798081828384858687888990919293949596979899";
+    out[0] = kDigits[value * 2];
+    out[1] = kDigits[value * 2 + 1];
+}
+
+/**
+ * @brief Write microseconds in [0, 999999] as six ASCII digits.
+ */
+inline void write_6_digits(char* out, uint32_t value) noexcept {
+    write_2_digits(out, value / 10000);
+    write_2_digits(out + 2, (value / 100) % 100);
+    write_2_digits(out + 4, value % 100);
+}
+
+/**
+ * @brief Length of the "YYYY-MM-DD HH:MM:SS" prefix cached per whole second.
+ */
+inline constexpr size_t kDateTimeLen = 19;
+inline constexpr size_t kTimeOffset = 11;   // index of "HH" within the prefix
+inline constexpr size_t kTimeLen = 8;       // "HH:MM:SS"
+
+/**
+ * @brief Broken-down time for one whole second, rendered once and reused.
+ *
+ * Cached per thread rather than per formatter: the contents do not depend on
+ * the output format, so every sink writing on the logger's writer thread shares
+ * a single localtime() call per second. thread_local keeps format_timestamp()
+ * safe to call concurrently on a shared TimestampFormatter.
+ */
+struct second_cache {
+    int64_t seconds = INT64_MIN;              // whole seconds since epoch, or INT64_MIN if empty
+    char date_time[kDateTimeLen] = {};        // "YYYY-MM-DD HH:MM:SS"
+    std::tm tm = {};                          // for CUSTOM formats, which still need put_time
+};
+
+/**
+ * @brief Return the cache filled for @p seconds, or nullptr if it cannot be converted.
+ */
+inline const second_cache* cached_second(int64_t seconds) noexcept {
+    thread_local second_cache cache;
+    if (cache.seconds != seconds) [[unlikely]] {
+        const time_t time_val = static_cast<time_t>(seconds);
+        std::tm tm;
+    #if defined(_WIN32)
+        if (localtime_s(&tm, &time_val) != 0) {
+            return nullptr;
+        }
+    #else
+        if (!localtime_r(&time_val, &tm)) {
+            return nullptr;
+        }
+    #endif
+        char* out = cache.date_time;
+        const uint32_t year = static_cast<uint32_t>(tm.tm_year + 1900);
+        write_2_digits(out, year / 100);
+        write_2_digits(out + 2, year % 100);
+        out[4] = '-';
+        write_2_digits(out + 5, static_cast<uint32_t>(tm.tm_mon + 1));
+        out[7] = '-';
+        write_2_digits(out + 8, static_cast<uint32_t>(tm.tm_mday));
+        out[10] = ' ';
+        write_2_digits(out + 11, static_cast<uint32_t>(tm.tm_hour));
+        out[13] = ':';
+        write_2_digits(out + 14, static_cast<uint32_t>(tm.tm_min));
+        out[16] = ':';
+        write_2_digits(out + 17, static_cast<uint32_t>(tm.tm_sec));
+        cache.tm = tm;
+        cache.seconds = seconds;
+    }
+    return &cache;
+}
+
 } // namespace detail
 
 inline constexpr bool has_source_location(const char* file_name, uint32_t line) noexcept {
@@ -166,67 +246,65 @@ public:
         : format_(Format::CUSTOM), custom_format_(custom_format) {}
 
     std::string format_timestamp(uint64_t timestamp_ns) const {
-        using namespace std::chrono;
+        using namespace detail;
 
-        nanoseconds duration_ns(timestamp_ns);
-        system_clock::time_point time_point(duration_cast<system_clock::duration>(duration_ns));
+        // Whole seconds select the cached "YYYY-MM-DD HH:MM:SS" prefix; only the
+        // sub-second digits have to be written per call.
+        const int64_t seconds = static_cast<int64_t>(timestamp_ns / 1000000000ULL);
+        const uint32_t us = static_cast<uint32_t>((timestamp_ns / 1000ULL) % 1000000ULL);
 
-        time_t time_val = system_clock::to_time_t(time_point);
-        std::tm* tm_ptr = std::localtime(&time_val);
-        if (!tm_ptr) {
+        const second_cache* cache = cached_second(seconds);
+        if (!cache) [[unlikely]] {
             return "1970-01-01 00:00:00.000000"; // fallback timestamp
         }
-        std::tm tm = *tm_ptr;
 
-        // Extract microseconds and milliseconds
-        auto microseconds_count = duration_cast<microseconds>(duration_ns).count();
-        auto microseconds = microseconds_count % 1000000;
-        auto milliseconds = microseconds / 1000;
-
-        std::ostringstream oss;
-
+        // Longest output is ISO8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ" (27 chars).
+        char buf[32];
         switch (format_) {
-            case Format::DEFAULT:
-                oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
-                break;
+        case Format::DEFAULT:
+            return std::string(cache->date_time, kDateTimeLen);
 
-            case Format::WITH_MICROSECONDS:
-                oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
-                    << "." << std::setfill('0') << std::setw(6) << microseconds;
-                break;
+        case Format::WITH_MICROSECONDS:
+            std::memcpy(buf, cache->date_time, kDateTimeLen);
+            buf[19] = '.';
+            write_6_digits(buf + 20, us);
+            return std::string(buf, 26);
 
-            case Format::WITH_MILLISECONDS:
-                oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
-                    << "." << std::setfill('0') << std::setw(3) << milliseconds;
-                break;
+        case Format::WITH_MILLISECONDS:
+            std::memcpy(buf, cache->date_time, kDateTimeLen);
+            buf[19] = '.';
+            write_2_digits(buf + 20, us / 10000);
+            buf[22] = static_cast<char>('0' + (us / 1000) % 10);
+            return std::string(buf, 23);
 
-            case Format::ISO8601:
-                oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S")
-                    << "." << std::setfill('0') << std::setw(6) << microseconds << "Z";
-                break;
+        case Format::ISO8601:
+            std::memcpy(buf, cache->date_time, kDateTimeLen);
+            buf[10] = 'T';
+            buf[19] = '.';
+            write_6_digits(buf + 20, us);
+            buf[26] = 'Z';
+            return std::string(buf, 27);
 
-            case Format::TIME_ONLY:
-                oss << std::put_time(&tm, "%H:%M:%S")
-                    << "." << std::setfill('0') << std::setw(6) << microseconds;
-                break;
+        case Format::TIME_ONLY:
+            std::memcpy(buf, cache->date_time + kTimeOffset, kTimeLen);
+            buf[8] = '.';
+            write_6_digits(buf + 9, us);
+            return std::string(buf, 15);
 
-            case Format::CUSTOM:
-                if (!custom_format_.empty()) {
-                    // Handle %f placeholder for microseconds in custom format
-                    std::string format = custom_format_;
-                    size_t pos = format.find("%f");
-                    if (pos != std::string::npos) {
-                        format.replace(pos, 2, std::to_string(microseconds));
-                    }
-                    oss << std::put_time(&tm, format.c_str());
-                    return oss.str();
-                } else {
-                    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
-                }
-                break;
+        case Format::CUSTOM:
+            if (!custom_format_.empty()) {
+                // %f placeholder uses unpadded microseconds, as today
+                std::ostringstream oss;
+                std::string format = custom_format_;
+                size_t pos = format.find("%f");
+                if (pos != std::string::npos)
+                    format.replace(pos, 2, std::to_string(us));
+                oss << std::put_time(&cache->tm, format.c_str());
+                return oss.str();
+            }
+            return std::string(cache->date_time, kDateTimeLen);
         }
-
-        return oss.str();
+        return {};
     }
 
 private:
@@ -510,8 +588,14 @@ protected:
      */
     void open_stream(const std::filesystem::path& path, std::ios::openmode mode);
 
+    /// Size of the explicit stream buffer installed by open_stream().
+    static constexpr size_t kStreamBufferSize = 64 * 1024;
+
     std::filesystem::path file_path_;
     std::ofstream file_stream_;
+    /// Backing store for file_stream_'s buffer. Held by the sink so it outlives
+    /// every open/close cycle; pubsetbuf() does not take ownership.
+    std::vector<char> stream_buffer_;
     TimestampFormatter timestamp_formatter_;
 };
 
@@ -949,6 +1033,31 @@ private:
     DrainResult drain_pending();
     void write_log_entry(const LogEntry* entry_ptr, uint32_t count);
     void dispatch_entry(const LogEntry& entry);
+
+    /// Flush every sink. Only ever called on the writer thread, which owns them.
+    void flush_sinks();
+
+    /// Release the writer thread if it is parked. Called from the enqueue path,
+    /// so it costs a relaxed-order load and a predictable branch when the writer
+    /// is already awake, which is the case whenever logging is ongoing.
+    void wake_writer() noexcept;
+
+    /// Release the writer thread whether or not it looks parked. Used by the rare
+    /// paths - flush() and shutdown() - where missing a wake-up would stall the
+    /// caller rather than merely delay an entry.
+    void force_wake_writer() noexcept;
+
+    /// Block until a producer publishes, a flush is requested, or the logger
+    /// stops. Only called on the writer thread.
+    void park_writer();
+
+    /// Wait on a caller's thread until @p ready holds or the logger stops.
+    /// Stays hot briefly - a drain usually completes well inside that - before
+    /// falling back to sleeping so a long wait does not pin a core. The
+    /// predicate is re-checked every pass, so no wake-up can be missed and
+    /// shutdown always ends the wait.
+    template<typename Predicate>
+    void wait_until_ready(Predicate ready);
     void set_source_location_options(bool enabled) noexcept;
 
     // Helper function to round up to next power of 2
@@ -1001,7 +1110,28 @@ private:
     std::filesystem::path log_file_;
     std::thread writer_thread_;
     std::atomic<bool> running_{false};
-    uint64_t read_index_{0};
+    /// How far the writer thread has claimed into the queue. Written only by the
+    /// writer thread but read by callers of flush(), so it has to be atomic even
+    /// though nothing synchronises through it: relaxed is enough because it
+    /// carries no data, only progress. The ordering that makes flush() a real
+    /// guarantee is the flush_request_/flush_done_ handshake below.
+    std::atomic<uint64_t> read_index_{0};
+    /// Sink flushing is owned by the writer thread, so flush() cannot touch the
+    /// sinks directly without racing it. A caller bumps flush_request_ and waits
+    /// for the writer thread to publish the same generation in flush_done_.
+    std::atomic<uint64_t> flush_request_{0};
+    std::atomic<uint64_t> flush_done_{0};
+    /// Set while the writer thread is blocked in wake_token_.wait(). Producers
+    /// read it after publishing and only pay for a wake-up when one is needed.
+    /// Both the store here and the load in wake_writer() are seq_cst: the writer
+    /// re-checks for work *after* announcing itself and the producer checks this
+    /// flag *after* publishing, so the two orderings must not be reordered past
+    /// each other or a wake-up could be lost.
+    std::atomic<bool> writer_parked_{false};
+    /// Bumped to release the parked writer thread. The value must change, not
+    /// merely be notified: atomic::wait re-blocks if the value still compares
+    /// equal to the one it was given.
+    std::atomic<uint32_t> wake_token_{0};
     std::atomic<LogLevel> log_level_{LogLevel::L_TRACE};
     static constexpr uint8_t kSourceLocationEnabled = 0x01;
     std::atomic<uint8_t> source_location_options_{kSourceLocationEnabled};
@@ -1374,6 +1504,13 @@ inline void FileSink::open_stream(const std::filesystem::path& path, std::ios::o
         std::error_code ec;
         std::filesystem::create_directories(parent, ec); // no-op when it already exists
     }
+    // Must be set while the stream is closed to take effect. Every caller either
+    // opens for the first time or has just closed the previous file.
+    if (stream_buffer_.empty()) {
+        stream_buffer_.resize(kStreamBufferSize);
+    }
+    file_stream_.rdbuf()->pubsetbuf(stream_buffer_.data(),
+                                    static_cast<std::streamsize>(stream_buffer_.size()));
     file_stream_.open(path, mode);
 }
 
@@ -1397,7 +1534,7 @@ inline FileSink::FileSink(const std::filesystem::path& file_path,
 
 inline void FileSink::write(const LogEntry& entry) {
     if (file_stream_) {
-        file_stream_ << format_log_entry(entry) << std::endl;
+        file_stream_ << format_log_entry(entry) << "\n";
     }
 }
 
@@ -1449,7 +1586,7 @@ inline void RotatingFileSink::write(const LogEntry& entry) {
     
     if (file_stream_) {
         std::string formatted = format_log_entry(entry);
-        file_stream_ << formatted << std::endl;
+        file_stream_ << formatted << "\n";
         current_file_size_ += formatted.length() + 1; // +1 for newline
     }
 }
@@ -1614,7 +1751,7 @@ inline void DailyFileSink::write(const LogEntry& entry) {
 
     if (file_stream_) {
         std::string formatted = format_log_entry(entry);
-        file_stream_ << formatted << std::endl;
+        file_stream_ << formatted << "\n";
         current_file_size_ += formatted.length() + 1; // +1 for newline
     }
 }
@@ -1799,20 +1936,24 @@ inline void Logger::start() {
     // process owns both and drains the shared queue on everyone's behalf.
     if (mode_ != QueueMode::SharedProducer) {
         // Initialize read_index_ before starting the thread
-        read_index_ = log_queue_->initial_reading_index();
+        read_index_.store(log_queue_->initial_reading_index(), std::memory_order_relaxed);
         if (mode_ == QueueMode::SharedCollector && collect_backlog_) {
             // Producers may already have published into this segment before the
             // collector attached. Rewind to the oldest slot the ring can still
             // hold so nothing buffered is dropped; anything older than that has
             // been overwritten already.
             const uint64_t capacity = log_queue_->size();
-            read_index_ = read_index_ > capacity ? read_index_ - capacity : 0;
+            const uint64_t attached_at = read_index_.load(std::memory_order_relaxed);
+            read_index_.store(attached_at > capacity ? attached_at - capacity : 0,
+                              std::memory_order_relaxed);
         }
 
+        // No wait for the thread to come up: running_ is already true, and the
+        // queue is lock-free, so entries logged before the thread is scheduled
+        // simply wait in the ring for it to drain them. The delay that used to
+        // stand here could not have ensured anything anyway - a sleep is not a
+        // handshake - and on Windows it cost ~15.6ms of every init().
         writer_thread_ = std::thread([this]() { writer_thread_func(); });
-
-        // Give a small delay to ensure writer thread is started
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     log(LogLevel::L_INFO, "SlickLogger v{}", SLICK_LOGGER_VERSION);
 }
@@ -2163,6 +2304,7 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
     uint64_t index = log_queue_->reserve();
     *(*log_queue_)[index] = std::move(entry);
     log_queue_->publish(index);
+    wake_writer();
 }
 
 template<typename T>
@@ -2387,6 +2529,10 @@ inline void Logger::retain_shared_queue(void* queue) noexcept {
 inline void Logger::shutdown(bool clear_sinks) {
     if (running_.load(std::memory_order_relaxed)) {
         running_.store(false, std::memory_order_release);
+        // The writer thread may be parked. atomic::wait has no timeout, so it
+        // only ever resumes because the token changed - without this the join
+        // below would block until something else happened to be logged.
+        force_wake_writer();
         if (writer_thread_.joinable()) {
             writer_thread_.join();
         }
@@ -2452,22 +2598,52 @@ inline void Logger::flush() {
     // already been assigned an index below drain_target.
     const uint64_t drain_target = log_queue_->initial_reading_index();
     // Wait until the writer thread's read cursor reaches drain_target.
-    while (running_.load(std::memory_order_relaxed) && read_index_ < drain_target) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    force_wake_writer(); // the entries may have arrived while the writer was parked
+    wait_until_ready([&] {
+        return read_index_.load(std::memory_order_relaxed) >= drain_target;
+    });
+
+    // Consuming an entry only hands it to a sink; the sink may still be holding it
+    // in a stream buffer. Ask the writer thread - the only thread allowed to touch
+    // the sinks - to flush, and wait for it to acknowledge this request.
+    const uint64_t generation = flush_request_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    force_wake_writer(); // it may be parked, and would not see the request otherwise
+    wait_until_ready([&] { return flush_done_.load(std::memory_order_acquire) >= generation; });
 }
 
 inline void Logger::reset() {
     shutdown();
     // Reset all state for fresh initialization
     log_file_.clear();
-    read_index_ = 0;
+    read_index_.store(0, std::memory_order_relaxed);
     log_level_.store(LogLevel::L_TRACE);
     source_location_options_.store(kSourceLocationEnabled, std::memory_order_relaxed);
+
+    // shutdown() has joined the writer thread, so nothing else can be touching the
+    // wake and flush state by now. None of this is required for correctness: the
+    // counters are monotonic, the writer compares flush_request_ against
+    // flush_done_ for inequality rather than order (so it resynchronises on its
+    // first iteration whatever they hold), and wake_token_ is only ever compared
+    // for change. Clearing them simply leaves a reused Logger indistinguishable
+    // from a fresh one, which makes init()/reset() cycles easier to reason about.
+    // Keep flush_request_ and flush_done_ together all the same, so the
+    // flush_done_ <= flush_request_ invariant is obvious at a glance.
+    flush_request_.store(0, std::memory_order_relaxed);
+    flush_done_.store(0, std::memory_order_relaxed);
+    wake_token_.store(0, std::memory_order_relaxed);
+    writer_parked_.store(false, std::memory_order_relaxed);
 }
 
 inline Logger::DrainResult Logger::drain_pending() {
-    auto [entry_ptr, count] = log_queue_->read(read_index_);
+    // read() takes a plain uint64_t& and advances it in place. The atomic must
+    // not be passed directly: SlickQueue also has a read(std::atomic<uint64_t>&)
+    // overload for multiple consumers sharing one cursor, and binding that by
+    // accident would change how slots are claimed. So the cursor is round-tripped
+    // through a local and republished at exactly the point read() used to move it.
+    uint64_t cursor = read_index_.load(std::memory_order_relaxed);
+    auto [entry_ptr, count] = log_queue_->read(cursor);
+    read_index_.store(cursor, std::memory_order_relaxed);
+
     if (entry_ptr && count) {
         write_log_entry(entry_ptr, count);
         stalled_since_ = {};
@@ -2478,7 +2654,7 @@ inline Logger::DrainResult Logger::drain_pending() {
     // read() will never return, stalling every entry behind it. Only shared queues
     // can be orphaned this way, so the recovery is scoped to the collector role.
     const bool recover_stalls = (mode_ == QueueMode::SharedCollector) && stalled_entry_timeout_ms_ > 0;
-    if (!recover_stalls || log_queue_->initial_reading_index() <= read_index_) {
+    if (!recover_stalls || log_queue_->initial_reading_index() <= cursor) {
         stalled_since_ = {};
         return DrainResult::Idle;
     }
@@ -2493,7 +2669,7 @@ inline Logger::DrainResult Logger::drain_pending() {
         return DrainResult::WaitingOnStall;
     }
 
-    ++read_index_;
+    read_index_.store(cursor + 1, std::memory_order_relaxed); // abandon the stalled slot
     stalled_since_ = {};
     return DrainResult::SkippedStalled;
 }
@@ -2501,17 +2677,74 @@ inline Logger::DrainResult Logger::drain_pending() {
 inline void Logger::writer_thread_func() {
     stalled_since_ = {};
 
+    // Sinks are flushed when the queue runs dry rather than after every batch.
+    // Flushing per batch meant one fflush per entry whenever the writer thread
+    // kept up with the producers, which cost far more than formatting the entry.
+    // Draining to empty and then flushing preserves what callers can observe -
+    // once the logger is caught up, everything logged is on disk - while letting
+    // a burst share a single flush.
+    bool sinks_dirty = false;
+
+    // Idle backoff. std::this_thread::sleep_for is deliberately not used here:
+    // Windows' default timer resolution is ~15.6ms, so a "1ms" sleep really
+    // parks the thread for ~15.6ms and puts that much latency between a log call
+    // and the entry reaching its sink. Instead the thread stays hot for a short
+    // burst - covering the gaps in an active logging stream - and then parks on
+    // wake_token_ until a producer, a flush request, or shutdown releases it.
+    static constexpr uint32_t kIdleYieldLimit = 64;
+    uint32_t idle_yields = 0;
+
+    // Parking only works when the producers share this process: writer_parked_
+    // lives in this address space, and neither WaitOnAddress nor a futex on a
+    // private mapping can be signalled by another process. A collector therefore
+    // keeps polling for entries that cross a process boundary. mode_ is fixed
+    // before this thread starts and does not change while it runs.
+    const bool can_park = (mode_ == QueueMode::Local);
+
     while (running_.load(std::memory_order_relaxed)) {
+        // Read the request before flushing so a request arriving mid-flush is not
+        // mistaken for one this flush already covered.
+        const uint64_t flush_requested = flush_request_.load(std::memory_order_acquire);
+        if (flush_requested != flush_done_.load(std::memory_order_relaxed)) {
+            flush_sinks();
+            sinks_dirty = false;
+            flush_done_.store(flush_requested, std::memory_order_release);
+        }
+
         switch (drain_pending()) {
         case DrainResult::Wrote:
+            sinks_dirty = true;
+            idle_yields = 0;
             break;
         case DrainResult::SkippedStalled:
             log(LogLevel::L_WARN, "SlickLogger: skipped an unpublished log entry, "
                                   "a producer process likely died mid-write");
+            idle_yields = 0;
             break;
         case DrainResult::WaitingOnStall:
+            // A dead producer's slot clears by timeout rather than by a wake-up,
+            // so this must keep re-checking instead of parking. It is a rare,
+            // multi-second path where the coarse sleep does no harm.
+            if (sinks_dirty) {
+                flush_sinks();
+                sinks_dirty = false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            break;
         case DrainResult::Idle:
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Small delay if no data
+            if (sinks_dirty) {
+                flush_sinks(); // caught up: make everything written so far visible
+                sinks_dirty = false;
+            }
+            if (idle_yields < kIdleYieldLimit) {
+                ++idle_yields;
+                std::this_thread::yield();
+            } else if (can_park) {
+                park_writer();
+                idle_yields = 0;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             break;
         }
     }
@@ -2532,6 +2765,11 @@ inline void Logger::writer_thread_func() {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
+
+    // The writer thread owns the sinks, so this final flush is the last chance to
+    // get the drained entries onto disk before shutdown() joins and returns.
+    flush_sinks();
+    flush_done_.store(flush_request_.load(std::memory_order_acquire), std::memory_order_release);
 }
 
 inline void Logger::rebase_entry(LogEntry& entry) const noexcept {
@@ -2562,13 +2800,63 @@ inline void Logger::write_log_entry(const LogEntry* entry_ptr, uint32_t count) {
             dispatch_entry(entry);
         }
     }
+}
 
-    // Flush all sinks
+inline void Logger::flush_sinks() {
     for (auto& sink : sinks_) {
         if (sink) {
             sink->flush();
         }
     }
+}
+
+template<typename Predicate>
+inline void Logger::wait_until_ready(Predicate ready) {
+    // Long enough to cover a normal drain without sleeping, short enough that a
+    // genuinely slow wait stops burning a core.
+    static constexpr uint32_t kCallerYieldLimit = 1024;
+    for (uint32_t spins = 0; ; ++spins) {
+        if (ready() || !running_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (spins < kCallerYieldLimit) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
+
+inline void Logger::wake_writer() noexcept {
+    if (writer_parked_.load(std::memory_order_seq_cst)) [[unlikely]] {
+        force_wake_writer();
+    }
+}
+
+inline void Logger::force_wake_writer() noexcept {
+    wake_token_.fetch_add(1, std::memory_order_release);
+    wake_token_.notify_all();
+}
+
+inline void Logger::park_writer() {
+    // Read the token before announcing the park: a producer that bumps it in the
+    // window between here and wait() leaves the value different from the one
+    // passed in, so wait() returns immediately instead of missing the wake-up.
+    const uint32_t token = wake_token_.load(std::memory_order_acquire);
+    writer_parked_.store(true, std::memory_order_seq_cst);
+
+    // Re-check everything the park waits for. Anything that became true before
+    // writer_parked_ became visible would otherwise never wake us.
+    const bool work_pending =
+        !running_.load(std::memory_order_relaxed) ||
+        flush_request_.load(std::memory_order_acquire) != flush_done_.load(std::memory_order_relaxed) ||
+        (log_queue_ && log_queue_->initial_reading_index() !=
+                           read_index_.load(std::memory_order_relaxed));
+
+    if (!work_pending) {
+        wake_token_.wait(token, std::memory_order_acquire);
+    }
+    writer_parked_.store(false, std::memory_order_release);
 }
 
 inline void Logger::dispatch_entry(const LogEntry& entry) {

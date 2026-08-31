@@ -1,11 +1,14 @@
 #include <slick/logger.hpp>
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <thread>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 class SlickLoggerTest : public ::testing::Test {
 protected:
@@ -880,6 +883,290 @@ TEST_F(SlickLoggerTest, MultipleProducersAfterSetInstance) {
         ++count;
 
     EXPECT_EQ(count, 11); // 10 messages + 1 version line
+}
+
+
+// Sinks are no longer flushed after every batch; the writer thread flushes when
+// it has drained the queue, and on request. These tests pin the guarantees that
+// callers can actually observe.
+
+TEST_F(SlickLoggerTest, FlushMakesEntriesVisibleOnDisk) {
+    std::filesystem::remove("test_flush_visible.log");
+
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    logger.add_file_sink("test_flush_visible.log");
+    logger.init(1024);
+
+    const int kMessages = 500;
+    for (int i = 0; i < kMessages; ++i) {
+        LOG_INFO("flush visibility message {}", i);
+    }
+
+    logger.flush();
+
+    // Without shutting the logger down, every entry must already be readable.
+    int count = 0;
+    {
+        std::ifstream file("test_flush_visible.log");
+        ASSERT_TRUE(file.is_open());
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.find("flush visibility message") != std::string::npos) {
+                ++count;
+            }
+        }
+    }
+    EXPECT_EQ(count, kMessages);
+
+    logger.shutdown();
+    std::filesystem::remove("test_flush_visible.log");
+}
+
+TEST_F(SlickLoggerTest, IdleWriterFlushesWithoutExplicitFlush) {
+    std::filesystem::remove("test_idle_flush.log");
+
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    logger.add_file_sink("test_idle_flush.log");
+    logger.init(1024);
+
+    const int kMessages = 200;
+    for (int i = 0; i < kMessages; ++i) {
+        LOG_INFO("idle flush message {}", i);
+    }
+
+    // No flush() and no shutdown(): once the writer thread drains the queue it
+    // flushes on its own, so the entries appear without the caller asking.
+    int count = 0;
+    for (int attempt = 0; attempt < 200 && count < kMessages; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        count = 0;
+        std::ifstream file("test_idle_flush.log");
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.find("idle flush message") != std::string::npos) {
+                ++count;
+            }
+        }
+    }
+    EXPECT_EQ(count, kMessages);
+
+    logger.shutdown();
+    std::filesystem::remove("test_idle_flush.log");
+}
+
+// Counts entries as the writer thread hands them over, with no I/O of its own.
+class CountingSink : public slick::logger::ISink {
+public:
+    CountingSink() : ISink("counting") {}
+    void write(const slick::logger::LogEntry&) override {
+        writes_.fetch_add(1, std::memory_order_release);
+    }
+    void flush() override {}
+    std::atomic<int> writes_{0};
+};
+
+TEST_F(SlickLoggerTest, ParkedWriterIsAlwaysWokenByANewEntry) {
+    // The idle writer thread parks on an atomic, and atomic::wait has no
+    // timeout: a lost wake-up strands an entry indefinitely rather than merely
+    // delaying it. The riskiest moment is an entry published in the window
+    // between the writer deciding to park and actually parking, so the gap
+    // before each entry is swept across that boundary rather than fixed.
+    //
+    // Sleeping cannot produce those gaps - Windows rounds any sleep request up
+    // to ~15.6ms - so the gap is busy-waited.
+    auto spin_for = [](double microseconds) {
+        const auto start = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double, std::micro>(
+                   std::chrono::steady_clock::now() - start).count() < microseconds) {
+            std::this_thread::yield();
+        }
+    };
+
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    auto sink = std::make_shared<CountingSink>();
+    logger.add_sink(sink);
+    logger.init(4096);
+
+    logger.flush();
+    const int baseline = sink->writes_.load(std::memory_order_acquire);
+
+    const int kRounds = 1500;
+    for (int i = 0; i < kRounds; ++i) {
+        // Sweeps 0..299us, which brackets the writer's idle spin, so some
+        // iterations land inside the park window. Every 250th round idles long
+        // enough to park deeply as well.
+        if (i % 250 == 249) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        } else {
+            spin_for(static_cast<double>(i % 300));
+        }
+
+        LOG_INFO("park probe {}", i);
+
+        // A delayed entry is fine; a stranded one is not. Checking before the
+        // next entry is logged means nothing else can wake the writer for us.
+        const int expected = baseline + i + 1;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (sink->writes_.load(std::memory_order_acquire) < expected &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        ASSERT_GE(sink->writes_.load(std::memory_order_acquire), expected)
+            << "writer thread was not woken for entry " << i;
+    }
+
+    logger.shutdown();
+}
+
+TEST_F(SlickLoggerTest, ShutdownAndFlushCompleteWhileWriterIsParked) {
+    // Both paths have to release a parked writer explicitly; without that the
+    // join or the flush would block until something else happened to be logged.
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    auto sink = std::make_shared<CountingSink>();
+    logger.add_sink(sink);
+    logger.init(4096);
+
+    LOG_INFO("before the writer parks");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // let it park
+
+    auto started = std::chrono::steady_clock::now();
+    logger.flush(); // must not wait on another entry arriving
+    auto flush_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    EXPECT_LT(flush_ms, 1000) << "flush() did not wake the parked writer";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // let it park again
+
+    started = std::chrono::steady_clock::now();
+    logger.shutdown();
+    auto shutdown_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    EXPECT_LT(shutdown_ms, 1000) << "shutdown() did not wake the parked writer";
+}
+
+// A sink that is slow to write, so the writer thread is still mid-batch when a
+// caller asks to flush. The queue cursor advances when a batch is claimed rather
+// than when it is written, so this is what distinguishes "the writer took the
+// entries" from "the entries reached the sink and were flushed".
+class SlowCountingSink : public slick::logger::ISink {
+public:
+    SlowCountingSink() : ISink("slow_counting") {}
+
+    void write(const slick::logger::LogEntry&) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        writes_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void flush() override {
+        writes_at_last_flush_.store(writes_.load(std::memory_order_relaxed),
+                                    std::memory_order_relaxed);
+    }
+
+    std::atomic<int> writes_{0};
+    std::atomic<int> writes_at_last_flush_{-1};
+};
+
+TEST_F(SlickLoggerTest, FlushWaitsForSinksNotJustTheQueueCursor) {
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    auto sink = std::make_shared<SlowCountingSink>();
+    logger.add_sink(sink);
+    logger.init(4096);
+
+    // Each write takes far longer than flush()'s polling interval, so "the queue
+    // cursor reached the target" and "the sink finished and was flushed" are
+    // separated by a wide, reliable margin.
+    const int kMessages = 30;
+    for (int i = 0; i < kMessages; ++i) {
+        LOG_INFO("slow sink message {}", i);
+    }
+
+    logger.flush();
+
+    // flush() must not return until the sink has actually written every entry
+    // and been flushed afterwards. The sink also sees the version line logged by
+    // init(), so the counts are lower bounds.
+    EXPECT_GE(sink->writes_.load(), kMessages);
+    EXPECT_GE(sink->writes_at_last_flush_.load(), kMessages);
+
+    logger.shutdown();
+}
+
+TEST_F(SlickLoggerTest, FlushStillWorksAcrossResetCycles) {
+    // reset() clears the flush generation counters, so exercise flush() over
+    // repeated init()/reset() cycles rather than only the first one. The slow
+    // sink keeps the assertions meaningful: a flush() that returned before the
+    // sink was done could not report every entry as written and flushed.
+    auto& logger = slick::logger::Logger::instance();
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        logger.reset();
+        auto sink = std::make_shared<SlowCountingSink>();
+        logger.add_sink(sink);
+        logger.init(4096);
+
+        const int kMessages = 20;
+        for (int i = 0; i < kMessages; ++i) {
+            LOG_INFO("reset cycle {} message {}", cycle, i);
+        }
+
+        logger.flush();
+
+        EXPECT_GE(sink->writes_.load(), kMessages)
+            << "flush() returned before the sink had the entries, cycle " << cycle;
+        EXPECT_GE(sink->writes_at_last_flush_.load(), kMessages)
+            << "flush() returned without the sink being flushed, cycle " << cycle;
+
+        logger.shutdown();
+    }
+}
+
+TEST_F(SlickLoggerTest, RepeatedAndConcurrentFlushesAllComplete) {
+    std::filesystem::remove("test_flush_repeat.log");
+
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    logger.add_file_sink("test_flush_repeat.log");
+    logger.init(1024);
+
+    // Interleaved logging and flushing from several threads must not hang: each
+    // flush waits for its own generation to be acknowledged.
+    std::atomic<int> written{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&logger, &written]() {
+            for (int i = 0; i < 50; ++i) {
+                LOG_INFO("concurrent flush message {}", i);
+                ++written;
+                logger.flush();
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    logger.flush();
+
+    int count = 0;
+    {
+        std::ifstream file("test_flush_repeat.log");
+        ASSERT_TRUE(file.is_open());
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.find("concurrent flush message") != std::string::npos) {
+                ++count;
+            }
+        }
+    }
+    EXPECT_EQ(count, written.load());
+
+    logger.shutdown();
+    std::filesystem::remove("test_flush_repeat.log");
 }
 
 int main(int argc, char **argv) {

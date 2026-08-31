@@ -528,11 +528,26 @@ Useful controls:
 - `init(path, log_queue_size, string_buffer_size)`: create a default file sink and start logging
 - `init(config)`: initialize from `LogConfig`
 - `init(queue_size, string_buffer_size)`: start with sinks that were already added
-- `flush()`: wait for queued entries to be written while keeping the logger running
+- `flush()`: wait for queued entries to be written **and flushed to their sinks**, while keeping the logger running
 - `shutdown(clear_sinks = true)`: flush, stop the writer thread, and optionally clear sinks
 - `reset()`: return the singleton to an uninitialized state; mainly intended for tests
 - `set_level()` / `get_level()`: update or read the global level filter
 - `clear_sinks()`: remove all currently registered sinks before reconfiguration
+
+#### When entries reach disk
+
+The writer thread flushes the file sinks once it has drained the queue, not after every entry, so a burst of logging shares a single flush instead of paying a write syscall per line. In practice this means:
+
+- Once the logger is caught up, everything logged so far is on disk.
+- While a backlog is still draining, recent entries may still be sitting in a sink's buffer.
+- `flush()` returns only after the writer thread has written **and** flushed every entry queued before the call, so use it whenever you need a guarantee at a specific point (before unloading a plugin, before inspecting the log file, at a checkpoint).
+- `shutdown()` drains and flushes before the writer thread exits.
+
+`ConsoleSink` is the exception: it flushes after every line. That is deliberate - an interactive terminal is line-buffered anyway, and when stdout is redirected to a file or a pipe (CI logs, `docker logs`, process supervisors) a per-line flush is what keeps each line immediately visible to the capturing process. Console output is rarely the hot path, so the per-line cost does not matter there.
+
+A custom sink's `flush()` is only ever called on the writer thread, so it does not need its own locking against `write()`.
+
+An idle writer thread parks rather than polling on a timer, so an entry logged into an otherwise idle logger reaches its sink in tens of microseconds instead of waiting out a scheduler tick. Producers only signal a wake-up when the writer is actually parked, so this costs an atomic load and a predictable branch on the logging path. In `QueueMode::SharedCollector` the collector polls instead, because a producer in another process cannot signal it.
 
 ### Timestamp Formatting
 
@@ -557,6 +572,10 @@ Available predefined formats:
 - `TimestampFormatter::Format::ISO8601`
 - `TimestampFormatter::Format::TIME_ONLY`
 - `TimestampFormatter::Format::CUSTOM`
+
+The predefined formats are rendered by writing digits straight into a stack buffer, on top of a broken-down time that is computed once per whole second and cached. A burst of entries within the same second therefore costs no `localtime` call at all. The cache is `thread_local`, so a `TimestampFormatter` may be shared between threads, and every sink on the writer thread shares one `localtime` call per second.
+
+`Format::CUSTOM` is the exception: an arbitrary `strftime` pattern still goes through `std::put_time`, which measures more than an order of magnitude slower per entry than the predefined formats. Prefer a predefined format on a hot logging path.
 
 ### Sharing the Logger Across Shared Libraries (Plugin / Strategy Pattern)
 

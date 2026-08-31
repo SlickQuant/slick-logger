@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 #include <slick/logger.hpp>
+#include <atomic>
 #include <fstream>
 #include <regex>
+#include <thread>
+#include <vector>
 
 using namespace slick::logger;
 
@@ -157,4 +160,153 @@ TEST_F(TimestampTest, DailyFileSinkWithTimestampFormats) {
     std::filesystem::remove("test_daily.log");
     std::filesystem::remove("test_daily_micro.log");
     std::filesystem::remove("test_daily_custom.log");
+}
+// The formats below are produced by hand-written digit rendering over a
+// per-second cache, so these tests pin the exact digits and the relationships
+// between formats rather than only their shape.
+
+TEST_F(TimestampTest, SubSecondDigitsAreExact) {
+    // The date/time part depends on the local timezone, but the fractional part
+    // never does, so it can be asserted exactly.
+    struct Case { uint64_t sub_ns; const char* micros; const char* millis; };
+    const Case cases[] = {
+        {0ULL,         "000000", "000"},
+        {1000ULL,      "000001", "000"},
+        {9000ULL,      "000009", "000"},
+        {10000ULL,     "000010", "000"},
+        {999000ULL,    "000999", "000"},
+        {1000000ULL,   "001000", "001"},
+        {9999000ULL,   "009999", "009"},
+        {10000000ULL,  "010000", "010"},
+        {123456000ULL, "123456", "123"},
+        {999999000ULL, "999999", "999"},
+        {999999999ULL, "999999", "999"}, // sub-microsecond digits are truncated
+    };
+
+    const uint64_t whole_second = 1693038674ULL * 1000000000ULL;
+    TimestampFormatter micro_fmt(TimestampFormatter::Format::WITH_MICROSECONDS);
+    TimestampFormatter milli_fmt(TimestampFormatter::Format::WITH_MILLISECONDS);
+
+    for (const auto& c : cases) {
+        const uint64_t ts = whole_second + c.sub_ns;
+        const std::string micro = micro_fmt.format_timestamp(ts);
+        const std::string milli = milli_fmt.format_timestamp(ts);
+        ASSERT_EQ(micro.size(), 26u) << "sub_ns=" << c.sub_ns;
+        ASSERT_EQ(milli.size(), 23u) << "sub_ns=" << c.sub_ns;
+        EXPECT_EQ(micro.substr(20, 6), c.micros) << "sub_ns=" << c.sub_ns;
+        EXPECT_EQ(milli.substr(20, 3), c.millis) << "sub_ns=" << c.sub_ns;
+    }
+}
+
+TEST_F(TimestampTest, FormatsAgreeWithEachOther) {
+    // Every format is rendered from the same cached prefix, so they must stay
+    // consistent with one another.
+    TimestampFormatter default_fmt(TimestampFormatter::Format::DEFAULT);
+    TimestampFormatter micro_fmt(TimestampFormatter::Format::WITH_MICROSECONDS);
+    TimestampFormatter milli_fmt(TimestampFormatter::Format::WITH_MILLISECONDS);
+    TimestampFormatter iso_fmt(TimestampFormatter::Format::ISO8601);
+    TimestampFormatter time_fmt(TimestampFormatter::Format::TIME_ONLY);
+
+    const uint64_t timestamps[] = {
+        0ULL,                                        // epoch
+        1693038674123456789ULL,                      // 2023-08-26
+        1709164800987654321ULL,                      // 2024-02-29, leap day
+        1735689599999999000ULL,                      // 2024-12-31 23:59:59.999999
+        1735689600000000000ULL,                      // 2025-01-01 00:00:00
+        4102444800000000000ULL,                      // 2100-01-01
+    };
+
+    for (uint64_t ts : timestamps) {
+        const std::string def = default_fmt.format_timestamp(ts);
+        const std::string micro = micro_fmt.format_timestamp(ts);
+        const std::string milli = milli_fmt.format_timestamp(ts);
+        const std::string iso = iso_fmt.format_timestamp(ts);
+        const std::string time_only = time_fmt.format_timestamp(ts);
+
+        ASSERT_EQ(def.size(), 19u) << "ts=" << ts;
+        ASSERT_EQ(iso.size(), 27u) << "ts=" << ts;
+        ASSERT_EQ(time_only.size(), 15u) << "ts=" << ts;
+
+        EXPECT_EQ(micro.substr(0, 19), def) << "ts=" << ts;
+        EXPECT_EQ(milli.substr(0, 19), def) << "ts=" << ts;
+        EXPECT_EQ(milli.substr(20, 3), micro.substr(20, 3)) << "ts=" << ts;
+
+        // ISO8601 is the microsecond format with 'T' as the separator and a 'Z' suffix.
+        std::string iso_from_micro = micro;
+        iso_from_micro[10] = 'T';
+        iso_from_micro += 'Z';
+        EXPECT_EQ(iso, iso_from_micro) << "ts=" << ts;
+
+        // TIME_ONLY is the time portion of the microsecond format.
+        EXPECT_EQ(time_only, micro.substr(11)) << "ts=" << ts;
+    }
+}
+
+TEST_F(TimestampTest, PerSecondCacheRefreshesAcrossSeconds) {
+    // The "YYYY-MM-DD HH:MM:SS" prefix is cached per whole second; interleaving
+    // seconds must never hand back a stale prefix.
+    TimestampFormatter fmt(TimestampFormatter::Format::WITH_MICROSECONDS);
+
+    const uint64_t a = 1693038674123456000ULL;
+    const uint64_t b = 1693038675123456000ULL; // one second later
+    const uint64_t c = 1793038674123456000ULL; // years later
+
+    const std::string first_a = fmt.format_timestamp(a);
+    const std::string first_b = fmt.format_timestamp(b);
+    const std::string first_c = fmt.format_timestamp(c);
+
+    EXPECT_NE(first_a, first_b);
+    EXPECT_NE(first_b, first_c);
+
+    // Re-reading in a different order must reproduce the same strings.
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(fmt.format_timestamp(c), first_c);
+        EXPECT_EQ(fmt.format_timestamp(a), first_a);
+        EXPECT_EQ(fmt.format_timestamp(b), first_b);
+    }
+
+    // Repeating the same second must be stable (the cache-hit path).
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(fmt.format_timestamp(a), first_a);
+    }
+}
+
+TEST_F(TimestampTest, SharedFormatterIsSafeAcrossThreads) {
+    // A single formatter may legitimately be shared; the per-second cache is
+    // thread-local so concurrent use must not tear the returned strings.
+    const TimestampFormatter fmt(TimestampFormatter::Format::WITH_MICROSECONDS);
+
+    std::vector<uint64_t> timestamps;
+    for (int i = 0; i < 500; ++i) {
+        timestamps.push_back(1693038674000000000ULL + static_cast<uint64_t>(i) * 500000000ULL);
+    }
+
+    // Expected values computed on this thread first.
+    std::vector<std::string> expected;
+    expected.reserve(timestamps.size());
+    for (uint64_t ts : timestamps) {
+        expected.push_back(fmt.format_timestamp(ts));
+    }
+
+    std::atomic<int> mismatches{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&, t]() {
+            // Each thread walks the list from a different offset so the threads
+            // request different seconds at the same time.
+            const size_t offset = static_cast<size_t>(t) * 37;
+            for (int pass = 0; pass < 20; ++pass) {
+                for (size_t i = 0; i < timestamps.size(); ++i) {
+                    const size_t idx = (i + offset) % timestamps.size();
+                    if (fmt.format_timestamp(timestamps[idx]) != expected[idx]) {
+                        ++mismatches;
+                    }
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    EXPECT_EQ(mismatches.load(), 0);
 }
