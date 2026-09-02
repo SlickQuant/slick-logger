@@ -1,4 +1,4 @@
-# Unreleased
+# v1.2.1 - 09-01-2026
 - Clear the wake and flush state in `reset()`
   - `reset()` left `flush_request_`, `flush_done_`, `wake_token_` and `writer_parked_` at whatever the previous run had reached, so a reused `Logger` was not equivalent to a fresh one
   - Purely for clarity, not correctness: the counters are monotonic, the writer compares `flush_request_` against `flush_done_` for inequality rather than order so it resynchronises on its first iteration whatever they hold, and `wake_token_` is only ever compared for change. `reset()` calls `shutdown()` first, so the writer thread is joined before any of this is touched
