@@ -109,56 +109,65 @@ jobs:
             echo "CHANGELOG_CONTENT=CHANGELOG not found." >> $GITHUB_OUTPUT
           fi
 
-      # logger.hpp includes <slick/queue.h>, which in turn pulls in <slick/shm/...>,
-      # so an archive holding only our own header is not usable on its own. Both
-      # the repository and the tag are read out of CMakeLists.txt rather than
-      # repeated here, so the bundled headers can never drift from the version the
-      # build actually requires.
-      - name: Resolve the slick-queue version the build requires
-        id: queue
-        run: |
-          REPO=$(grep -oP 'GIT_REPOSITORY\s+\K\S+' CMakeLists.txt)
-          TAG=$(grep -oP 'GIT_TAG\s+\K\S+' CMakeLists.txt)
-          if [ -z "$REPO" ] || [ -z "$TAG" ]; then
-            echo "could not resolve slick-queue GIT_REPOSITORY/GIT_TAG from CMakeLists.txt" >&2
-            exit 1
-          fi
-          REPO=${REPO#https://github.com/}
-          REPO=${REPO%.git}
-          echo "REPO=$REPO" >> $GITHUB_OUTPUT
-          echo "TAG=$TAG" >> $GITHUB_OUTPUT
-          echo "bundling $REPO@$TAG"
+      # logger.hpp includes <slick/queue.h>, which pulls in <slick/shm/...> from
+      # slick-shm, a further dependency of slick-queue. Rather than hand-resolving
+      # that graph here, let CMake fetch it: whatever the build actually compiles
+      # against is what gets bundled, and a new transitive header would be picked
+      # up by the self-containment check below instead of silently going missing.
+      - name: Fetch the dependency headers the build resolves
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_SLICK_LOGGER_COLLECTOR=OFF
+          -DBUILD_SLICK_LOGGER_TESTING=OFF
+          -DBUILD_SLICK_LOGGER_EXAMPLES=OFF
 
-      - name: Check out slick-queue
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.queue.outputs.REPO }}
-          ref: ${{ steps.queue.outputs.TAG }}
-          path: .slick-queue
-
-      - name: Bundle the slick-queue headers
+      - name: Bundle the dependency headers
         run: |
           set -e
-          SRC=.slick-queue/include/slick
-          if [ ! -f "$SRC/queue.h" ] || [ ! -d "$SRC/shm" ]; then
-            echo "unexpected slick-queue layout; queue.h or shm/ not where expected:" >&2
-            find .slick-queue -name 'queue.h' -o -name 'shm' -type d >&2
+          # Copy every slick/* header the fetched dependencies provide, so this
+          # keeps working if the dependency graph grows another header or repo.
+          found=0
+          for dep_include in $(find build/_deps -type d -path '*-src/include' | sort); do
+            if [ -d "$dep_include/slick" ]; then
+              echo "bundling from $dep_include"
+              cp -r "$dep_include/slick/." include/slick/
+              found=1
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "no dependency headers found under build/_deps" >&2
+            find build/_deps -maxdepth 2 -type d >&2
             exit 1
           fi
-          cp "$SRC/queue.h" include/slick/
-          cp -r "$SRC/shm" include/slick/
-          cp .slick-queue/LICENSE ./LICENSE-slick-queue
-          # Fail here rather than publishing an archive that cannot compile.
-          test -f include/slick/queue.h
-          test -f include/slick/shm/shared_memory.hpp
-          test -f include/slick/shm/detail/platform.hpp
+          # Bundling source means shipping its licence too.
+          mkdir -p licenses
+          for dep_src in $(find build/_deps -maxdepth 1 -type d -name '*-src' | sort); do
+            name=$(basename "$dep_src" -src)
+            for lic in "$dep_src"/LICENSE*; do
+              [ -f "$lic" ] && cp "$lic" "licenses/LICENSE-$name" && break
+            done
+            [ -f "licenses/LICENSE-$name" ] || echo "WARNING: no LICENSE found for $name" >&2
+          done
           echo "bundled header tree:"
           find include -type f | sort
+          ls -1 licenses/
+
+      # The real guarantee: compile logger.hpp against the archive contents alone.
+      # If any header the dependency graph needs is missing, this fails here rather
+      # than in a user's build after the release is published.
+      - name: Verify the archive is self-contained
+        run: |
+          set -e
+          printf '#include <slick/logger.hpp>\nint main() { return 0; }\n' > selfcheck.cpp
+          g++ -std=c++20 -Iinclude -c selfcheck.cpp -o selfcheck.o
+          echo "logger.hpp compiles against the bundled headers alone"
+          rm -f selfcheck.cpp selfcheck.o
 
       - name: Create header archive
         run: |
-          zip -r ./slick-logger-${{ steps.get_version.outputs.VERSION }}.zip include/ LICENSE-slick-queue
-          tar -czf ./slick-logger-${{ steps.get_version.outputs.VERSION }}.tar.gz include/ LICENSE-slick-queue
+          zip -r ./slick-logger-${{ steps.get_version.outputs.VERSION }}.zip include/ licenses/
+          tar -czf ./slick-logger-${{ steps.get_version.outputs.VERSION }}.tar.gz include/ licenses/
 
       - name: Download collector binaries
         uses: actions/download-artifact@v4
@@ -180,10 +189,10 @@ jobs:
             The library is header-only: take `slick-logger-${{ steps.get_version.outputs.VERSION }}.zip`
             or `.tar.gz` and add `include/` to your include path. The archive is
             self-contained - alongside `slick/logger.hpp` it bundles the
-            `slick/queue.h` and `slick/shm/` headers from
-            [slick-queue](https://github.com/SlickQuant/slick-queue) that it includes,
-            so there is no separate dependency to install. `LICENSE-slick-queue`
-            covers those bundled files.
+            `slick/queue.h` and `slick/shm/` headers it includes, from
+            [slick-queue](https://github.com/SlickQuant/slick-queue) and
+            [slick-shm](https://github.com/SlickQuant/slick-shm), so there is no
+            separate dependency to install. Their licences are in `licenses/`.
 
             `slick-log-collector-*` contains the prebuilt standalone collector for
             [multi-process logging](https://github.com/SlickQuant/slick-logger#multi-process-logging-shared-memory).
