@@ -109,10 +109,56 @@ jobs:
             echo "CHANGELOG_CONTENT=CHANGELOG not found." >> $GITHUB_OUTPUT
           fi
 
+      # logger.hpp includes <slick/queue.h>, which in turn pulls in <slick/shm/...>,
+      # so an archive holding only our own header is not usable on its own. Both
+      # the repository and the tag are read out of CMakeLists.txt rather than
+      # repeated here, so the bundled headers can never drift from the version the
+      # build actually requires.
+      - name: Resolve the slick-queue version the build requires
+        id: queue
+        run: |
+          REPO=$(grep -oP 'GIT_REPOSITORY\s+\K\S+' CMakeLists.txt)
+          TAG=$(grep -oP 'GIT_TAG\s+\K\S+' CMakeLists.txt)
+          if [ -z "$REPO" ] || [ -z "$TAG" ]; then
+            echo "could not resolve slick-queue GIT_REPOSITORY/GIT_TAG from CMakeLists.txt" >&2
+            exit 1
+          fi
+          REPO=${REPO#https://github.com/}
+          REPO=${REPO%.git}
+          echo "REPO=$REPO" >> $GITHUB_OUTPUT
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "bundling $REPO@$TAG"
+
+      - name: Check out slick-queue
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.queue.outputs.REPO }}
+          ref: ${{ steps.queue.outputs.TAG }}
+          path: .slick-queue
+
+      - name: Bundle the slick-queue headers
+        run: |
+          set -e
+          SRC=.slick-queue/include/slick
+          if [ ! -f "$SRC/queue.h" ] || [ ! -d "$SRC/shm" ]; then
+            echo "unexpected slick-queue layout; queue.h or shm/ not where expected:" >&2
+            find .slick-queue -name 'queue.h' -o -name 'shm' -type d >&2
+            exit 1
+          fi
+          cp "$SRC/queue.h" include/slick/
+          cp -r "$SRC/shm" include/slick/
+          cp .slick-queue/LICENSE ./LICENSE-slick-queue
+          # Fail here rather than publishing an archive that cannot compile.
+          test -f include/slick/queue.h
+          test -f include/slick/shm/shared_memory.hpp
+          test -f include/slick/shm/detail/platform.hpp
+          echo "bundled header tree:"
+          find include -type f | sort
+
       - name: Create header archive
         run: |
-          zip -r ./slick-logger-${{ steps.get_version.outputs.VERSION }}.zip include/
-          tar -czf ./slick-logger-${{ steps.get_version.outputs.VERSION }}.tar.gz include/
+          zip -r ./slick-logger-${{ steps.get_version.outputs.VERSION }}.zip include/ LICENSE-slick-queue
+          tar -czf ./slick-logger-${{ steps.get_version.outputs.VERSION }}.tar.gz include/ LICENSE-slick-queue
 
       - name: Download collector binaries
         uses: actions/download-artifact@v4
@@ -132,7 +178,12 @@ jobs:
             ## Downloads
 
             The library is header-only: take `slick-logger-${{ steps.get_version.outputs.VERSION }}.zip`
-            or `.tar.gz` and add `include/` to your include path.
+            or `.tar.gz` and add `include/` to your include path. The archive is
+            self-contained - alongside `slick/logger.hpp` it bundles the
+            `slick/queue.h` and `slick/shm/` headers from
+            [slick-queue](https://github.com/SlickQuant/slick-queue) that it includes,
+            so there is no separate dependency to install. `LICENSE-slick-queue`
+            covers those bundled files.
 
             `slick-log-collector-*` contains the prebuilt standalone collector for
             [multi-process logging](https://github.com/SlickQuant/slick-logger#multi-process-logging-shared-memory).

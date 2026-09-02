@@ -1,4 +1,8 @@
 # v1.2.1 - 09-01-2026
+- Bundle the slick-queue headers in the release archive
+  - `slick/logger.hpp` includes `<slick/queue.h>`, which pulls in `<slick/shm/...>`, so the published archive held a header that could not compile on its own and every consumer had to go and fetch the dependency separately
+  - `slick-logger-<version>.zip`/`.tar.gz` now also carry `slick/queue.h` and the `slick/shm/` tree, plus `LICENSE-slick-queue` covering them
+  - The workflow reads `GIT_REPOSITORY` and `GIT_TAG` out of `CMakeLists.txt` rather than repeating the version, so the bundled headers cannot drift from the version the build requires, and it fails the release if the expected files are not where it looks for them
 - Clear the wake and flush state in `reset()`
   - `reset()` left `flush_request_`, `flush_done_`, `wake_token_` and `writer_parked_` at whatever the previous run had reached, so a reused `Logger` was not equivalent to a fresh one
   - Purely for clarity, not correctness: the counters are monotonic, the writer compares `flush_request_` against `flush_done_` for inequality rather than order so it resynchronises on its first iteration whatever they hold, and `wake_token_` is only ever compared for change. `reset()` calls `shutdown()` first, so the writer thread is joined before any of this is touched
