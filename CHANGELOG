@@ -1,3 +1,7 @@
+# Unreleased
+- Update slick-queue to v2.0.0
+  - disable slick::queue enable_read_last feature to improve performance.
+
 # v1.2.1 - 09-01-2026
 - Bundle the dependency headers in the release archive
   - `slick/logger.hpp` includes `<slick/queue.h>`, which pulls in `<slick/shm/...>`, so the published archive held a header that could not compile on its own and every consumer had to go and fetch the dependencies separately

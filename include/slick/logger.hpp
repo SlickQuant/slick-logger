@@ -49,7 +49,7 @@
 #include <string_view>
 #include <type_traits>
 #include <system_error>
-#include <slick/queue.h>
+#include <slick/queue.hpp>
 
 // For time functions on some platforms
 #ifdef _WIN32
@@ -187,6 +187,14 @@ inline const second_cache* cached_second(int64_t seconds) noexcept {
     }
     return &cache;
 }
+
+/// Traits of every ring the logger owns. read_last is dead weight for a log
+/// queue, so it stays off. Declared here rather than inside Logger so a test
+/// can name the exact traits when it attaches to a segment, without the type
+/// becoming supported public API.
+struct logger_queue_traits : public slick::queue_traits {
+    static constexpr bool enable_read_last = false;
+};
 
 } // namespace detail
 
@@ -1085,11 +1093,13 @@ private:
     /// multi-byte UTF-8 sequence.
     static size_t truncated_tag_length(std::string_view tag) noexcept;
 
+    using logger_queue_traits = detail::logger_queue_traits;
+
     /// Attach to an existing segment when one is there, otherwise create it.
     /// This is what makes producer and collector startup order irrelevant, and it
     /// lets a producer inherit the collector's sizing when the collector went first.
     template<typename T>
-    static std::unique_ptr<slick::SlickQueue<T>> open_shared_queue(const std::string& name, uint32_t size);
+    static std::unique_ptr<slick::queue<T, logger_queue_traits>> open_shared_queue(const std::string& name, uint32_t size);
 
     /// Turn an entry's ring indices back into addresses valid in this process.
     void rebase_entry(LogEntry& entry) const noexcept;
@@ -1106,8 +1116,8 @@ private:
     /// elsewhere, which is never retained.
     static void retain_shared_queue(void* queue) noexcept;
 
-    std::unique_ptr<slick::SlickQueue<LogEntry>> log_queue_;
-    std::unique_ptr<slick::SlickQueue<char>> string_queue_;
+    std::unique_ptr<slick::queue<LogEntry, logger_queue_traits>> log_queue_;
+    std::unique_ptr<slick::queue<char, logger_queue_traits>> string_queue_;
     std::vector<std::shared_ptr<ISink>> sinks_;
     std::filesystem::path log_file_;
     std::thread writer_thread_;
@@ -1925,8 +1935,8 @@ inline void Logger::init(const std::filesystem::path& log_file, size_t log_queue
     log_queue_size = round_up_to_power_of_2(log_queue_size);
     string_buffer_size = round_up_to_power_of_2(string_buffer_size);
 
-    log_queue_ = std::make_unique<slick::SlickQueue<LogEntry>>(static_cast<uint32_t>(log_queue_size));
-    string_queue_ = std::make_unique<slick::SlickQueue<char>>(static_cast<uint32_t>(string_buffer_size));
+    log_queue_ = std::make_unique<slick::queue<LogEntry, logger_queue_traits>>(static_cast<uint32_t>(log_queue_size));
+    string_queue_ = std::make_unique<slick::queue<char, logger_queue_traits>>(static_cast<uint32_t>(string_buffer_size));
     log_file_ = log_file;
     start();
 }
@@ -1987,8 +1997,8 @@ inline void Logger::init(const LogConfig& config) {
     size_t string_buffer_size = round_up_to_power_of_2(config.string_buffer_size);
 
     if (config.mode == QueueMode::Local) {
-        log_queue_ = std::make_unique<slick::SlickQueue<LogEntry>>(static_cast<uint32_t>(log_queue_size));
-        string_queue_ = std::make_unique<slick::SlickQueue<char>>(static_cast<uint32_t>(string_buffer_size));
+        log_queue_ = std::make_unique<slick::queue<LogEntry, logger_queue_traits>>(static_cast<uint32_t>(log_queue_size));
+        string_queue_ = std::make_unique<slick::queue<char, logger_queue_traits>>(static_cast<uint32_t>(string_buffer_size));
     }
     else {
         setup_shared_queues(config, static_cast<uint32_t>(log_queue_size),
@@ -2035,12 +2045,12 @@ inline size_t Logger::truncated_tag_length(std::string_view tag) noexcept {
 }
 
 template<typename T>
-inline std::unique_ptr<slick::SlickQueue<T>> Logger::open_shared_queue(const std::string& name, uint32_t size) {
+inline std::unique_ptr<slick::queue<T, Logger::logger_queue_traits>> Logger::open_shared_queue(const std::string& name, uint32_t size) {
     std::string attach_error;
     try {
         // Attach to a segment somebody else already created. Sizing then comes
         // from its header, so a producer automatically matches the collector.
-        return std::make_unique<slick::SlickQueue<T>>(name.c_str());
+        return std::make_unique<slick::queue<T, logger_queue_traits>>(name.c_str());
     }
     catch (const std::exception& e) {
         // Usually just "nothing there yet". Keep the reason: if creating fails too,
@@ -2053,7 +2063,7 @@ inline std::unique_ptr<slick::SlickQueue<T>> Logger::open_shared_queue(const std
     try {
         // Create it. Still create-or-attach, so a process that loses the race to
         // another creator simply attaches instead.
-        return std::make_unique<slick::SlickQueue<T>>(size, name.c_str());
+        return std::make_unique<slick::queue<T, logger_queue_traits>>(size, name.c_str());
     }
     catch (const std::exception& e) {
         throw std::runtime_error(std::string(e.what())
@@ -2145,8 +2155,8 @@ inline void Logger::init(size_t queue_size, size_t string_buffer_size) {
     queue_size = round_up_to_power_of_2(queue_size);
     string_buffer_size = round_up_to_power_of_2(string_buffer_size);
 
-    log_queue_ = std::make_unique<slick::SlickQueue<LogEntry>>(static_cast<uint32_t>(queue_size));
-    string_queue_ = std::make_unique<slick::SlickQueue<char>>(static_cast<uint32_t>(string_buffer_size));
+    log_queue_ = std::make_unique<slick::queue<LogEntry, logger_queue_traits>>(static_cast<uint32_t>(queue_size));
+    string_queue_ = std::make_unique<slick::queue<char, logger_queue_traits>>(static_cast<uint32_t>(string_buffer_size));
     start();
 }
 
@@ -2638,7 +2648,7 @@ inline void Logger::reset() {
 
 inline Logger::DrainResult Logger::drain_pending() {
     // read() takes a plain uint64_t& and advances it in place. The atomic must
-    // not be passed directly: SlickQueue also has a read(std::atomic<uint64_t>&)
+    // not be passed directly: queue also has a read(std::atomic<uint64_t>&)
     // overload for multiple consumers sharing one cursor, and binding that by
     // accident would change how slots are claimed. So the cursor is round-tripped
     // through a local and republished at exactly the point read() used to move it.

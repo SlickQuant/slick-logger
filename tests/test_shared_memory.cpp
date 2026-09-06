@@ -37,6 +37,7 @@ using slick::logger::LogConfig;
 using slick::logger::Logger;
 using slick::logger::LogLevel;
 using slick::logger::QueueMode;
+using slick::logger::Logger;
 
 namespace {
 
@@ -314,7 +315,7 @@ TEST_F(SharedMemoryTest, SkipsEntryStalledByADeadProducer) {
     {
         // Attach to the same segment and reserve a slot that is never published,
         // exactly what a producer crashing mid-write leaves behind.
-        slick::SlickQueue<slick::logger::LogEntry> raw(segment.c_str());
+        slick::queue<slick::logger::LogEntry, slick::logger::detail::logger_queue_traits> raw(segment.c_str());
         (void)raw.reserve();
 
         LOG_INFO("after the hole");
@@ -352,7 +353,7 @@ TEST_F(SharedMemoryTest, ShutdownDrainsEntriesBehindAStalledSlot) {
     {
         // Punch a hole, then publish behind it and shut down immediately, well
         // inside the timeout so the running loop cannot skip it first.
-        slick::SlickQueue<slick::logger::LogEntry> raw(segment.c_str());
+        slick::queue<slick::logger::LogEntry, slick::logger::detail::logger_queue_traits> raw(segment.c_str());
         (void)raw.reserve();
 
         LOG_INFO("queued behind the hole");

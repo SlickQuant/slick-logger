@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 1.5.0 or newer is required: multi-process logging relies on the slick-shm based
 # shared-memory implementation introduced in slick-queue 1.3.0.
-find_package(slick-queue 1.5.0 CONFIG QUIET)
+find_package(slick-queue 2.0.0 CONFIG QUIET)
 
 if (NOT slick-queue_FOUND)
     message(STATUS "Fetching slick-queue...")
@@ -20,7 +20,7 @@ if (NOT slick-queue_FOUND)
     FetchContent_Declare(
         slick-queue
         GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-        GIT_TAG v1.5.0
+        GIT_TAG v2.0.0
     )
     FetchContent_MakeAvailable(slick-queue)
 else()
