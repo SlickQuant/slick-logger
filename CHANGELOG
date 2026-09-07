@@ -1,4 +1,34 @@
 # Unreleased
+- Add `BinarySink` and binary payload logging
+  - `as_binary(ptr, size)` - or `as_binary(range)` over any contiguous range of trivially copyable elements - turns raw bytes into a log argument, carried through the queue as the new `ArgType::BLOB`. Packets, wire messages and serialized records now go through the same asynchronous path as text, instead of needing a second I/O path in the application
+  - `BinarySink` writes those payloads to a file byte for byte and adds nothing of its own - no header, no framing, no separators - so the file's format is entirely the caller's to define. Entries carrying no binary argument write nothing. `write_payload()` is virtual, so length-prefixing or an index is a short subclass rather than a fork
+  - Opened with `std::ios::binary`, which no path through `FileSink` could reach: both its constructors hardcode `std::ios::app`. Without it Windows expands a `0x0A` byte in a payload into CR LF and corrupts everything after it
+  - `Logger::add_binary_sink()` returns the sink, unlike the other `add_*_sink` overloads, because a binary sink is addressed at every call site. It is dedicated by default, since broadcast text entries would produce no output anyway
+  - Text sinks render payloads as hex, so one call can feed both a binary capture and a readable log: `{}` lowercase, `{:X}` uppercase, `{:.N}` capping how many bytes are shown. The cap defaults to 64 bytes - without it a 64KB payload reaching a console sink becomes a 128KB line - and the total byte count is appended when it bites
+  - Payloads reuse the string ring, so they inherit its 65534-byte reservation limit, now named `kMaxPayloadBytes` rather than repeated as a literal. Longer payloads are truncated; split them across calls
+  - `ArgType::BLOB` is appended at the end of the enum and stored in `LogArgument`'s existing `dynamic_str` member, so `LogEntry`'s layout is unchanged and a shared-memory producer built against an older header stays compatible
+  - File-stream plumbing moved from `FileSink` into a new `FileSinkBase` - the stream, its 64KB buffer, directory creation, `file_path()` and `flush()` - so `BinarySink` shares it rather than copying it. `FileSink`'s public API is unchanged. `file_path()` was declared but never defined, a link error for anyone who called it; it now has a definition
+- Add `LOG_SINK_<LEVEL>` macros for per-sink logging
+  - `LOG_SINK_TRACE/DEBUG/INFO/WARN/ERROR/FATAL(sink, ...)` check the sink's own minimum level and the global level *before* the arguments appear in the expansion, so a filtered-out call computes nothing. `sink->log_info(...)` cannot do this - the arguments are evaluated before the call is even made - so a sink set to `L_WARN` was paying full price for every `L_TRACE` call
+  - They also attach the call site, which the direct sink helpers never could
+  - `sink` may be an `ISink` reference, a raw pointer or a smart pointer, and is evaluated exactly once. An empty smart pointer is a no-op
+  - A sink not yet added to a logger has index -1, which downstream means "broadcast to every sink". `ISink::should_log()` rejects it, so a macro on an unregistered sink does nothing instead of writing everywhere
+  - `ISink::min_level_` is now `std::atomic<LogLevel>`: the macros read it from producer threads while `set_min_level()` may run on another. It was previously a plain member read only on the writer thread. Lock-free, since `LogLevel` is `uint8_t`-backed
+  - `ISink::log()` gained the same level check, so the direct helpers at least skip the queue slot and the string-ring copies for entries they would drop
+  - `log_with_static_location()` now delegates to a new sink-aware `log_to_sink_with_static_location()`, so the runtime source-location toggle has one implementation rather than two
+- Resolve `Logger::instance()` once per sink-targeted log call
+  - `LOG_SINK_*` loaded it twice - once inside `ISink::should_log()`, once to make the call - as did `ISink::log()`. Besides the redundant atomic load on every accepted call, a `set_instance()` landing between the two could test one logger and then log to another. Both now capture the logger and pass it to a `should_log(const Logger&, LogLevel)` overload, matching what `SLICK_LOGGER_LOG_IF_ENABLED` already did
+- Store binary payloads without a NUL terminator
+  - `store_string_in_queue()` reserved `length + 1` and terminated. A binary payload is never read as a string - `view_binary()` treats the stored length as authoritative, since embedded NULs are legitimate payload - so the terminator was a wasted byte and a wasted store per binary argument. Both paths now share `store_bytes_in_queue()`, which terminates only when asked
+  - slick-queue rejects a zero-size reservation, so an empty unterminated payload still claims one byte. That keeps the invariant readers rely on: a stored reference always resolves to a real ring slot
+- Build a binary argument's hex text directly into the output
+  - `format_log_message()` materialized the hex into a temporary string and then copied it into the result, once per text sink. `append_binary_arg()` writes straight into the caller's buffer instead. At the default 64-byte preview the saving is below run-to-run noise on the measured machine; it is kept because it removes an allocation and a copy that grow with the preview length
+- Detach sinks when a logger releases them
+  - `clear_sinks()` and `shutdown()` dropped their sinks without resetting `ISink::index_`. A caller holding a `shared_ptr` to a released sink kept an index into a slot the next `add_sink()` reuses, so that stale handle's entries were silently written by an unrelated sink
+  - Worse through `sink->log_*()`: a sink that is not attached to a logger has index -1, which `log_to_sink()` reads as "broadcast to every sink", so a stale or never-added handle wrote to all of them. `ISink::log()` now applies the same `should_log()` predicate as the `LOG_SINK_*` macros, which rejects a negative index
+  - Both release paths now go through one `release_sinks()` helper rather than each clearing the containers itself, so they cannot diverge on this again
+- Make `BinarySink::bytes_written()` safe to poll
+  - The counter is updated on the writer thread inside `write_payload()` and read through a public getter, so reading it while logging was in flight was a data race. It is now `std::atomic<size_t>`, relaxed throughout - it is a progress counter that orders nothing else
 - Update slick-queue to v2.0.0
   - disable slick::queue enable_read_last feature to improve performance.
 

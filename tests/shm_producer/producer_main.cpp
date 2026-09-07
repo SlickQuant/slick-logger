@@ -78,6 +78,12 @@ int main(int argc, char** argv) {
         // the whole "copy into the shared ring, resolve in the collector" path.
         LOG_INFO("producer message {} of {} from {}", i, count, dynamic_text);
     }
+
+    // A binary payload takes the same "copy into the shared ring" path, so this
+    // covers the collector rebasing an ArgType::BLOB offset in its own mapping.
+    const unsigned char payload[] = {0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0x0A};
+    LOG_INFO("producer payload {}", slick::logger::as_binary(payload, sizeof(payload)));
+
     LOG_WARN("producer done");
 
     if (linger_ms > 0) {

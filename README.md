@@ -18,8 +18,9 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 - **Colored Console Output**: ANSI color support with configurable error routing
 - **Source Locations by Default**: `LOG_*` macros include the call-site file and line, with runtime controls for basename vs full path
 - **Runtime Configuration**: Configure sinks, queue sizes, log level, source-location output, and timestamp formats
-- **Macro Fast Path**: Disabled log levels skip argument evaluation before queueing
+- **Macro Fast Path**: Disabled log levels skip argument evaluation before queueing, globally and per sink
 - **Direct Sink Logging**: Route messages to a named sink or a sink reference when a message should not be broadcast
+- **Binary Payloads**: Log raw bytes and write them to a file verbatim with `BinarySink`, encoding entirely under your control
 - **Shared-Library Redirection**: Route plugin or strategy-library logs into a host application's logger
 - **Multi-Process Logging**: Several processes can log into one shared-memory queue drained by a single collector process
 - **Header-Only**: No linking required - just include and use
@@ -191,6 +192,19 @@ auto current_level = Logger::instance().get_level();
 
 The available levels are `L_TRACE`, `L_DEBUG`, `L_INFO`, `L_WARN`, `L_ERROR`, `L_FATAL`, and `L_OFF`. A log call supports up to `SLICK_LOGGER_MAX_ARGS` format arguments; define that macro before including `slick/logger.hpp` if you need a different limit.
 
+To target a single sink, use the `LOG_SINK_*` macros, which apply the same fast path against **both** the global level and that sink's own minimum level:
+
+```cpp
+LOG_SINK_TRACE(sink, "order book depth={}", depth);
+LOG_SINK_DEBUG(sink, "request id={}", request_id);
+LOG_SINK_INFO(sink, "connected to {}", endpoint);
+LOG_SINK_WARN(sink, "retrying after {} ms", delay_ms);
+LOG_SINK_ERROR(sink, "request failed: {}", reason);
+LOG_SINK_FATAL(sink, "unrecoverable error: {}", reason);
+```
+
+`sink` may be an `ISink` reference, a raw pointer, or a smart pointer, and is evaluated exactly once. An empty smart pointer, or a sink that has not been added to a logger, makes the call a no-op. See [Logging to Specific Sinks](#logging-to-specific-sinks).
+
 ### Source Location Logging
 
 Source-location logging is enabled by default for `LOG_*` macros. The output always uses only the basename (e.g. `main.cpp:8`):
@@ -255,7 +269,7 @@ slick::logger::Logger::instance().log_with_location(
     "bridged message"); // logged as [bridge.cpp:42]
 ```
 
-Direct sink helpers such as `sink->log_info(...)` route to that sink only and do not automatically attach the caller's source location. Use `LOG_*` macros when you want automatic call-site capture.
+Direct sink helpers such as `sink->log_info(...)` route to that sink only and do not automatically attach the caller's source location. Use `LOG_*` macros when you want automatic call-site capture, or `LOG_SINK_*` when you want it *and* a specific sink.
 
 ### String Formatting with std::format
 
@@ -415,6 +429,19 @@ int main() {
 - Messages are filtered twice: first by global logger level, then by sink-specific level
 - Use `sink->set_min_level(LogLevel::L_WARN)` to control what each sink accepts
 - This allows different sinks to have different verbosity levels
+- Raising a sink's `min_level` also drops entries that are already queued but not yet written, because the level is re-checked when the writer thread dispatches. Call `Logger::instance().flush()` first if those entries must survive.
+
+**Prefer the `LOG_SINK_*` macros over `sink->log_*(...)`.** The direct helpers must evaluate their arguments before the call can decide to drop the message; the macros check the sink's level first, so nothing is computed for a filtered-out call. They also attach the call site, which the direct helpers cannot:
+
+```cpp
+auto audit = Logger::instance().get_sink("audit");
+audit->set_min_level(LogLevel::L_WARN);
+
+LOG_SINK_INFO(audit, "{}", build_expensive_report());  // never evaluated
+LOG_SINK_ERROR(audit, "failed with {}", code);         // written, with file:line
+
+audit->log_info("{}", build_expensive_report());       // evaluated, then dropped
+```
 
 ### Dedicated Sinks
 
@@ -808,6 +835,93 @@ Date-based log rotation:
 - **Automatic**: Switches files at midnight
 - **Retention**: Configurable cleanup of old files
 
+### BinarySink
+Raw byte capture — see [Binary Logging](#binary-logging):
+- **Verbatim**: Writes binary payloads byte for byte, adding nothing of its own
+- **Your Encoding**: No header, no framing, no separators; the file's format is whatever you wrote into it
+- **Binary Mode**: Opened with `std::ios::binary`, so `0x0A` bytes survive on Windows
+- **Extensible**: Override `write_payload()` to add framing
+- **Dedicated by Default**: Only receives entries addressed to it
+
+## Binary Logging
+
+`BinarySink` writes raw bytes to a file exactly as given, so an application can capture packets, wire messages, or serialized records through the same asynchronous queue as its text logs — without a second I/O path and without formatting on the writer thread.
+
+Wrap bytes in `as_binary()` and log them like any other argument:
+
+```cpp
+#include <slick/logger.hpp>
+
+using namespace slick::logger;
+
+#pragma pack(push, 1)
+struct Trade {
+    uint64_t timestamp_ns;
+    uint32_t quantity;
+    double   price;
+    char     symbol[8];
+};
+#pragma pack(pop)
+
+int main() {
+    auto& logger = Logger::instance();
+    auto capture = logger.add_binary_sink("trades.bin", "capture");
+    logger.init(1 << 16);
+
+    Trade trade{1'725'000'000'000'000'000ULL, 100, 431.25, {'A','A','P','L'}};
+
+    // A POD, by address and size
+    LOG_SINK_INFO(capture, "{}", as_binary(&trade, sizeof(trade)));
+
+    // Or any contiguous range: vector, array, span
+    std::vector<uint8_t> frame{0xFE, 0xED, 0x00, 0x0A};
+    LOG_SINK_INFO(capture, "{}", as_binary(frame));
+
+    logger.shutdown();   // trades.bin is exactly 28 + 4 bytes
+}
+```
+
+`add_binary_sink()` returns the sink so it can go straight into `LOG_SINK_*`.
+
+**What lands in the file.** Only the binary payloads. Timestamp, level, format string and non-binary arguments are all ignored — the file is exactly the concatenation of what you encoded. Entries with no binary argument write nothing. This means the file has **no framing of its own**: if you need to walk it back record by record, encode that yourself, or override `write_payload()`:
+
+```cpp
+class LengthPrefixedBinarySink : public BinarySink {
+public:
+    using BinarySink::BinarySink;
+protected:
+    void write_payload(const std::byte* data, size_t size) override {
+        const auto length = static_cast<uint16_t>(size);
+        BinarySink::write_payload(reinterpret_cast<const std::byte*>(&length), sizeof(length));
+        BinarySink::write_payload(data, size);
+    }
+};
+```
+
+**Text sinks render payloads as hex**, so the same call can feed a binary capture and a readable log. `{}` gives lowercase hex, `{:X}` uppercase, and `{:.N}` renders at most N bytes; the default cap is 64 bytes, after which the total byte count is appended (`0a1bff...(100 bytes)`).
+
+**Payloads larger than 64KB.** A single payload is capped at `slick::logger::kMaxPayloadBytes` (65534) and truncated beyond it, because slick-queue packs its reservation size into 16 bits. To log more, pass the buffer as several arguments of **one** log call:
+
+```cpp
+constexpr auto kCap = kMaxPayloadBytes;
+LOG_SINK_INFO(capture, "{}{}{}",
+              as_binary(p,            kCap),
+              as_binary(p + kCap,     kCap),
+              as_binary(p + 2 * kCap, size - 2 * kCap));
+```
+
+`BinarySink` writes an entry's payloads back to back with nothing between them, so the file is byte-identical to the unsplit buffer.
+
+Do **not** spread the chunks over separate log calls. The queue is multi-producer, so another thread's entry can land between them and interleave the two payloads in the file. One entry is the unit of atomicity, which caps a single payload at `SLICK_LOGGER_MAX_ARGS * kMaxPayloadBytes` (~1.28 MB by default; raise `SLICK_LOGGER_MAX_ARGS` for more).
+
+**Notes:**
+- The bytes are copied into the string ring while the log call runs, so the source buffer only has to outlive that call.
+- `as_binary()` over a range copies the element bytes as-is, padding included.
+- Binary payloads cross process boundaries like any other argument, so a shared-memory collector can own the `BinarySink`.
+- A `BinarySink` is dedicated by default, so broadcast `LOG_*` entries do not reach it. Call `set_dedicated(false)` to change that.
+
+Runnable example: [`examples/binary_sink_example.cpp`](examples/binary_sink_example.cpp).
+
 ## Rotation Configuration
 
 ```cpp
@@ -836,7 +950,8 @@ The logger uses a **multi-producer, single-consumer** ring buffer (slick-queue) 
 [Thread 2] ──┼──► [Lock-Free Queue] ──► [Writer Thread] ──┬──► ConsoleSink
 [Thread N] ──┘                                            ├──► FileSink  
                                                           ├──► RotatingFileSink
-                                                          └──► DailyFileSink
+                                                          ├──► DailyFileSink
+                                                          └──► BinarySink
 ```
 
 The same structure spans processes when the queue is placed in shared memory — the producers
@@ -924,6 +1039,8 @@ public:
 Logger::instance().add_sink(std::make_shared<JsonSink>("app.json"));
 ```
 
+A sink that writes to a file can inherit `FileSinkBase` instead, which supplies the stream, its buffer, directory creation, and `flush()`. That is what `FileSink` and `BinarySink` are built on.
+
 ## Examples
 
 The repository includes comprehensive examples:
@@ -932,6 +1049,7 @@ The repository includes comprehensive examples:
 - **`multi_sink_example.exe`**: Demonstrates all sink types, rotation, and custom sinks
 - **`timestamp_example.exe`**: Demonstrates predefined and custom timestamp formats
 - **`multi_process_example.exe`**: Collector and producer roles logging across process boundaries
+- **`binary_sink_example.exe`**: Raw binary capture, custom framing, and the `LOG_SINK_*` fast path
 
 ## Building Examples/Tests  
 
@@ -948,6 +1066,7 @@ cmake --build . --config Debug
 ./examples/Debug/logger_example.exe
 ./examples/Debug/multi_sink_example.exe
 ./examples/Debug/timestamp_example.exe
+./examples/Debug/binary_sink_example.exe
 
 # Multi-process example: run the collector in one terminal and producers in others
 ./examples/Debug/multi_process_example.exe --collector --name demo_log

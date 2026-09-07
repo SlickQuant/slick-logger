@@ -200,6 +200,9 @@ TEST_F(SharedMemoryTest, CollectsEntriesFromAnotherProcess) {
     EXPECT_EQ(count_lines_containing(lines, "producer message"), static_cast<size_t>(kMessageCount));
     EXPECT_EQ(count_lines_containing(lines, "dynamic-prod"), static_cast<size_t>(kMessageCount));
 
+    // The binary payload survived the ring-offset round trip into this process.
+    EXPECT_EQ(count_lines_containing(lines, "producer payload 00deadbeef0a"), 1u);
+
     // The producer's pid and tag are recorded, and they are not this process's.
     const std::string own_stamp = "[" + std::to_string(SLICK_TEST_GETPID()) + ":collector]";
     size_t producer_lines = 0;

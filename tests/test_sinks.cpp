@@ -28,7 +28,11 @@ protected:
             "daily_size_test.log", "args_sink.log", "dedicated_sink.log", "filtered_sink.log",
             "location_sink1.log", "location_sink2.log",
             "named_sink1.log", "named_sink2.log", "regular_sink.log", "daily_no_size_rotation.log",
-            "daily_multi_rotation.log", "daily_restart_test.log", "daily_restart_existing.log"
+            "daily_multi_rotation.log", "daily_restart_test.log", "daily_restart_existing.log",
+            "binary_basic.bin", "binary_multi.bin", "binary_empty.bin", "binary_newline.bin",
+            "binary_truncate.bin", "binary_framed.bin", "binary_dedicated.bin",
+            "binary_chunked.bin",
+            "binary_hex.log", "binary_broadcast.log"
         };
 
         for (const auto& file : files) {
@@ -957,6 +961,239 @@ TEST_F(SinkTest, FileSinkWithoutDirectoryComponentStillWorks) {
     slick::logger::Logger::instance().reset();
 
     ASSERT_TRUE(std::filesystem::exists("regular_sink.log"));
+}
+
+// ---------------------------------------------------------------------------
+// BinarySink
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A POD of the kind a binary sink exists to capture.
+#pragma pack(push, 1)
+struct MarketTick {
+    uint32_t id;
+    double price;
+    char symbol[8];
+};
+#pragma pack(pop)
+
+// Reads a whole binary file into a byte vector.
+std::vector<unsigned char> read_bytes(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::vector<unsigned char>((std::istreambuf_iterator<char>(file)),
+                                      std::istreambuf_iterator<char>());
+}
+
+// "ab" repeated `count` times - the hex rendering of `count` 0xAB bytes.
+std::string hex_ab(size_t count) {
+    std::string s;
+    for (size_t i = 0; i < count; ++i) {
+        s += "ab";
+    }
+    return s;
+}
+
+} // namespace
+
+TEST_F(SinkTest, BinarySinkWritesRawPayload) {
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = slick::logger::Logger::instance().add_binary_sink("binary_basic.bin", "binary");
+    slick::logger::Logger::instance().init(1024);
+
+    MarketTick tick{42, 431.25, {'A', 'A', 'P', 'L', 0, 0, 0, 0}};
+    LOG_SINK_INFO(sink, "{}", slick::logger::as_binary(&tick, sizeof(tick)));
+
+    slick::logger::Logger::instance().reset();
+
+    auto bytes = read_bytes("binary_basic.bin");
+    ASSERT_EQ(bytes.size(), sizeof(MarketTick));
+    EXPECT_EQ(std::memcmp(bytes.data(), &tick, sizeof(tick)), 0);
+}
+
+TEST_F(SinkTest, BinarySinkWritesMultipleBlobsInOrder) {
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = slick::logger::Logger::instance().add_binary_sink("binary_multi.bin");
+    slick::logger::Logger::instance().init(1024);
+
+    const std::vector<unsigned char> first{0x01, 0x02, 0x03};
+    const std::vector<unsigned char> second{0x04, 0x05};
+
+    // Two payloads in one entry, then one in a second entry.
+    LOG_SINK_INFO(sink, "{} {}", slick::logger::as_binary(first), slick::logger::as_binary(second));
+    LOG_SINK_INFO(sink, "{}", slick::logger::as_binary(std::vector<unsigned char>{0x06}));
+
+    slick::logger::Logger::instance().reset();
+
+    const std::vector<unsigned char> expected{0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+    EXPECT_EQ(read_bytes("binary_multi.bin"), expected);
+    EXPECT_EQ(sink->bytes_written(), expected.size());
+}
+
+TEST_F(SinkTest, BinarySinkIgnoresEntriesWithoutBlob) {
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = slick::logger::Logger::instance().add_binary_sink("binary_empty.bin");
+    slick::logger::Logger::instance().init(1024);
+
+    LOG_SINK_INFO(sink, "text only, no payload {}", 123);
+
+    slick::logger::Logger::instance().reset();
+
+    EXPECT_TRUE(read_bytes("binary_empty.bin").empty());
+    EXPECT_EQ(sink->bytes_written(), 0u);
+}
+
+TEST_F(SinkTest, BinarySinkHandlesEmptyPayload) {
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = slick::logger::Logger::instance().add_binary_sink("binary_empty.bin");
+    slick::logger::Logger::instance().init(1024);
+
+    LOG_SINK_INFO(sink, "{}", slick::logger::as_binary(nullptr, 0));
+    LOG_SINK_INFO(sink, "{}", slick::logger::as_binary(std::vector<unsigned char>{}));
+
+    slick::logger::Logger::instance().reset();
+
+    EXPECT_TRUE(read_bytes("binary_empty.bin").empty());
+}
+
+TEST_F(SinkTest, BinarySinkPreservesNewlineBytes) {
+    // Regression guard for text-mode opening: on Windows a 0x0A byte written to a
+    // stream opened without std::ios::binary becomes 0x0D 0x0A.
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = slick::logger::Logger::instance().add_binary_sink("binary_newline.bin");
+    slick::logger::Logger::instance().init(1024);
+
+    const std::vector<unsigned char> payload{0x00, 0x0A, 0x0D, 0x0A, 0x1A, 0xFF, 0x00};
+    LOG_SINK_INFO(sink, "{}", slick::logger::as_binary(payload));
+
+    slick::logger::Logger::instance().reset();
+
+    EXPECT_EQ(read_bytes("binary_newline.bin"), payload);
+}
+
+TEST_F(SinkTest, BinaryPayloadTruncatedAtMaxPayloadBytes) {
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = slick::logger::Logger::instance().add_binary_sink("binary_truncate.bin");
+    slick::logger::Logger::instance().init(1024, 1 << 20);
+
+    const std::vector<unsigned char> payload(slick::logger::kMaxPayloadBytes + 16, 0xAB);
+    LOG_SINK_INFO(sink, "{}", slick::logger::as_binary(payload));
+
+    slick::logger::Logger::instance().reset();
+
+    auto bytes = read_bytes("binary_truncate.bin");
+    ASSERT_EQ(bytes.size(), slick::logger::kMaxPayloadBytes);
+    EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](unsigned char b) { return b == 0xAB; }));
+}
+
+TEST_F(SinkTest, LargePayloadSplitAcrossArgsOfOneEntryIsContiguous) {
+    // The documented way to log more than kMaxPayloadBytes: several chunks as
+    // several arguments of ONE entry. The sink writes an entry's payloads back to
+    // back, so the file must come out byte-identical to the unsplit buffer.
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = slick::logger::Logger::instance().add_binary_sink("binary_chunked.bin");
+    slick::logger::Logger::instance().init(1024, 1 << 22);
+
+    constexpr uint32_t kCap = slick::logger::kMaxPayloadBytes;
+    constexpr size_t kTotal = 2 * kCap + 1000;
+    std::vector<unsigned char> big(kTotal);
+    for (size_t i = 0; i < kTotal; ++i) {
+        big[i] = static_cast<unsigned char>(i * 7 + (i >> 8));
+    }
+
+    const auto* p = big.data();
+    LOG_SINK_INFO(sink, "{}{}{}",
+                  slick::logger::as_binary(p, kCap),
+                  slick::logger::as_binary(p + kCap, kCap),
+                  slick::logger::as_binary(p + 2 * kCap, kTotal - 2 * kCap));
+
+    slick::logger::Logger::instance().reset();
+
+    EXPECT_EQ(read_bytes("binary_chunked.bin"), big);
+}
+
+TEST_F(SinkTest, BinarySinkIsDedicatedByDefault) {
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = slick::logger::Logger::instance().add_binary_sink("binary_dedicated.bin");
+    slick::logger::Logger::instance().add_file_sink("binary_broadcast.log");
+    slick::logger::Logger::instance().init(1024);
+
+    EXPECT_TRUE(sink->is_dedicated());
+
+    const std::vector<unsigned char> payload{0x11, 0x22};
+    LOG_INFO("Broadcast entry {}", slick::logger::as_binary(payload));
+
+    slick::logger::Logger::instance().reset();
+
+    // Dedicated: the broadcast never reached the binary sink.
+    EXPECT_TRUE(read_bytes("binary_dedicated.bin").empty());
+
+    std::ifstream text("binary_broadcast.log");
+    std::string content((std::istreambuf_iterator<char>(text)), std::istreambuf_iterator<char>());
+    EXPECT_NE(content.find("Broadcast entry 1122"), std::string::npos);
+}
+
+TEST_F(SinkTest, BinarySinkSubclassCanFramePayloads) {
+    // write_payload is the extension point for framing.
+    class LengthPrefixedSink : public slick::logger::BinarySink {
+    public:
+        using BinarySink::BinarySink;
+    protected:
+        void write_payload(const std::byte* data, size_t size) override {
+            const auto length = static_cast<uint16_t>(size);
+            BinarySink::write_payload(reinterpret_cast<const std::byte*>(&length), sizeof(length));
+            BinarySink::write_payload(data, size);
+        }
+    };
+
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = std::make_shared<LengthPrefixedSink>("binary_framed.bin", "framed");
+    slick::logger::Logger::instance().add_sink(sink);
+    slick::logger::Logger::instance().init(1024);
+
+    const std::vector<unsigned char> payload{0xDE, 0xAD, 0xBE, 0xEF};
+    LOG_SINK_INFO(sink, "{}", slick::logger::as_binary(payload));
+
+    slick::logger::Logger::instance().reset();
+
+    const std::vector<unsigned char> expected{0x04, 0x00, 0xDE, 0xAD, 0xBE, 0xEF};
+    EXPECT_EQ(read_bytes("binary_framed.bin"), expected);
+}
+
+TEST_F(SinkTest, TextSinkRendersBinaryAsHex) {
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("binary_hex.log");
+    slick::logger::Logger::instance().init(1024);
+
+    const std::vector<unsigned char> payload{0x0A, 0x1B, 0xFF};
+    LOG_INFO("lower={} upper={:X}", slick::logger::as_binary(payload),
+             slick::logger::as_binary(payload));
+
+    slick::logger::Logger::instance().reset();
+
+    std::ifstream file("binary_hex.log");
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    EXPECT_NE(content.find("lower=0a1bff"), std::string::npos);
+    EXPECT_NE(content.find("upper=0A1BFF"), std::string::npos);
+}
+
+TEST_F(SinkTest, TextSinkTruncatesLongBinaryPreview) {
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("binary_hex.log");
+    slick::logger::Logger::instance().init(1024);
+
+    const std::vector<unsigned char> payload(100, 0xAB);
+    LOG_INFO("default={}", slick::logger::as_binary(payload));   // 64-byte cap
+    LOG_INFO("capped={:.2}", slick::logger::as_binary(payload)); // explicit 2-byte cap
+
+    slick::logger::Logger::instance().reset();
+
+    std::ifstream file("binary_hex.log");
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+    // Default cap: 64 of the 100 bytes rendered, then the total byte count.
+    EXPECT_NE(content.find("default=" + hex_ab(64) + "...(100 bytes)"), std::string::npos);
+    EXPECT_NE(content.find("capped=" + hex_ab(2) + "...(100 bytes)"), std::string::npos);
 }
 
 int main(int argc, char **argv) {

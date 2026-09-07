@@ -39,6 +39,8 @@ protected:
         std::filesystem::remove("test_source_location_config.log");
         std::filesystem::remove("test_set_instance_host.log");
         std::filesystem::remove("test_set_instance_plugin.log");
+        std::filesystem::remove("test_sink_macro.log");
+        std::filesystem::remove("test_sink_orphan.log");
     }
 };
 
@@ -1167,6 +1169,234 @@ TEST_F(SlickLoggerTest, RepeatedAndConcurrentFlushesAllComplete) {
 
     logger.shutdown();
     std::filesystem::remove("test_flush_repeat.log");
+}
+
+// ---------------------------------------------------------------------------
+// LOG_SINK_* macros
+// ---------------------------------------------------------------------------
+
+TEST_F(SlickLoggerTest, SinkMacrosDoNotEvaluateArgumentsWhenSinkLevelDisabled) {
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "macro_sink");
+    slick::logger::Logger::instance().init(1024);
+
+    auto sink = slick::logger::Logger::instance().get_sink("macro_sink");
+    ASSERT_TRUE(sink != nullptr);
+    sink->set_min_level(slick::logger::LogLevel::L_WARN);
+
+    int evaluation_count = 0;
+    auto expensive = [&]() -> std::string {
+        ++evaluation_count;
+        return "payload";
+    };
+
+    LOG_SINK_TRACE(sink, "trace {}", expensive());
+    LOG_SINK_DEBUG(sink, "debug {}", expensive());
+    LOG_SINK_INFO(sink, "info {}", expensive());
+    LOG_SINK_WARN(sink, "warn {}", expensive());
+
+    slick::logger::Logger::instance().shutdown();
+
+    EXPECT_EQ(evaluation_count, 1);
+
+    std::ifstream log_file("test_sink_macro.log");
+    std::string content((std::istreambuf_iterator<char>(log_file)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_NE(content.find("warn payload"), std::string::npos);
+    EXPECT_EQ(content.find("info payload"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, SinkMacrosDoNotEvaluateArgumentsWhenGlobalLevelDisabled) {
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "macro_sink");
+    slick::logger::Logger::instance().init(1024);
+    slick::logger::Logger::instance().set_level(slick::logger::LogLevel::L_ERROR);
+
+    auto sink = slick::logger::Logger::instance().get_sink("macro_sink");
+    ASSERT_TRUE(sink != nullptr);
+    // The sink itself accepts everything; only the global level filters here.
+    sink->set_min_level(slick::logger::LogLevel::L_TRACE);
+
+    int evaluation_count = 0;
+    auto expensive = [&]() -> std::string {
+        ++evaluation_count;
+        return "payload";
+    };
+
+    LOG_SINK_INFO(sink, "info {}", expensive());
+    LOG_SINK_WARN(sink, "warn {}", expensive());
+    LOG_SINK_ERROR(sink, "error {}", expensive());
+
+    slick::logger::Logger::instance().shutdown();
+
+    EXPECT_EQ(evaluation_count, 1);
+}
+
+TEST_F(SlickLoggerTest, SinkMacrosCaptureCallSiteSourceLocation) {
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "macro_sink");
+    slick::logger::Logger::instance().init(1024);
+
+    auto sink = slick::logger::Logger::instance().get_sink("macro_sink");
+    ASSERT_TRUE(sink != nullptr);
+
+    const int expected_line = __LINE__ + 1;
+    LOG_SINK_INFO(sink, "Sink macro source location");
+
+    slick::logger::Logger::instance().shutdown();
+
+    std::ifstream log_file("test_sink_macro.log");
+    std::string content((std::istreambuf_iterator<char>(log_file)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_NE(content.find("test_logger.cpp:" + std::to_string(expected_line)), std::string::npos);
+    EXPECT_NE(content.find("Sink macro source location"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, SinkMacrosAcceptRefPointerAndSharedPtr) {
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "macro_sink");
+    slick::logger::Logger::instance().init(1024);
+
+    auto shared = slick::logger::Logger::instance().get_sink("macro_sink");
+    ASSERT_TRUE(shared != nullptr);
+    slick::logger::ISink* raw = shared.get();
+    slick::logger::ISink& ref = *shared;
+
+    LOG_SINK_INFO(shared, "via shared_ptr");
+    LOG_SINK_INFO(raw, "via raw pointer");
+    LOG_SINK_INFO(ref, "via reference");
+
+    // An empty smart pointer must be a no-op, not a crash.
+    std::shared_ptr<slick::logger::ISink> empty;
+    LOG_SINK_INFO(empty, "must not be logged");
+
+    slick::logger::Logger::instance().shutdown();
+
+    std::ifstream log_file("test_sink_macro.log");
+    std::string content((std::istreambuf_iterator<char>(log_file)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_NE(content.find("via shared_ptr"), std::string::npos);
+    EXPECT_NE(content.find("via raw pointer"), std::string::npos);
+    EXPECT_NE(content.find("via reference"), std::string::npos);
+    EXPECT_EQ(content.find("must not be logged"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, SinkMacrosEvaluateSinkExpressionOnce) {
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "macro_sink");
+    slick::logger::Logger::instance().init(1024);
+
+    auto shared = slick::logger::Logger::instance().get_sink("macro_sink");
+    ASSERT_TRUE(shared != nullptr);
+
+    int lookups = 0;
+    auto fetch = [&]() -> std::shared_ptr<slick::logger::ISink> {
+        ++lookups;
+        return shared;
+    };
+
+    LOG_SINK_INFO(fetch(), "single evaluation");
+
+    slick::logger::Logger::instance().shutdown();
+
+    EXPECT_EQ(lookups, 1);
+}
+
+TEST_F(SlickLoggerTest, SinkMacroOnUnregisteredSinkDoesNotBroadcast) {
+    // An unregistered sink has index -1, which downstream means "every sink".
+    // should_log() must reject it rather than let it broadcast.
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "macro_sink");
+    slick::logger::Logger::instance().init(1024);
+
+    auto orphan = std::make_shared<slick::logger::FileSink>("test_sink_orphan.log");
+    ASSERT_EQ(orphan->index(), -1);
+
+    LOG_SINK_ERROR(orphan, "must not broadcast");
+    orphan->log_error("must not broadcast");  // the direct helper must refuse too
+
+    slick::logger::Logger::instance().shutdown();
+
+    std::ifstream log_file("test_sink_macro.log");
+    std::string content((std::istreambuf_iterator<char>(log_file)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_EQ(content.find("must not broadcast"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, ClearSinksDetachesHandlesFromReusedSlots) {
+    // A handle kept across clear_sinks() must not address the slot a later
+    // add_sink() reuses - both sinks would otherwise sit at index 0.
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_orphan.log", "old");
+
+    auto stale = slick::logger::Logger::instance().get_sink("old");
+    ASSERT_TRUE(stale != nullptr);
+    ASSERT_EQ(stale->index(), 0);
+
+    slick::logger::Logger::instance().clear_sinks();
+    EXPECT_EQ(stale->index(), -1);
+
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "replacement");
+    slick::logger::Logger::instance().init(1024);
+
+    LOG_SINK_ERROR(stale, "must not reach the replacement");
+    stale->log_error("must not reach the replacement either");
+
+    slick::logger::Logger::instance().shutdown();
+
+    std::ifstream log_file("test_sink_macro.log");
+    std::string content((std::istreambuf_iterator<char>(log_file)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_EQ(content.find("must not reach the replacement"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, ShutdownDetachesHandlesFromReusedSlots) {
+    // Same hazard through shutdown(), which clears sinks by default.
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_orphan.log", "old");
+    slick::logger::Logger::instance().init(1024);
+
+    auto stale = slick::logger::Logger::instance().get_sink("old");
+    ASSERT_TRUE(stale != nullptr);
+    ASSERT_EQ(stale->index(), 0);
+
+    slick::logger::Logger::instance().shutdown();
+    EXPECT_EQ(stale->index(), -1);
+
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "replacement");
+    slick::logger::Logger::instance().init(1024);
+
+    LOG_SINK_ERROR(stale, "must not reach the replacement");
+
+    slick::logger::Logger::instance().shutdown();
+
+    std::ifstream log_file("test_sink_macro.log");
+    std::string content((std::istreambuf_iterator<char>(log_file)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_EQ(content.find("must not reach the replacement"), std::string::npos);
+}
+
+TEST_F(SlickLoggerTest, DirectSinkLogRespectsSinkMinLevel) {
+    // sink->log_*() cannot skip evaluating its arguments, but it must still skip
+    // the enqueue when the entry is below the sink's own level.
+    slick::logger::Logger::instance().clear_sinks();
+    slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "macro_sink");
+    slick::logger::Logger::instance().init(1024);
+
+    auto sink = slick::logger::Logger::instance().get_sink("macro_sink");
+    ASSERT_TRUE(sink != nullptr);
+    sink->set_min_level(slick::logger::LogLevel::L_ERROR);
+
+    sink->log_info("below threshold");
+    sink->log_error("above threshold");
+
+    slick::logger::Logger::instance().shutdown();
+
+    std::ifstream log_file("test_sink_macro.log");
+    std::string content((std::istreambuf_iterator<char>(log_file)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_EQ(content.find("below threshold"), std::string::npos);
+    EXPECT_NE(content.find("above threshold"), std::string::npos);
 }
 
 int main(int argc, char **argv) {

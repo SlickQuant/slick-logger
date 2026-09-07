@@ -14,6 +14,9 @@ if(BUILD_SLICK_LOGGER_EXAMPLES)
     add_executable(multi_process_example multi_process_example.cpp)
     target_link_libraries(multi_process_example slick::logger)
 
+    add_executable(binary_sink_example binary_sink_example.cpp)
+    target_link_libraries(binary_sink_example slick::logger)
+
     message(STATUS "Building slick-logger examples")
 else()
     message(STATUS "Skipping slick-logger examples")

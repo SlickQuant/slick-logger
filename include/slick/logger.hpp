@@ -30,6 +30,7 @@
 
 #include <string>
 #include <cstring>
+#include <cstddef>
 #include <cstdint>
 #include <algorithm>
 #include <thread>
@@ -46,6 +47,8 @@
 #include <format>
 #include <utility>
 #include <vector>
+#include <span>
+#include <ranges>
 #include <string_view>
 #include <type_traits>
 #include <system_error>
@@ -339,8 +342,75 @@ enum class ArgType : uint8_t {
     DOUBLE,
     PTR,             // pointer types
     STRING_LITERAL,  // const char* - safe to store pointer
-    STRING_DYNAMIC   // std::string - stored in separate queue
+    STRING_DYNAMIC,  // std::string - stored in separate queue
+    // New values must be appended here. Shared-memory producers and collectors
+    // can be built against different revisions of this header, and they agree on
+    // argument types by numeric value.
+    BLOB             // raw bytes - copied into the string queue, length is authoritative
 };
+
+/**
+ * @brief Largest payload the string ring accepts in a single reservation
+ *
+ * slick-queue packs the reservation size into 16 bits, so a longer reservation
+ * would corrupt the write cursor. Strings and binary payloads are truncated to
+ * this length instead.
+ *
+ * To log more than this, pass the payload as several arguments of ONE log call:
+ *
+ * @code
+ * LOG_SINK_INFO(sink, "{}{}", as_binary(p, kMaxPayloadBytes),
+ *                             as_binary(p + kMaxPayloadBytes, rest));
+ * @endcode
+ *
+ * A BinarySink writes an entry's payloads back to back with nothing between
+ * them, so the file is byte-identical to the unsplit buffer. Spreading the
+ * chunks over separate log calls does NOT work: the queue is multi-producer, so
+ * another thread's entry can land between them and interleave the two payloads.
+ * One entry is the unit of atomicity, which caps a payload at
+ * SLICK_LOGGER_MAX_ARGS * kMaxPayloadBytes.
+ */
+inline constexpr uint32_t kMaxPayloadBytes = 65534;
+
+/**
+ * @brief Non-owning view over raw bytes to be logged verbatim
+ *
+ * Build one with as_binary(). The bytes are copied into the logger's string ring
+ * while the LOG_* call runs, so the source buffer only has to stay alive for the
+ * duration of that call. BinarySink writes them out untouched; text sinks render
+ * them as hex.
+ */
+struct BinaryView {
+    const std::byte* data = nullptr;
+    uint32_t size = 0;
+};
+
+/**
+ * @brief View raw bytes as a loggable binary payload
+ * @param data Start of the payload
+ * @param size Payload length in bytes; truncated to kMaxPayloadBytes
+ */
+inline BinaryView as_binary(const void* data, size_t size) noexcept {
+    if (!data || size == 0) {
+        return {};
+    }
+    return BinaryView{static_cast<const std::byte*>(data),
+                      static_cast<uint32_t>(std::min<size_t>(size, kMaxPayloadBytes))};
+}
+
+/**
+ * @brief View a contiguous range of trivially copyable elements as a binary payload
+ *
+ * Covers std::vector, std::array, std::span and C arrays. The element bytes are
+ * taken as-is, so padding inside the element type is logged too.
+ */
+template<typename R>
+    requires std::ranges::contiguous_range<R> &&
+             std::is_trivially_copyable_v<std::ranges::range_value_t<R>>
+inline BinaryView as_binary(const R& range) noexcept {
+    return as_binary(std::ranges::data(range),
+                     std::ranges::size(range) * sizeof(std::ranges::range_value_t<R>));
+}
 
 // Whether `_Float128` is usable as a type name in C++.
 //
@@ -481,6 +551,8 @@ inline constexpr bool has_source_location(const LogEntry& entry) noexcept {
     return (entry.flags & kEntryHasSourceLocation) != 0;
 }
 
+class Logger;
+
 class ISink {
 public:
     ISink(std::string&& name = "") : name_(std::move(name)) {}
@@ -488,8 +560,29 @@ public:
     virtual void write(const LogEntry& entry) = 0;
     virtual void flush() = 0;
 
-    void set_min_level(LogLevel level) noexcept { min_level_ = level; }
-    LogLevel min_level() const noexcept { return min_level_; }
+    void set_min_level(LogLevel level) noexcept { min_level_.store(level, std::memory_order_release); }
+    LogLevel min_level() const noexcept { return min_level_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Fast-path check for the LOG_SINK_* macros
+     * @param logger The logger the entry will be handed to
+     *
+     * True when an entry at this level, targeted at this sink, would actually be
+     * written. Checks the sink's own minimum level before consulting the logger,
+     * so a filtered-out call never touches its arguments.
+     *
+     * The index_ test is not an optimization: an unregistered sink has index -1,
+     * and -1 means "broadcast to every sink" further down the pipeline.
+     *
+     * Callers that go on to log should pass the same Logger reference they will
+     * log through, as the macros do. Resolving Logger::instance() separately for
+     * the check and the call costs a second atomic load, and lets a set_instance()
+     * landing in between test one logger and write to another.
+     */
+    bool should_log(const Logger& logger, LogLevel level) const noexcept;
+
+    /// Convenience overload resolving Logger::instance() itself.
+    bool should_log(LogLevel level) const noexcept;
 
     /**
      * @brief Set whether this sink is dedicated (logs only its own entries)
@@ -540,9 +633,26 @@ protected:
 protected:
     std::string name_;
     int index_ = -1; // Index assigned by Logger when added
-    LogLevel min_level_ = LogLevel::L_TRACE; // Minimum level for this sink
+    // Atomic because the LOG_SINK_* macros read it from producer threads while
+    // set_min_level() may run concurrently on another. LogLevel is uint8_t-backed,
+    // so this stays lock-free.
+    std::atomic<LogLevel> min_level_{LogLevel::L_TRACE}; // Minimum level for this sink
     bool dedicated_ = false; // Whether this sink is dedicated (logs only its own entries)
 };
+
+namespace detail {
+
+// Normalize the many ways a sink is held into a plain pointer, so one macro
+// accepts a reference, a raw pointer, or a smart pointer. A pointer (rather
+// than a reference) lets the caller null-check an empty smart pointer.
+inline ISink* sink_ptr(ISink& sink) noexcept { return &sink; }
+inline ISink* sink_ptr(ISink* sink) noexcept { return sink; }
+template<typename T>
+inline ISink* sink_ptr(const std::shared_ptr<T>& sink) noexcept { return sink.get(); }
+template<typename T, typename D>
+inline ISink* sink_ptr(const std::unique_ptr<T, D>& sink) noexcept { return sink.get(); }
+
+} // namespace detail
 
 struct RotationConfig {
     size_t max_file_size = 10 * 1024 * 1024; // 10MB
@@ -573,21 +683,25 @@ private:
     TimestampFormatter timestamp_formatter_;
 };
 
-class FileSink : public ISink {
+/**
+ * @brief Shared file-stream plumbing for sinks that write to a file
+ *
+ * Owns the stream, its explicit buffer, and the path. Says nothing about what
+ * goes into the file, which is what lets FileSink (text) and BinarySink (raw
+ * bytes) share it.
+ */
+class FileSinkBase : public ISink {
 public:
-    explicit FileSink(const std::filesystem::path& file_path,
-                      TimestampFormatter::Format timestamp_format = TimestampFormatter::Format::WITH_MICROSECONDS,
-                      std::string&& name = "");
-    
-    explicit FileSink(const std::filesystem::path& file_path, const std::string& custom_timestamp_format, std::string&& name = "");
+    std::string file_path() const { return file_path_.string(); }
 
-    std::string file_path() const noexcept;
-    
-    void write(const LogEntry& entry) override;
     void flush() override;
 
 protected:
-    std::string format_log_entry(const LogEntry& entry);
+    /**
+     * @brief Open path, throwing if it cannot be opened
+     * @param mode Open mode; binary sinks must include std::ios::binary
+     */
+    FileSinkBase(const std::filesystem::path& file_path, std::ios::openmode mode, std::string&& name);
 
     /**
      * @brief Open file_stream_ on path, creating any missing parent directories first.
@@ -606,6 +720,21 @@ protected:
     /// Backing store for file_stream_'s buffer. Held by the sink so it outlives
     /// every open/close cycle; pubsetbuf() does not take ownership.
     std::vector<char> stream_buffer_;
+};
+
+class FileSink : public FileSinkBase {
+public:
+    explicit FileSink(const std::filesystem::path& file_path,
+                      TimestampFormatter::Format timestamp_format = TimestampFormatter::Format::WITH_MICROSECONDS,
+                      std::string&& name = "");
+
+    explicit FileSink(const std::filesystem::path& file_path, const std::string& custom_timestamp_format, std::string&& name = "");
+
+    void write(const LogEntry& entry) override;
+
+protected:
+    std::string format_log_entry(const LogEntry& entry);
+
     TimestampFormatter timestamp_formatter_;
 };
 
@@ -655,6 +784,52 @@ protected:
     std::filesystem::path base_path_;
     std::string current_date_;
     size_t current_file_size_;
+};
+
+/**
+ * @brief Writes raw binary payloads to a file, byte for byte
+ *
+ * Every BinaryView argument of an entry is written out verbatim, in the order it
+ * was logged. Nothing else about the entry reaches the file - no timestamp, no
+ * level, no format string, no separators, no framing. The file is exactly the
+ * concatenation of what the caller encoded, so the encoding (and any framing
+ * needed to read it back) is entirely the caller's to define.
+ *
+ * @code
+ * auto capture = Logger::instance().add_binary_sink("md.bin", "capture");
+ * LOG_SINK_INFO(capture, "{}", slick::logger::as_binary(&msg, sizeof(msg)));
+ * @endcode
+ *
+ * Entries carrying no binary argument produce no output. The sink is dedicated
+ * by default so broadcast text entries, which it could not write anyway, never
+ * reach it; call set_dedicated(false) to also receive them.
+ *
+ * Payloads are capped at kMaxPayloadBytes (see as_binary). Split larger records
+ * across several calls.
+ */
+class BinarySink : public FileSinkBase {
+public:
+    explicit BinarySink(const std::filesystem::path& file_path, std::string&& name = "");
+
+    void write(const LogEntry& entry) override;
+
+    /// Bytes this sink has written since it was constructed.
+    /// Safe to poll from any thread while logging is in flight.
+    size_t bytes_written() const noexcept { return bytes_written_.load(std::memory_order_relaxed); }
+
+protected:
+    /**
+     * @brief Write one payload to the stream
+     *
+     * The extension point for framing: override to prefix a length, a header, or
+     * a record index. Called once per binary argument, on the writer thread only.
+     */
+    virtual void write_payload(const std::byte* data, size_t size);
+
+    // Written on the writer thread, but bytes_written() is public and callers
+    // poll it while logging is in flight. Relaxed throughout: it is a progress
+    // counter that orders nothing else.
+    std::atomic<size_t> bytes_written_{0};
 };
 
 /**
@@ -849,6 +1024,18 @@ public:
     void add_daily_file_sink(const std::filesystem::path& path, const RotationConfig& config, const std::string& custom_timestamp_format, std::string&& name = "");
 
     /**
+     * @brief Add a binary sink that writes raw payloads to a file
+     * @param path Path to the binary file
+     * @param name Optional name for the sink
+     * @return The sink, ready to pass to the LOG_SINK_* macros
+     *
+     * Returns the sink rather than void - unlike the text sinks, a binary sink is
+     * addressed directly at every call site, so handing it back saves a
+     * get_sink() round trip.
+     */
+    std::shared_ptr<BinarySink> add_binary_sink(const std::filesystem::path& path, std::string&& name = "");
+
+    /**
      * @brief Get the sink of givent type
      * @return The shared_ptr of the given sink type. It could be null if the sink of give type doesn't exist
      */
@@ -952,6 +1139,19 @@ public:
                                   FormatT&& format, Args&&... args);
 
     /**
+     * @brief Log to one sink with static-lifetime source path data from a LOG_SINK_* call site
+     * @param sink_index Index of the sink to log to; -1 broadcasts to every sink
+     * @param level LogLevel of the message
+     * @param location Static-lifetime source file path and file name from the macro call site
+     * @param line Source line from the macro call site
+     * @param format Format string (printf-style)
+     * @param args Arguments for the format string
+     */
+    template<typename FormatT, typename... Args>
+    void log_to_sink_with_static_location(int sink_index, LogLevel level, StaticSourceLocation location,
+                                          uint32_t line, FormatT&& format, Args&&... args);
+
+    /**
      * @brief Log a message to a specific sink by index
      * @param index Index of the sink to log to
      * @param level LogLevel of the message
@@ -1044,6 +1244,11 @@ private:
     void write_log_entry(const LogEntry* entry_ptr, uint32_t count);
     void dispatch_entry(const LogEntry& entry);
 
+    /// Drop every sink, resetting each one's index so handles the caller kept
+    /// cannot address a slot a later add_sink() reuses. Shared by clear_sinks()
+    /// and shutdown(), which must not diverge on this.
+    void release_sinks();
+
     /// Flush every sink. Only ever called on the writer thread, which owns them.
     void flush_sinks();
 
@@ -1078,7 +1283,11 @@ private:
 
     void enqueue_format_args(LogEntry& entry, std::format_args fa);
 
+    /// Copy bytes into the string ring, optionally NUL-terminating them.
+    /// Truncates at kMaxPayloadBytes; shared by the string and binary paths.
+    StringRef store_bytes_in_queue(const char* data, size_t size, bool terminate);
     StringRef store_string_in_queue(std::string_view str);
+    StringRef store_binary_in_queue(BinaryView payload);
 
     // ---- Multi-process helpers ----
 
@@ -1180,9 +1389,32 @@ private:
 // ------------------------------ Implementation (header-only library) ------------------------------
 
 
+inline bool ISink::should_log(const Logger& logger, LogLevel level) const noexcept {
+    // Cheapest checks first; the logger's own check ends in an atomic load.
+    return index_ >= 0
+        && level >= min_level_.load(std::memory_order_relaxed)
+        && logger.should_log(level);
+}
+
+inline bool ISink::should_log(LogLevel level) const noexcept {
+    return should_log(Logger::instance(), level);
+}
+
 template<typename FormatT, typename... Args>
 inline void ISink::log(LogLevel level, FormatT&& format, Args&&... args) {
-    Logger::instance().log_to_sink(index_, level, std::forward<FormatT>(format), std::forward<Args>(args)...);
+    // Resolve the logger once and use it for both the check and the call: two
+    // Logger::instance() calls would be two atomic loads, and a set_instance()
+    // landing between them would test one logger and log to another.
+    auto& logger = Logger::instance();
+    // Same predicate the LOG_SINK_* macros use. Two reasons to check it here:
+    // below-threshold entries then cost neither a queue slot nor a string-ring
+    // copy, and a sink that is not attached to a logger has index -1, which
+    // log_to_sink() would read as "broadcast to every sink". The arguments were
+    // already evaluated by the caller - use the macros to avoid that too.
+    if (!should_log(logger, level)) {
+        return;
+    }
+    logger.log_to_sink(index_, level, std::forward<FormatT>(format), std::forward<Args>(args)...);
 }
 
 template<typename FormatT, typename... Args>
@@ -1225,6 +1457,69 @@ inline std::string_view view_string_ref(StringRef ref) noexcept {
         return {};
     }
     return ref.length ? std::string_view{ref.ptr, ref.length} : std::string_view{ref.ptr};
+}
+
+/**
+ * @brief View the payload of an ArgType::BLOB argument
+ * @note Unlike view_string_ref, the stored length is authoritative and a length
+ *       of 0 means an empty payload. Binary payloads can contain NUL bytes, so
+ *       the strlen fallback that view_string_ref uses would read past the end.
+ */
+inline std::span<const std::byte> view_binary(StringRef ref) noexcept {
+    if (!ref.ptr || !ref.length) {
+        return {};
+    }
+    return {reinterpret_cast<const std::byte*>(ref.ptr), ref.length};
+}
+
+/**
+ * @brief Render a binary payload as hex text for the text sinks
+ * @param format_spec The full "{...}" spec from the format string
+ * @param ref The payload
+ *
+ * Supported spec flags: 'X' for uppercase hex (lowercase by default) and a
+ * ".N" precision capping how many bytes are rendered. The default cap keeps a
+ * 64KB payload from turning into a 128KB console line; when it bites, the byte
+ * count of the whole payload is appended.
+ */
+inline void append_binary_arg(std::string& out, std::string_view format_spec, StringRef ref) {
+    constexpr size_t kDefaultPreviewBytes = 64;
+    static constexpr char kLower[] = "0123456789abcdef";
+    static constexpr char kUpper[] = "0123456789ABCDEF";
+
+    const auto bytes = view_binary(ref);
+    const char* digits = format_spec.find('X') != std::string_view::npos ? kUpper : kLower;
+
+    size_t preview = kDefaultPreviewBytes;
+    if (const auto dot = format_spec.find('.'); dot != std::string_view::npos) {
+        preview = 0;
+        for (size_t i = dot + 1; i < format_spec.size() && format_spec[i] >= '0' && format_spec[i] <= '9'; ++i) {
+            preview = preview * 10 + static_cast<size_t>(format_spec[i] - '0');
+        }
+    }
+
+    const size_t shown = std::min(preview, bytes.size());
+    // Written straight into the caller's buffer. Every text sink formats the
+    // entry independently, so a temporary string here would be an allocation and
+    // a copy of a few hundred bytes per sink per binary argument.
+    out.reserve(out.size() + shown * 2 + 24);
+    for (size_t i = 0; i < shown; ++i) {
+        const auto byte = static_cast<unsigned char>(bytes[i]);
+        out += digits[byte >> 4];
+        out += digits[byte & 0x0F];
+    }
+    if (shown < bytes.size()) {
+        out += "...(";
+        out += std::to_string(bytes.size());
+        out += " bytes)";
+    }
+}
+
+/// Convenience wrapper around append_binary_arg for callers that want a string.
+inline std::string format_binary_arg(std::string_view format_spec, StringRef ref) {
+    std::string result;
+    append_binary_arg(result, format_spec, ref);
+    return result;
 }
 
 /**
@@ -1364,6 +1659,14 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                     break;
                 case ArgType::STRING_DYNAMIC:
                     formatted_arg = format_one_arg(format_spec, view_string_ref(arg.value.dynamic_str));
+                    break;
+                case ArgType::BLOB:
+                    // Rendered here rather than through format_one_arg: std::format
+                    // has no formatter for raw bytes, and the spec flags a payload
+                    // accepts are its own. Appended directly to the result, leaving
+                    // formatted_arg empty, so the hex text is built once instead of
+                    // being materialized and then copied.
+                    append_binary_arg(result, format_spec, arg.value.dynamic_str);
                     break;
                 default:
                     formatted_arg = "<UNKNOWN>";
@@ -1510,7 +1813,7 @@ inline std::string ConsoleSink::get_reset_code() {
     return "\033[0m";
 }
 
-inline void FileSink::open_stream(const std::filesystem::path& path, std::ios::openmode mode) {
+inline void FileSinkBase::open_stream(const std::filesystem::path& path, std::ios::openmode mode) {
     const auto parent = path.parent_path();
     if (!parent.empty()) {
         std::error_code ec;
@@ -1526,33 +1829,34 @@ inline void FileSink::open_stream(const std::filesystem::path& path, std::ios::o
     file_stream_.open(path, mode);
 }
 
-inline FileSink::FileSink(const std::filesystem::path& file_path,
-                          TimestampFormatter::Format timestamp_format, std::string&& name)
-    : ISink(std::move(name)), file_path_(file_path), timestamp_formatter_(timestamp_format) {
-    open_stream(file_path_, std::ios::app);
+inline FileSinkBase::FileSinkBase(const std::filesystem::path& file_path, std::ios::openmode mode,
+                                  std::string&& name)
+    : ISink(std::move(name)), file_path_(file_path) {
+    open_stream(file_path_, mode);
     if (!file_stream_) {
         throw std::runtime_error("Failed to open log file: " + file_path_.string());
     }
 }
 
+inline void FileSinkBase::flush() {
+    if (file_stream_) {
+        file_stream_.flush();
+    }
+}
+
+inline FileSink::FileSink(const std::filesystem::path& file_path,
+                          TimestampFormatter::Format timestamp_format, std::string&& name)
+    : FileSinkBase(file_path, std::ios::app, std::move(name)), timestamp_formatter_(timestamp_format) {
+}
+
 inline FileSink::FileSink(const std::filesystem::path& file_path,
                           const std::string& custom_timestamp_format, std::string&& name)
-    : ISink(std::move(name)), file_path_(file_path), timestamp_formatter_(custom_timestamp_format) {
-    open_stream(file_path_, std::ios::app);
-    if (!file_stream_) {
-        throw std::runtime_error("Failed to open log file: " + file_path_.string());
-    }
+    : FileSinkBase(file_path, std::ios::app, std::move(name)), timestamp_formatter_(custom_timestamp_format) {
 }
 
 inline void FileSink::write(const LogEntry& entry) {
     if (file_stream_) {
         file_stream_ << format_log_entry(entry) << "\n";
-    }
-}
-
-inline void FileSink::flush() {
-    if (file_stream_) {
-        file_stream_.flush();
     }
 }
 
@@ -1908,6 +2212,36 @@ inline std::string DailyFileSink::get_date_string() const {
     return std::string(date_str);
 }
 
+inline BinarySink::BinarySink(const std::filesystem::path& file_path, std::string&& name)
+    // std::ios::binary is what keeps Windows from expanding a 0x0A byte in the
+    // payload into CR LF, which would corrupt every record after it.
+    : FileSinkBase(file_path, std::ios::binary | std::ios::app, std::move(name)) {
+    // A binary sink can only write binary payloads, so broadcast text entries
+    // would be dropped anyway. Opt out with set_dedicated(false).
+    set_dedicated(true);
+}
+
+inline void BinarySink::write(const LogEntry& entry) {
+    if (!file_stream_) {
+        return;
+    }
+    for (uint8_t i = 0; i < entry.arg_count; ++i) {
+        const LogArgument& arg = entry.args[i];
+        if (arg.type != ArgType::BLOB) {
+            continue;
+        }
+        const auto payload = view_binary(arg.value.dynamic_str);
+        if (!payload.empty()) {
+            write_payload(payload.data(), payload.size());
+        }
+    }
+}
+
+inline void BinarySink::write_payload(const std::byte* data, size_t size) {
+    file_stream_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    bytes_written_.fetch_add(size, std::memory_order_relaxed);
+}
+
 inline Logger& Logger::instance() {
     return *override_instance_.load(std::memory_order_acquire);
 }
@@ -2117,9 +2451,25 @@ inline void Logger::add_sink(std::shared_ptr<ISink> sink) {
     }
 }
 
-inline void Logger::clear_sinks() {
-    sinks_.clear();
+inline void Logger::release_sinks() {
+    // Detach before dropping. A caller can still hold a shared_ptr to a sink this
+    // logger is releasing, and an index left pointing at a slot that a later
+    // add_sink() reuses would silently route that stale handle's entries to an
+    // unrelated sink. -1 makes ISink::should_log() reject it instead.
+    for (auto& sink : sinks_) {
+        if (sink) {
+            sink->set_index(-1);
+        }
+    }
+    // sinkname_index_map_ holds string_view keys that point into the name strings
+    // owned by each sink object - it must be cleared before the sink shared_ptrs
+    // are destroyed so no dangling views remain.
     sinkname_index_map_.clear();
+    sinks_.clear();
+}
+
+inline void Logger::clear_sinks() {
+    release_sinks();
 }
 
 template<typename SinkT>
@@ -2208,6 +2558,12 @@ inline void Logger::add_daily_file_sink(const std::filesystem::path& path, const
     add_sink(std::make_shared<DailyFileSink>(path, config, custom_timestamp_format, std::move(name)));
 }
 
+inline std::shared_ptr<BinarySink> Logger::add_binary_sink(const std::filesystem::path& path, std::string&& name) {
+    auto sink = std::make_shared<BinarySink>(path, std::move(name));
+    add_sink(sink);
+    return sink;
+}
+
 template<typename FormatT, typename... Args>
 inline void Logger::log(LogLevel level, FormatT&& format, Args&&... args) {
     log_to_sink_with_location(-1, level, nullptr, 0, false,
@@ -2229,8 +2585,16 @@ inline void Logger::log_with_location(LogLevel level, const char* file_path, uin
 template<typename FormatT, typename... Args>
 inline void Logger::log_with_static_location(LogLevel level, StaticSourceLocation location, uint32_t line,
                                              FormatT&& format, Args&&... args) {
+    log_to_sink_with_static_location(-1, level, location, line,
+                                     std::forward<FormatT>(format),
+                                     std::forward<Args>(args)...);
+}
+
+template<typename FormatT, typename... Args>
+inline void Logger::log_to_sink_with_static_location(int sink_index, LogLevel level, StaticSourceLocation location,
+                                                     uint32_t line, FormatT&& format, Args&&... args) {
     const bool include_source_location = (source_location_options_.load(std::memory_order_relaxed) & kSourceLocationEnabled) != 0;
-    log_to_sink_with_location(-1, level,
+    log_to_sink_with_location(sink_index, level,
                               include_source_location ? location.file_name : nullptr,
                               include_source_location ? line : 0,
                               false,
@@ -2404,6 +2768,15 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
         arg.type = ArgType::INT64_T;
         arg.value.i64 = std::chrono::duration_cast<std::chrono::nanoseconds>(value.time_since_epoch()).count();
     }
+    else if constexpr (std::is_same_v<DecayedT, BinaryView>) {
+        // Raw bytes: copied into the string ring like any other dynamic payload,
+        // but without a terminator. The stored length is what makes them readable
+        // back, since embedded NULs are legitimate payload. Stored even when empty
+        // so shared-memory entries always carry a resolvable ring index rather
+        // than a null pointer.
+        arg.type = ArgType::BLOB;
+        arg.value.dynamic_str = store_binary_in_queue(value);
+    }
     else if constexpr (std::is_array_v<BareT> &&
                        std::is_same_v<std::remove_cv_t<std::remove_extent_t<BareT>>, char>) {
         // value may be cv-qualified (e.g. a volatile struct member); strip
@@ -2449,24 +2822,27 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
     }
 }
 
-inline StringRef Logger::store_string_in_queue(std::string_view str) {
-    // slick-queue packs the reservation size into 16 bits, so an over-long string
-    // would corrupt the write cursor. Truncate instead.
-    constexpr uint32_t kMaxStringLength = 65534;
-    uint32_t length = static_cast<uint32_t>(std::min<size_t>(str.length(), kMaxStringLength));
-    auto len = length + 1; // +1 for null terminator
+inline StringRef Logger::store_bytes_in_queue(const char* data, size_t size, bool terminate) {
+    // slick-queue packs the reservation size into 16 bits, so an over-long
+    // reservation would corrupt the write cursor. Truncate instead.
+    uint32_t length = static_cast<uint32_t>(std::min<size_t>(size, kMaxPayloadBytes));
+    // slick-queue rejects a zero-size reservation, so an empty unterminated
+    // payload still claims one byte. That keeps the invariant every reader
+    // depends on - a stored reference always resolves to a real ring slot - at
+    // the cost of one byte in a case that carries no data anyway.
+    uint32_t reserved = std::max(1u, length + (terminate ? 1u : 0u));
 
-    // Reserve space in string queue
-    uint64_t start_index = string_queue_->reserve(len);
+    uint64_t start_index = string_queue_->reserve(reserved);
 
     char* dest = (*string_queue_)[start_index];
     if (length) {
-        // Copy only the string payload, then terminate explicitly.
-        std::memcpy(dest, str.data(), length);
+        std::memcpy(dest, data, length);
     }
-    dest[length] = '\0';
-    // Publish the string data
-    string_queue_->publish(start_index, len);
+    if (terminate) {
+        // Copy only the payload, then terminate explicitly.
+        dest[length] = '\0';
+    }
+    string_queue_->publish(start_index, reserved);
 
     StringRef ref;
     if (entry_flags_ & kEntryOffsets) {
@@ -2479,6 +2855,20 @@ inline StringRef Logger::store_string_in_queue(std::string_view str) {
     }
     ref.length = length;
     return ref;
+}
+
+inline StringRef Logger::store_string_in_queue(std::string_view str) {
+    // Strings are terminated: readers reach them through view_string_ref(), where
+    // a length of 0 means "NUL-terminated, length unknown".
+    return store_bytes_in_queue(str.data(), str.length(), true);
+}
+
+inline StringRef Logger::store_binary_in_queue(BinaryView payload) {
+    // Binary payloads are not terminated. view_binary() treats the stored length
+    // as authoritative - a payload can contain NUL bytes, so a terminator would
+    // mean nothing to a reader - and skipping it saves a byte of ring space and
+    // a store per binary argument.
+    return store_bytes_in_queue(reinterpret_cast<const char*>(payload.data), payload.size, false);
 }
 
 inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
@@ -2551,12 +2941,10 @@ inline void Logger::shutdown(bool clear_sinks) {
     }
     
     if (clear_sinks) {
-        // Clear sinks to release file handles and other resources.
-        // sinkname_index_map_ holds string_view keys that point into the name
-        // strings owned by each sink object — it must be cleared first so no
-        // dangling views remain after the sink shared_ptrs are destroyed.
-        sinkname_index_map_.clear();
-        sinks_.clear();
+        // Release sinks to free file handles and other resources, and to detach
+        // any handle the caller still holds. Safe here: the writer thread, the
+        // only other user of sinks_, has been joined above.
+        release_sinks();
     }
 #ifndef _WIN32
     // POSIX only: slick-queue's destructor shm_unlink()s a segment this process
@@ -2791,7 +3179,8 @@ inline void Logger::rebase_entry(LogEntry& entry) const noexcept {
     }
     for (uint8_t i = 0; i < entry.arg_count; ++i) {
         LogArgument& arg = entry.args[i];
-        if (arg.type == ArgType::STRING_DYNAMIC || arg.type == ArgType::STRING_LITERAL) {
+        if (arg.type == ArgType::STRING_DYNAMIC || arg.type == ArgType::STRING_LITERAL ||
+            arg.type == ArgType::BLOB) {
             arg.value.dynamic_str.ptr = (*string_queue_)[arg.value.dynamic_str.offset];
         }
     }
@@ -2943,3 +3332,45 @@ inline size_t Logger::round_up_to_power_of_2(size_t value) noexcept {
 #define LOG_WARN(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_WARN, __VA_ARGS__)
 #define LOG_ERROR(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_ERROR, __VA_ARGS__)
 #define LOG_FATAL(...) SLICK_LOGGER_LOG_IF_ENABLED(slick::logger::LogLevel::L_FATAL, __VA_ARGS__)
+
+// ---- Sink-targeted logging ----
+//
+// LOG_SINK_<LEVEL>(sink, ...) routes to one sink and, unlike sink->log_<level>(...),
+// checks both the sink's own minimum level and the global level BEFORE the
+// arguments appear in the expansion - so a filtered-out call evaluates nothing.
+// It also attaches the call site, which the direct sink helpers cannot.
+//
+// `sink` may be an ISink reference, a raw pointer, or a smart pointer, and is
+// evaluated exactly once.
+
+#if SLICK_LOGGER_ENABLE_SOURCE_LOCATION
+#define SLICK_LOGGER_LOG_TO_SINK_AT_CALL_SITE(logger_instance, sink_index, level, ...) \
+    do { \
+        static constexpr const char* slick_logger_file_name__ = SLICK_LOGGER_FILE_NAME; \
+        (logger_instance).log_to_sink_with_static_location( \
+            sink_index, \
+            level, \
+            slick::logger::Logger::static_source_location(slick_logger_file_name__), \
+            __LINE__, __VA_ARGS__); \
+    } while (false)
+#else
+#define SLICK_LOGGER_LOG_TO_SINK_AT_CALL_SITE(logger_instance, sink_index, level, ...) \
+    (logger_instance).log_to_sink(sink_index, level, __VA_ARGS__)
+#endif
+
+#define SLICK_LOGGER_LOG_TO_SINK_IF_ENABLED(sink, level, ...)            \
+    do {                                                                 \
+        auto* slick_logger_sink__ = slick::logger::detail::sink_ptr(sink); \
+        auto& slick_logger_instance__ = slick::logger::Logger::instance(); \
+        if (slick_logger_sink__ && slick_logger_sink__->should_log(slick_logger_instance__, level)) { \
+            SLICK_LOGGER_LOG_TO_SINK_AT_CALL_SITE(slick_logger_instance__, \
+                slick_logger_sink__->index(), level, __VA_ARGS__);       \
+        }                                                                \
+    } while (false)
+
+#define LOG_SINK_TRACE(sink, ...) SLICK_LOGGER_LOG_TO_SINK_IF_ENABLED(sink, slick::logger::LogLevel::L_TRACE, __VA_ARGS__)
+#define LOG_SINK_DEBUG(sink, ...) SLICK_LOGGER_LOG_TO_SINK_IF_ENABLED(sink, slick::logger::LogLevel::L_DEBUG, __VA_ARGS__)
+#define LOG_SINK_INFO(sink, ...) SLICK_LOGGER_LOG_TO_SINK_IF_ENABLED(sink, slick::logger::LogLevel::L_INFO, __VA_ARGS__)
+#define LOG_SINK_WARN(sink, ...) SLICK_LOGGER_LOG_TO_SINK_IF_ENABLED(sink, slick::logger::LogLevel::L_WARN, __VA_ARGS__)
+#define LOG_SINK_ERROR(sink, ...) SLICK_LOGGER_LOG_TO_SINK_IF_ENABLED(sink, slick::logger::LogLevel::L_ERROR, __VA_ARGS__)
+#define LOG_SINK_FATAL(sink, ...) SLICK_LOGGER_LOG_TO_SINK_IF_ENABLED(sink, slick::logger::LogLevel::L_FATAL, __VA_ARGS__)
