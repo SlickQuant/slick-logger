@@ -41,6 +41,10 @@ protected:
         std::filesystem::remove("test_set_instance_plugin.log");
         std::filesystem::remove("test_sink_macro.log");
         std::filesystem::remove("test_sink_orphan.log");
+        std::filesystem::remove("test_numbered.log");
+        std::filesystem::remove("test_wchar.log");
+        std::filesystem::remove("test_dynamic_spec.log");
+        std::filesystem::remove("test_dynamic_spec_errors.log");
     }
 };
 
@@ -450,6 +454,209 @@ TEST_F(SlickLoggerTest, MixedValidAndInvalidFormats) {
     EXPECT_TRUE(file_contents.find("<MISSING_ARG> <MISSING_ARG>") != std::string::npos);
     EXPECT_TRUE(file_contents.find("[FORMAT_ERROR: unmatched '}' in format string]") != std::string::npos);
     EXPECT_TRUE(file_contents.find("Invalid stray close brace: } 42") == std::string::npos);
+}
+
+// std::format supports positional / numbered placeholders ({0}, {1}, ...).
+// Regression test: they must resolve to the right argument instead of being
+// passed wholesale to std::vformat (which threw "Argument not found" and
+// replaced the whole line with a FORMAT_ERROR).
+TEST_F(SlickLoggerTest, NumberedPlaceholders) {
+    std::filesystem::remove("test_numbered.log");
+
+    slick::logger::Logger::instance().init("test_numbered.log", 1024);
+
+    LOG_INFO("automatic: {} {}", 111, 222);
+    LOG_INFO("numbered: {1} then {0}", 111, 222);
+    LOG_INFO("indexed spec: {0:>5} {1:.1f}", 42, 3.5);
+    LOG_INFO("out of range: {0} {9}", "only");
+    LOG_INFO("repeated: {0} {0} {0}", 7);
+    LOG_INFO("leading zeros: {01} {00}", 111, 222);
+
+    // std::format rejects mixing automatic and explicit indices; this parser
+    // tolerates it, with the two counters advancing independently, rather than
+    // dropping the line. {} takes 111, {0} takes 111, {} takes 222.
+    LOG_INFO("mixed: {} {0} {}", 111, 222);
+
+    // An index long enough to overflow the uint32_t accumulator must still read
+    // as out of range instead of wrapping back onto a valid argument.
+    LOG_INFO("overflow: {4294967296} {99999999999999999999}", 111, 222);
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_numbered.log"));
+
+    std::ifstream log_file("test_numbered.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    std::string file_contents;
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_TRUE(file_contents.find("automatic: 111 222") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("numbered: 222 then 111") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("indexed spec:    42 3.5") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("out of range: only <MISSING_ARG>") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("repeated: 7 7 7") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("leading zeros: 222 111") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("mixed: 111 111 222") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("overflow: <MISSING_ARG> <MISSING_ARG>") != std::string::npos);
+}
+
+// A format spec may itself contain replacement fields, for a dynamic width or
+// precision ({0:{1}}, {:{}}, {:.{}f}). Regression test: the parser used to stop
+// at the first '}', so "{0:{1}}" became the invalid single-argument spec
+// "{:{1}" and every one of these forms replaced the whole message with a
+// FORMAT_ERROR. Each expectation below was checked against std::format itself.
+TEST_F(SlickLoggerTest, DynamicWidthAndPrecision) {
+    std::filesystem::remove("test_dynamic_spec.log");
+
+    slick::logger::Logger::instance().init("test_dynamic_spec.log", 1024);
+
+    LOG_INFO("manual: [{0:{1}}]", 42, 8);
+    LOG_INFO("automatic: [{:{}}]", 42, 8);
+    LOG_INFO("precision: [{:.{}f}]", 3.14159, 3);
+    LOG_INFO("both: [{:{}.{}f}]", 3.14159, 9, 2);
+    LOG_INFO("fill: [{:*^{}}]", "ab", 7);
+    LOG_INFO("flags: [{:#0{}x}]", 255, 8);
+    LOG_INFO("reversed: [{1:{0}}]", 6, 42);
+
+    // A nested field takes the argument *after* the one being formatted, so the
+    // automatic counter has to stay in step across the rest of the line.
+    LOG_INFO("interleaved: [{:{}}] {} [{:{}}]", 1, 4, "mid", 2, 5);
+
+    // A zero width is valid and means "no minimum width". Writing the 0 into
+    // the spec would make it the zero-padding flag instead, which pads a number
+    // and is rejected outright for a text argument. A zero precision, by
+    // contrast, is meaningful and has to survive.
+    LOG_INFO("zero width text: [{:{}}]", "x", 0);
+    LOG_INFO("zero width aligned: [{:*^{}}]", "x", 0);
+    LOG_INFO("zero width flags: [{:#0{}x}]", 255, 0);
+    LOG_INFO("zero width manual: [{0:{1}}]", "x", 0);
+    LOG_INFO("zero width number: [{:{}}]", 42, 0);
+    LOG_INFO("zero precision: [{:.{}}]", "abc", 0);
+    LOG_INFO("zero both: [{:{}.{}f}]", 3.14159, 0, 0);
+
+    // A nested field naming an argument that was never passed costs that field,
+    // not the line - the same treatment a bare {} past the end already gets.
+    LOG_INFO("missing width: [{:{}}] then {}", 42);
+    LOG_INFO("missing manual: [{0:{9}}]", 42, 8);
+
+    // A nested field that is never closed leaves the placeholder malformed, so
+    // it is emitted verbatim rather than swallowing the line.
+    LOG_INFO("unclosed: [{:{}]", 42, 8);
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_dynamic_spec.log"));
+
+    std::ifstream log_file("test_dynamic_spec.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    std::string file_contents;
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_TRUE(file_contents.find("manual: [      42]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("automatic: [      42]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("precision: [3.142]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("both: [     3.14]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("fill: [**ab***]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("flags: [0x0000ff]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("reversed: [    42]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("interleaved: [   1] mid [    2]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("zero width text: [x]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("zero width aligned: [x]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("zero width flags: [0xff]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("zero width manual: [x]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("zero width number: [42]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("zero precision: []") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("zero both: [3]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("missing width: [<MISSING_ARG>] then <MISSING_ARG>") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("missing manual: [<MISSING_ARG>]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("unclosed: [{:{}]") != std::string::npos);
+
+    // Nothing here should have cost a line.
+    EXPECT_TRUE(file_contents.find("FORMAT_ERROR") == std::string::npos);
+}
+
+// A nested width/precision field has to name an argument std::format could use
+// as one. Anything else is a format error rather than a silently dropped spec.
+TEST_F(SlickLoggerTest, DynamicWidthRejectsUnusableArgument) {
+    std::filesystem::remove("test_dynamic_spec_errors.log");
+
+    slick::logger::Logger::instance().init("test_dynamic_spec_errors.log", 1024);
+
+    LOG_INFO("non-integer: [{:{}}]", 42, "wide");
+    LOG_INFO("negative: [{:{}}]", 42, -3);
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_dynamic_spec_errors.log"));
+
+    std::ifstream log_file("test_dynamic_spec_errors.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    std::string file_contents;
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_TRUE(file_contents.find(
+        "[FORMAT_ERROR: dynamic width or precision must be an integer argument]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find(
+        "[FORMAT_ERROR: dynamic width or precision must not be negative]") != std::string::npos);
+}
+
+// Regression test: wchar_t arguments render their value instead of <UNKNOWN>.
+// Which *kind* of value is chosen by the format spec, exactly as std::format
+// does for char - text by default, a number under b/B/d/o/x/X - so that a given
+// spec does not change meaning with the code point.
+TEST_F(SlickLoggerTest, WCharArgument) {
+    std::filesystem::remove("test_wchar.log");
+
+    slick::logger::Logger::instance().init("test_wchar.log", 1024);
+
+    wchar_t wc = L'A';
+    LOG_INFO("wchar: {}", wc);
+    LOG_INFO("wchar code: {:d}", wc);
+    LOG_INFO("wchar hex: {:x}", wc);
+    LOG_INFO("wchar as char: {:c}", wc);
+
+    // Above U+007F the default spec still yields a character (UTF-8 encoded),
+    // not a number, and keeps the left alignment a character argument has.
+    wchar_t accent = L'\u00e9';   // U+00E9, 2 UTF-8 bytes
+    wchar_t cjk = L'\u4e2d';      // U+4E2D, 3 UTF-8 bytes
+    LOG_INFO("wide chars: [{}] [{}]", accent, cjk);
+    LOG_INFO("wide padded: [{:4}] [{:d}]", accent, accent);
+
+    // An unpaired UTF-16 surrogate is not a character, so it falls back to the
+    // numeric code point instead of emitting invalid UTF-8.
+    wchar_t surrogate = static_cast<wchar_t>(0xD800);
+    LOG_INFO("surrogate: {}", surrogate);
+
+    slick::logger::Logger::instance().shutdown();
+
+    ASSERT_TRUE(std::filesystem::exists("test_wchar.log"));
+
+    std::ifstream log_file("test_wchar.log");
+    std::string line;
+    std::getline(log_file, line);   // first line is the logger's version
+    std::string file_contents;
+    while (std::getline(log_file, line)) {
+        file_contents += line + "\n";
+    }
+
+    EXPECT_TRUE(file_contents.find("wchar: A") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("wchar code: 65") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("wchar hex: 41") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("wchar as char: A") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("wide chars: [\xc3\xa9] [\xe4\xb8\xad]") != std::string::npos);
+    // "e" acute is one column wide, so {:4} pads it with three spaces and, like
+    // any character argument, aligns it left.
+    EXPECT_TRUE(file_contents.find("wide padded: [\xc3\xa9   ] [233]") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("surrogate: 55296") != std::string::npos);
 }
 
 TEST_F(SlickLoggerTest, ConstCharArrayLogging) {

@@ -1521,6 +1521,105 @@ inline std::string format_binary_arg(std::string_view format_spec, StringRef ref
 }
 
 /**
+ * @brief Presentation type of a "{...}" spec, or '\0' if it has none
+ *
+ * The presentation type is the single character just before the closing brace,
+ * and can only appear after a ':'. A trailing width or precision digit
+ * ("{:5}") is not a type, and neither is the last character of a fill/align
+ * pair ("{:x<5}"), so only the recognized type letters are reported. Only the
+ * types that matter to a character argument are listed.
+ */
+inline char spec_presentation_type(std::string_view format_spec) noexcept {
+    // The shortest spec carrying a type is "{:d}".
+    if (format_spec.size() < 4 || format_spec.find(':') == std::string_view::npos) {
+        return '\0';
+    }
+    const char type = format_spec[format_spec.size() - 2];
+    switch (type) {
+        case 'b': case 'B': case 'c': case 'd': case 'o': case 'x': case 'X':
+            return type;
+        default:
+            return '\0';
+    }
+}
+
+/**
+ * @brief Encode one Unicode code point as UTF-8
+ * @return Number of bytes written to @p out, or 0 if @p code_point is not a
+ *         Unicode scalar value - an unpaired UTF-16 surrogate (what a lone
+ *         wchar_t holding half a surrogate pair looks like on Windows) or a
+ *         value beyond U+10FFFF. Those have no character to encode.
+ */
+inline size_t encode_utf8(uint32_t code_point, char (&out)[4]) noexcept {
+    if (code_point < 0x80) {
+        out[0] = static_cast<char>(code_point);
+        return 1;
+    }
+    if (code_point < 0x800) {
+        out[0] = static_cast<char>(0xC0 | (code_point >> 6));
+        out[1] = static_cast<char>(0x80 | (code_point & 0x3F));
+        return 2;
+    }
+    if (code_point < 0x10000) {
+        if (code_point >= 0xD800 && code_point <= 0xDFFF) {
+            return 0;
+        }
+        out[0] = static_cast<char>(0xE0 | (code_point >> 12));
+        out[1] = static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+        out[2] = static_cast<char>(0x80 | (code_point & 0x3F));
+        return 3;
+    }
+    if (code_point <= 0x10FFFF) {
+        out[0] = static_cast<char>(0xF0 | (code_point >> 18));
+        out[1] = static_cast<char>(0x80 | ((code_point >> 12) & 0x3F));
+        out[2] = static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+        out[3] = static_cast<char>(0x80 | (code_point & 0x3F));
+        return 4;
+    }
+    return 0;
+}
+
+/**
+ * @brief Narrow a signed argument used as a dynamic width or precision
+ * @throws std::format_error if it is negative
+ */
+template<typename T>
+inline uint64_t checked_spec_value(T value) {
+    if (value < 0) {
+        throw std::format_error("dynamic width or precision must not be negative");
+    }
+    return static_cast<uint64_t>(value);
+}
+
+/**
+ * @brief Value of a log argument named by a nested width/precision field
+ *
+ * Only the integer types can serve as one, which is the rule std::format
+ * applies to a nested field. Anything else is a format error rather than a
+ * silently dropped spec: a column that quietly loses its alignment gives the
+ * reader nothing to go on.
+ *
+ * @note The union member is read by value. These members are packed and may be
+ *       misaligned, so a reference must never be bound to one - see
+ *       format_one_arg.
+ * @throws std::format_error if the argument cannot serve as a width/precision
+ */
+inline uint64_t dynamic_spec_value(const LogArgument& arg) {
+    switch (arg.type) {
+        case ArgType::INT8_T:   return checked_spec_value(arg.value.i8);
+        case ArgType::INT16_T:  return checked_spec_value(arg.value.i16);
+        case ArgType::INT32_T:  return checked_spec_value(arg.value.i32);
+        case ArgType::INT64_T:  return checked_spec_value(arg.value.i64);
+        case ArgType::UINT8_T:  return arg.value.u8;
+        case ArgType::UINT16_T: return arg.value.u16;
+        case ArgType::UINT32_T: return arg.value.u32;
+        case ArgType::UINT64_T: return arg.value.u64;
+        default:
+            throw std::format_error("dynamic width or precision must be an integer argument");
+    }
+}
+
+/**
  * @brief Format a single log argument against one "{...}" spec
  * @note The value is taken BY VALUE on purpose. LogEntry and LogArgument are
  *       "#pragma pack(1)", so their members can sit at misaligned addresses,
@@ -1581,26 +1680,159 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                 continue;
             }
 
-            // Find the closing brace
-            size_t brace_end = format_str.find('}', brace_start);
-            if (brace_end == std::string::npos) {
+            // Find this field's closing brace. The spec may itself contain
+            // replacement fields, for a dynamic width or precision
+            // ("{:{}.{}f}"), so the first '}' is not necessarily the one that
+            // ends the field - step over a nested field rather than stopping
+            // inside it. A nested field cannot nest any further, so one level
+            // is all the grammar allows for.
+            //
+            // Only a '{' inside the format spec starts one: everything before
+            // the ':' is the argument index, which is digits alone. Reading a
+            // '{' there as nested would change what a malformed string like
+            // "{unclosed and {}" means, and it is not a nested field anyway.
+            size_t brace_end = brace_start + 1;
+            bool in_spec = false;
+            while (brace_end < format_str.length() && format_str[brace_end] != '}') {
+                if (format_str[brace_end] == ':') {
+                    in_spec = true;
+                } else if (in_spec && format_str[brace_end] == '{') {
+                    const size_t nested_end = format_str.find('}', brace_end + 1);
+                    if (nested_end == std::string::npos) {
+                        break;
+                    }
+                    brace_end = nested_end + 1;
+                    continue;
+                }
+                ++brace_end;
+            }
+            if (brace_end >= format_str.length() || format_str[brace_end] != '}') {
                 // Malformed format string
                 result += format_str.substr(brace_start);
                 break;
             }
 
-            if (arg_index >= entry.arg_count) {
-                // Not enough arguments
+            // A placeholder may carry an explicit argument index ({0}, {1}, ...)
+            // in front of the optional ':' format spec, so the manual parser
+            // here has to resolve the index itself: each argument is formatted
+            // against its own single-argument spec.
+            //
+            // std::format rejects a format string that mixes explicit indices
+            // with bare {} automatic placeholders. This parser tolerates the
+            // mix - the two counters are independent - rather than losing the
+            // whole log line to a format error.
+            uint8_t resolved_index = 0;
+            size_t spec_prefix_len = 0; // leading digits consumed from the placeholder
+            if (brace_start + 1 < brace_end &&
+                format_str[brace_start + 1] >= '0' && format_str[brace_start + 1] <= '9') {
+                uint32_t id = 0;
+                while (brace_start + 1 + spec_prefix_len < brace_end &&
+                       format_str[brace_start + 1 + spec_prefix_len] >= '0' &&
+                       format_str[brace_start + 1 + spec_prefix_len] <= '9') {
+                    if (id < entry.arg_count) {
+                        // Once id reaches arg_count it is already out of range,
+                        // and further digits can only push it further out, so
+                        // stop accumulating there. Multiplying through a long
+                        // digit run would overflow uint32_t and could wrap a
+                        // huge index back onto a valid argument - "{4294967296}"
+                        // would otherwise select argument 0.
+                        id = id * 10 + static_cast<uint32_t>(format_str[brace_start + 1 + spec_prefix_len] - '0');
+                    }
+                    ++spec_prefix_len;
+                }
+                if (id >= entry.arg_count) {
+                    // Not enough arguments
+                    result += "<MISSING_ARG>";
+                    pos = brace_end + 1;
+                    continue; // manual index: the automatic counter stays untouched
+                }
+                resolved_index = static_cast<uint8_t>(id);
+            } else {
+                if (arg_index >= entry.arg_count) {
+                    // Not enough arguments
+                    result += "<MISSING_ARG>";
+                    pos = brace_end + 1;
+                    continue;
+                }
+                // Claimed here rather than at the end of the iteration: a nested
+                // width or precision field takes the *next* automatic argument,
+                // so this field's own has to be spoken for before the spec below
+                // is walked.
+                resolved_index = arg_index++;
+            }
+
+            // Rebuild the spec as a single-argument one. The explicit index is
+            // dropped ({1:>8} -> {:>8}, {1} -> {}), and a nested width or
+            // precision field is replaced by the decimal value of the argument
+            // it names ({0:{1}} over (x, 8) -> {:8}). Substituting the value
+            // rather than forwarding the nested field is what keeps every
+            // argument formatting against a one-argument spec, which is what
+            // lets each ArgType hand std::format its own union member.
+            std::string format_spec;
+            format_spec.reserve(brace_end - brace_start + 1);
+            format_spec += '{';
+            bool nested_arg_missing = false;
+            bool spec_started = false; // same rule the scan above applied
+            for (size_t i = brace_start + 1 + spec_prefix_len; i < brace_end; ) {
+                const char ch = format_str[i];
+                if (ch != '{' || !spec_started) {
+                    spec_started = spec_started || ch == ':';
+                    format_spec += ch;
+                    ++i;
+                    continue;
+                }
+
+                ++i; // step past the nested field's '{'
+                uint32_t nested_id = 0;
+                bool nested_explicit = false;
+                while (i < brace_end && format_str[i] >= '0' && format_str[i] <= '9') {
+                    if (nested_id < entry.arg_count) {
+                        nested_id = nested_id * 10 + static_cast<uint32_t>(format_str[i] - '0');
+                    }
+                    nested_explicit = true;
+                    ++i;
+                }
+                if (i < brace_end && format_str[i] == '}') {
+                    ++i; // step past the nested field's '}'
+                }
+
+                if (!nested_explicit) {
+                    nested_id = arg_index;
+                    if (arg_index < entry.arg_count) {
+                        ++arg_index; // as above, never past the end
+                    }
+                }
+                if (nested_id >= entry.arg_count) {
+                    nested_arg_missing = true;
+                    break;
+                }
+                // A zero width is dropped rather than written out. A literal 0
+                // in the width position is the zero-padding flag and not a
+                // width at all - "{:0}" pads a number, and is rejected outright
+                // for a text argument - whereas a width of zero just means no
+                // minimum width, which is exactly what leaving it out says.
+                // Zero is a meaningful precision ("{:.0f}"), so only the width
+                // case is dropped; the '.' that introduces a precision is
+                // already in the spec by the time we get here.
+                const uint64_t nested_value = dynamic_spec_value(entry.args[nested_id]);
+                if (nested_value != 0 || format_spec.back() == '.') {
+                    format_spec += std::to_string(nested_value);
+                }
+            }
+
+            if (nested_arg_missing) {
+                // The width or precision names an argument that was never
+                // passed, so there is no spec to format against. Reported as a
+                // missing argument like any other, rather than as a format
+                // error, which would cost the whole line.
                 result += "<MISSING_ARG>";
                 pos = brace_end + 1;
                 continue;
             }
-
-            // Extract format spec (everything between { and })
-            std::string format_spec = format_str.substr(brace_start, brace_end - brace_start + 1);
+            format_spec += '}';
 
             // Format the argument using std::format with the specific format spec
-            const auto& arg = entry.args[arg_index];
+            const auto& arg = entry.args[resolved_index];
             std::string formatted_arg;
 
             // Every case passes the union member by value through format_one_arg:
@@ -1616,9 +1848,54 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                 case ArgType::U_CHAR:
                     formatted_arg = format_one_arg(format_spec, arg.value.uc);
                     break;
-                // case ArgType::WCHAR:
-                //     formatted_arg = format_one_arg(format_spec, arg.value.wc);
-                //     break;
+                case ArgType::WCHAR: {
+                    // std::format has no wchar_t formatter in a narrow (char)
+                    // context on any supported standard library, so a wchar_t
+                    // cannot go through format_one_arg directly. Reproduce what
+                    // std::format does for char instead: render it as text by
+                    // default and as a number under a b/B/d/o/x/X presentation
+                    // type. Dispatching on the spec rather than on the value
+                    // keeps "{}" and "{:5}" producing the same kind of output -
+                    // and the same default alignment - for every code point,
+                    // instead of silently switching to a number above U+007F.
+                    //
+                    // wchar_t is signed on Linux and macOS, so go through the
+                    // unsigned type first: a negative value is a code unit, not
+                    // a number to sign-extend into a huge unsigned one.
+                    const auto code_point = static_cast<uint32_t>(
+                        static_cast<std::make_unsigned_t<wchar_t>>(arg.value.wc));
+
+                    std::string_view spec{format_spec};
+                    std::string char_spec;
+                    bool as_number = false;
+                    switch (spec_presentation_type(format_spec)) {
+                        case 'b': case 'B': case 'd': case 'o': case 'x': case 'X':
+                            as_number = true;
+                            break;
+                        case 'c':
+                            // "render as a character" - already the default
+                            // here, and std::format's string formatter would
+                            // reject the 'c', so drop it.
+                            char_spec.assign(format_spec, 0, format_spec.size() - 2);
+                            char_spec += '}';
+                            spec = char_spec;
+                            break;
+                        default:
+                            break;
+                    }
+
+                    char utf8[4];
+                    const size_t utf8_len = as_number ? 0 : encode_utf8(code_point, utf8);
+                    if (utf8_len > 0) {
+                        formatted_arg = format_one_arg(spec, std::string_view{utf8, utf8_len});
+                    } else {
+                        // Either the spec asked for a number, or the value is
+                        // not a Unicode scalar value and has no character to
+                        // print - fall back to the numeric code point.
+                        formatted_arg = format_one_arg(spec, code_point);
+                    }
+                    break;
+                }
                 case ArgType::INT8_T:
                     formatted_arg = format_one_arg(format_spec, arg.value.i8);
                     break;
@@ -1673,7 +1950,6 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
 
             result += formatted_arg;
             pos = brace_end + 1;
-            arg_index++;
         }
 
         return std::make_pair(result, true);

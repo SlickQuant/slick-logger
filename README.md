@@ -33,7 +33,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 
 - **C++20 compatible compiler** with `std::format` support (GCC 11+, Clang 14+, MSVC 19.29+)
 - CMake 3.20 or higher (for building examples/tests)
-- slick-queue 1.5.0 or newer (multi-process logging relies on its shared-memory support)
+- slick-queue 2.0.0 or newer (multi-process logging relies on its shared-memory support). The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
 - Internet connection for downloading the slick-queue header when it is not already installed
 
 ## Installation
@@ -288,6 +288,15 @@ int main() {
     // Multiple arguments
     LOG_INFO("User {} has {} items", "Alice", 15);
 
+    // Numbered (positional) placeholders, with or without a format spec
+    LOG_INFO("{0} beat {1}, so {0} advances", "Alice", "Bob");
+    LOG_INFO("{1:>8} | {0:.2f}", 3.14159, "label");
+
+    // Dynamic width and precision, taken from an argument
+    LOG_INFO("[{:{}}]", 42, 8);                  // [      42]
+    LOG_INFO("[{:{}.{}f}]", 3.14159, 9, 2);      // [     3.14]
+    LOG_INFO("[{0:{1}}]", 42, 8);                // [      42]
+
     // Format specifiers (same as std::format)
     LOG_INFO("Price: ${:.2f}", 29.99);           // Currency with 2 decimals
     LOG_INFO("Progress: {:.1f}%", 85.7);         // Percentage with 1 decimal
@@ -303,6 +312,10 @@ int main() {
     // Zero padding
     LOG_INFO("Zero padded: {:04d}", 42);         // 0042
 
+    // wchar_t renders as text by default and as a number under b/B/d/o/x/X
+    LOG_INFO("Char: {}", L'\u00e9');              // e-acute, UTF-8 encoded
+    LOG_INFO("Code point: U+{:04X}", L'\u00e9');  // U+00E9
+
     // Custom types (as long as they support std::formatter)
     std::vector<int> numbers = {1, 2, 3, 4, 5};
     LOG_INFO("Vector size: {}", numbers.size());
@@ -311,6 +324,30 @@ int main() {
     return 0;
 }
 ```
+
+**Numbered placeholders:** `{0}`, `{1}`, ... select an argument by position and
+may carry a format spec (`{1:>8}`). An index past the end of the argument list
+renders as `<MISSING_ARG>` rather than discarding the line. Unlike `std::format`,
+which rejects a format string that mixes explicit indices with bare `{}`, this
+parser tolerates the mix: the automatic counter advances only through bare `{}`
+placeholders, so `"{} {0} {}"` with `(111, 222)` yields `111 111 222`.
+
+**Dynamic width and precision:** a nested field supplies a width or precision
+from an argument — `{:{}}`, `{:.{}f}`, `{:{}.{}f}`, and the positional
+`{0:{1}}`. A nested field takes the argument *after* the one being formatted, so
+`"{:{}}"` formats the first argument to the width given by the second. The
+argument must be a non-negative integer; anything else is a format error. If it
+was not passed at all, that field renders `<MISSING_ARG>` and the rest of the
+line is unaffected.
+
+**wchar_t arguments:** a `wchar_t` follows the same rule `std::format` applies to
+`char` — it renders as text by default (`{}`, `{:c}`, `{:>4}`), UTF-8 encoded, and
+as a number under a `b`/`B`/`d`/`o`/`x`/`X` presentation type (`{:d}` on `L'A'`
+gives `65`). Because the choice comes from the spec and not the value, a given
+spec means the same thing for every code point. A lone `wchar_t` that is not a
+Unicode scalar value — an unpaired UTF-16 surrogate on Windows — has no character
+to print and falls back to its numeric code point. Wide *strings* are not
+supported; convert them yourself before logging.
 
 **Benefits of std::format:**
 - **Type-Aware Formatting**: Standard C++ formatting for strings, numbers, pointers, chrono values, and custom formatter-enabled types
