@@ -629,6 +629,7 @@ TEST_F(SlickLoggerTest, WCharArgument) {
     wchar_t accent = L'\u00e9';   // U+00E9, 2 UTF-8 bytes
     wchar_t cjk = L'\u4e2d';      // U+4E2D, 3 UTF-8 bytes
     LOG_INFO("wide chars: [{}] [{}]", accent, cjk);
+    LOG_INFO("ascii padded: [{:4}]", wc);
     LOG_INFO("wide padded: [{:4}] [{:d}]", accent, accent);
 
     // An unpaired UTF-16 surrogate is not a character, so it falls back to the
@@ -653,9 +654,23 @@ TEST_F(SlickLoggerTest, WCharArgument) {
     EXPECT_TRUE(file_contents.find("wchar hex: 41") != std::string::npos);
     EXPECT_TRUE(file_contents.find("wchar as char: A") != std::string::npos);
     EXPECT_TRUE(file_contents.find("wide chars: [\xc3\xa9] [\xe4\xb8\xad]") != std::string::npos);
-    // "e" acute is one column wide, so {:4} pads it with three spaces and, like
-    // any character argument, aligns it left.
-    EXPECT_TRUE(file_contents.find("wide padded: [\xc3\xa9   ] [233]") != std::string::npos);
+    // Padding an ASCII code point is unambiguous - one column, so three spaces -
+    // and it lands on the right, the way a character argument aligns rather than
+    // the way a number does.
+    EXPECT_TRUE(file_contents.find("ascii padded: [A   ]") != std::string::npos);
+
+    // For a non-ASCII code point the *number* of pad columns is std::format's
+    // estimated field width, which the standard leaves implementations room to
+    // compute differently: libstdc++ 13 charges U+00E9 its two UTF-8 code units
+    // where MSVC and libstdc++ 14 charge it one display column, so "{:4}" pads
+    // it with two spaces on one and three on the other. That is not this
+    // library's behavior to pin down - slick-logger
+    // hands the spec and a UTF-8 string_view to std::vformat and does no padding
+    // of its own. What is asserted here is what slick-logger does decide: the
+    // argument arrives as UTF-8 text, padded on the right like a character, and
+    // becomes a number under an integer presentation type.
+    EXPECT_TRUE(file_contents.find("wide padded: [\xc3\xa9 ") != std::string::npos);
+    EXPECT_TRUE(file_contents.find("] [233]") != std::string::npos);
     EXPECT_TRUE(file_contents.find("surrogate: 55296") != std::string::npos);
 }
 
