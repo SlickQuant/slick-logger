@@ -177,7 +177,7 @@ LOG_ERROR("request failed: {}", reason);
 LOG_FATAL("unrecoverable error: {}", reason);
 ```
 
-The macros use the singleton logger and are filtered before arguments are evaluated. If the current global level rejects a message, expensive arguments in that log call are not computed.
+**Prefer the macros over calling `Logger::instance().log(...)` directly.** They test the level *before* the arguments appear in the expansion, so a filtered-out call computes nothing, while a direct call has to evaluate its arguments and only then discovers that the level rejects the message. They also attach the call site: `Logger::log()` passes no file or line, so entries logged that way carry no `file:line`. The direct call remains available for the cases that need it — forwarding a level chosen at runtime, or logging from code that has no call site worth recording.
 
 ```cpp
 using namespace slick::logger;
@@ -185,7 +185,12 @@ using namespace slick::logger;
 Logger::instance().set_level(LogLevel::L_WARN);
 
 LOG_DEBUG("expensive value: {}", build_expensive_debug_value()); // not evaluated
-LOG_WARN("visible warning");
+LOG_WARN("visible warning");                                     // written, with file:line
+
+// The same message through the direct call: the argument is built, the
+// entry is then dropped inside log(), and nothing records where it came from.
+Logger::instance().log(LogLevel::L_DEBUG, "expensive value: {}",
+                       build_expensive_debug_value());           // evaluated, then dropped
 
 auto current_level = Logger::instance().get_level();
 ```
