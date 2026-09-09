@@ -1,4 +1,4 @@
-# Unreleased
+# v1.3.0 - 09-09-2026
 - Add `BinarySink` and binary payload logging
   - `as_binary(ptr, size)` - or `as_binary(range)` over any contiguous range of trivially copyable elements - turns raw bytes into a log argument, carried through the queue as the new `ArgType::BLOB`. Packets, wire messages and serialized records now take the same asynchronous path as text, instead of needing a second I/O path in the application
   - `BinarySink` writes those payloads to a file byte for byte and adds nothing of its own - no header, no framing, no separators - so the file's format is entirely the caller's to define. It is opened with `std::ios::binary`, which no path through `FileSink` could reach and without which Windows expands a `0x0A` byte in a payload into CR LF. `write_payload()` is virtual, so length-prefixing or an index is a short subclass rather than a fork, and `bytes_written()` is atomic and safe to poll while logging is in flight
