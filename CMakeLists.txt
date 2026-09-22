@@ -7,6 +7,15 @@ project(slick-logger
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(SLICK_LOGGER_ENABLE_SOURCE_LOCATION "Enable LOG_* macro source-location capture" ON)
+# Off restores the pre-1.4.0 LogEntry layout byte for byte, at the cost of the
+# %t pattern flag. Only matters for shared-memory peers built from older headers.
+option(SLICK_LOGGER_ENABLE_THREAD_ID "Capture the producing thread id in every entry" ON)
+# The multi-process collector is a convenience executable;
+# the shared-memory feature itself is header-only and always available.
+option(BUILD_SLICK_LOGGER_COLLECTOR "Build the standalone slick_log_collector executable" OFF)
+option(BUILD_SLICK_LOGGER_BENCHMARKS "Build performance benchmarks" OFF)
+
 # 1.5.0 or newer is required: multi-process logging relies on the slick-shm based
 # shared-memory implementation introduced in slick-queue 1.3.0.
 find_package(slick-queue 2.0.0 CONFIG QUIET)
@@ -51,8 +60,6 @@ add_library(slick::logger ALIAS slick-logger)
 add_library(slick_logger ALIAS slick-logger)
 add_library(slick::slick_logger ALIAS slick-logger)
 
-option(SLICK_LOGGER_ENABLE_SOURCE_LOCATION "Enable LOG_* macro source-location capture" ON)
-
 target_include_directories(slick-logger INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
@@ -60,6 +67,9 @@ target_include_directories(slick-logger INTERFACE
 set_target_properties(slick-logger PROPERTIES EXPORT_NAME logger)
 if(NOT SLICK_LOGGER_ENABLE_SOURCE_LOCATION)
     target_compile_definitions(slick-logger INTERFACE SLICK_LOGGER_ENABLE_SOURCE_LOCATION=0)
+endif()
+if(NOT SLICK_LOGGER_ENABLE_THREAD_ID)
+    target_compile_definitions(slick-logger INTERFACE SLICK_LOGGER_ENABLE_THREAD_ID=0)
 endif()
 target_link_libraries(slick-logger INTERFACE slick::queue)
 
@@ -102,15 +112,10 @@ add_subdirectory(tests)
 # Add examples (placeholder)
 add_subdirectory(examples)
 
-# Add tools (optional). The multi-process collector is a convenience executable;
-# the shared-memory feature itself is header-only and always available.
-option(BUILD_SLICK_LOGGER_COLLECTOR "Build the standalone slick_log_collector executable" OFF)
 if(BUILD_SLICK_LOGGER_COLLECTOR)
     add_subdirectory(tools)
 endif()
 
-# Add benchmarks (optional)
-option(BUILD_SLICK_LOGGER_BENCHMARKS "Build performance benchmarks" OFF)
 if(BUILD_SLICK_LOGGER_BENCHMARKS AND CMAKE_BUILD_TYPE MATCHES Release)
     add_subdirectory(benchmarks)
 endif()

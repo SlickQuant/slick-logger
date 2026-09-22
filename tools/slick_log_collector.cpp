@@ -46,6 +46,10 @@ int usage() {
         "  --max-size <bytes>           rotation size threshold (default 10485760)\n"
         "  --max-files <n>              rotated files to keep (default 5)\n"
         "  --level <name>               trace|debug|info|warn|error|fatal (default trace)\n"
+        // Percent signs are doubled: this whole block is a printf format string.
+        "  --pattern <pattern>          line layout for every sink, spdlog style. Default is\n"
+        "                               \"<time> [LEVEL] [pid:tag] [file:line] <message>\".\n"
+        "                               e.g. --pattern \"%%T.%%e [%%P:%%k] %%^%%-5l%%$ %%v\"\n"
         "  --queue-size <n>             entry ring capacity, must match producers (default 65536)\n"
         "  --string-buffer-size <n>     string ring capacity, must match producers (default 16777216)\n"
         "  --stall-timeout-ms <n>       abandon an unpublished slot after this long, 0 disables\n"
@@ -58,6 +62,7 @@ int usage() {
 int main(int argc, char** argv) {
     std::string name;
     std::string level = "trace";
+    std::string pattern;
     std::string file_path;
     std::string rotating_path;
     std::string daily_path;
@@ -89,6 +94,8 @@ int main(int argc, char** argv) {
             daily_path = argv[++i];
         } else if (arg == "--level") {
             level = argv[++i];
+        } else if (arg == "--pattern") {
+            pattern = argv[++i];
         } else if (arg == "--max-size") {
             max_size = static_cast<size_t>(std::atoll(argv[++i]));
         } else if (arg == "--max-files") {
@@ -124,12 +131,25 @@ int main(int argc, char** argv) {
     config.log_queue_size = queue_size;
     config.string_buffer_size = string_buffer_size;
     config.stalled_entry_timeout_ms = stall_timeout_ms;
+    config.pattern = pattern;
 
     try {
         config.min_level = slick::logger::to_log_level(level);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "invalid --level '%s': %s\n", level.c_str(), e.what());
         return 2;
+    }
+
+    // Rejected here rather than inside init(), so a typo fails before any sink is
+    // opened and the message names the flag the user actually typed.
+    if (!pattern.empty()) {
+        try {
+            slick::logger::PatternFormatter validate{pattern};
+            (void)validate;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "invalid --pattern '%s': %s\n", pattern.c_str(), e.what());
+            return 2;
+        }
     }
 
     try {

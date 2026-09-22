@@ -310,3 +310,111 @@ TEST_F(TimestampTest, SharedFormatterIsSafeAcrossThreads) {
     }
     EXPECT_EQ(mismatches.load(), 0);
 }
+
+// append_timestamp() is the form every log line goes through, so it must append
+// to whatever the sink's buffer already holds rather than assign over it, and
+// produce exactly what format_timestamp() returns for the same timestamp. A line
+// that rendered its timestamp differently depending on which one it called would
+// be a difference nothing else in the header can see.
+TEST_F(TimestampTest, AppendTimestampAppendsExactlyWhatFormatTimestampReturns) {
+    const uint64_t test_timestamp = 1693038674123456789ULL;
+
+    const TimestampFormatter formatters[] = {
+        TimestampFormatter(TimestampFormatter::Format::DEFAULT),
+        TimestampFormatter(TimestampFormatter::Format::WITH_MICROSECONDS),
+        TimestampFormatter(TimestampFormatter::Format::WITH_MILLISECONDS),
+        TimestampFormatter(TimestampFormatter::Format::ISO8601),
+        TimestampFormatter(TimestampFormatter::Format::TIME_ONLY),
+        TimestampFormatter("%Y%m%d_%H%M%S"),
+    };
+
+    for (const TimestampFormatter& fmt : formatters) {
+        const std::string expected = fmt.format_timestamp(test_timestamp);
+
+        std::string out = "prefix ";
+        fmt.append_timestamp(out, test_timestamp);
+        EXPECT_EQ(out, "prefix " + expected);
+
+        // Appending twice must not reuse or overwrite the first result.
+        fmt.append_timestamp(out, test_timestamp);
+        EXPECT_EQ(out, "prefix " + expected + expected);
+
+        // max_length() backs the one reserve() a log line makes, so it has to
+        // cover what append_timestamp() actually writes.
+        EXPECT_GE(fmt.max_length(), expected.size());
+    }
+}
+
+// A CUSTOM format is split at every %f once, when it is set, so the render path
+// never parses the format string again. These pin what that split has to preserve.
+TEST_F(TimestampTest, CustomFormatMicrosecondsAreUnpadded) {
+    // %f in a CUSTOM format means "microseconds, no leading zeros" - unlike the
+    // %f pattern flag, which is zero-padded to six digits.
+    struct Case { uint64_t sub_ns; const char* micros; };
+    const Case cases[] = {
+        {0ULL,         "0"},
+        {1000ULL,      "1"},
+        {9000ULL,      "9"},
+        {123000ULL,    "123"},
+        {123456000ULL, "123456"},
+        {999999000ULL, "999999"},
+    };
+
+    const uint64_t whole_second = 1693038674ULL * 1000000000ULL;
+    const TimestampFormatter fmt("%H:%M:%S.%f");
+    for (const auto& c : cases) {
+        const std::string result = fmt.format_timestamp(whole_second + c.sub_ns);
+        ASSERT_NE(result.find('.'), std::string::npos) << "sub_ns=" << c.sub_ns;
+        EXPECT_EQ(result.substr(result.find('.') + 1), c.micros) << "sub_ns=" << c.sub_ns;
+    }
+}
+
+TEST_F(TimestampTest, CustomFormatRendersEveryMicrosecondFlag) {
+    const uint64_t ts = 1693038674ULL * 1000000000ULL + 123456000ULL;
+
+    EXPECT_EQ(TimestampFormatter("%f").format_timestamp(ts), "123456");
+    EXPECT_EQ(TimestampFormatter("[%f]").format_timestamp(ts), "[123456]");
+    // More than one: rewriting the format string per line replaced only the
+    // first, leaving the rest to reach strftime as an unknown conversion.
+    EXPECT_EQ(TimestampFormatter("%f-%f").format_timestamp(ts), "123456-123456");
+    EXPECT_EQ(TimestampFormatter("<%f><%f><%f>").format_timestamp(ts),
+              "<123456><123456><123456>");
+}
+
+TEST_F(TimestampTest, CustomFormatEscapedPercentIsNotTheMicrosecondFlag) {
+    const uint64_t ts = 1693038674ULL * 1000000000ULL + 123456000ULL;
+
+    // "%%" is a literal percent, so the 'f' that follows one is a literal 'f'.
+    EXPECT_EQ(TimestampFormatter("100%%f").format_timestamp(ts), "100%f");
+    // And a real flag right after an escaped percent is still a flag.
+    EXPECT_EQ(TimestampFormatter("%%%f").format_timestamp(ts), "%123456");
+}
+
+TEST_F(TimestampTest, CustomFormatIsRenderedWhateverItsLength) {
+    const uint64_t ts = 1693038674ULL * 1000000000ULL + 123456000ULL;
+
+    // Rendering expands through a stack buffer, and strftime() cannot say whether
+    // a 0 return means "empty" or "did not fit", so a format that overruns the
+    // buffer has to come out whole rather than empty. The sizes here straddle the
+    // stack buffer and every step the growing path takes past it: 4096 and 5000
+    // are the ones a single fixed-size fallback used to drop on the floor.
+    for (const size_t length : {size_t{600}, size_t{4095}, size_t{4096}, size_t{5000},
+                                size_t{20000}}) {
+        const std::string filler(length, 'x');
+        EXPECT_EQ(TimestampFormatter(filler + " %f").format_timestamp(ts), filler + " 123456")
+            << "length=" << length;
+    }
+
+    // The growing path has to expand real conversions too, not only literal text.
+    const std::string filler(5000, 'y');
+    const std::string rendered = TimestampFormatter(filler + " %H:%M:%S").format_timestamp(ts);
+    ASSERT_EQ(rendered.size(), filler.size() + 1 + 8) << rendered.size();
+    EXPECT_EQ(rendered.substr(0, filler.size()), filler);
+    EXPECT_TRUE(std::regex_match(rendered.substr(filler.size() + 1),
+                                 std::regex(R"(\d{2}:\d{2}:\d{2})")))
+        << rendered.substr(filler.size() + 1);
+
+    // An empty CUSTOM format means the default layout, not an empty timestamp.
+    EXPECT_EQ(TimestampFormatter(std::string{}).format_timestamp(ts),
+              TimestampFormatter(TimestampFormatter::Format::DEFAULT).format_timestamp(ts));
+}

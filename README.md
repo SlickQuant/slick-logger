@@ -16,8 +16,9 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 - **Multi-Sink Architecture**: Log to multiple destinations simultaneously (console, files, custom sinks)
 - **Log Rotation**: Size-based and time-based rotation with configurable retention
 - **Colored Console Output**: ANSI color support with configurable error routing
+- **Customizable Log Pattern**: spdlog-style `set_pattern()` controls the whole line — field order, widths, column alignment, and which span gets colored — globally or per sink
 - **Source Locations by Default**: `LOG_*` macros include the call-site file and line, with runtime controls for basename vs full path
-- **Runtime Configuration**: Configure sinks, queue sizes, log level, source-location output, and timestamp formats
+- **Runtime Configuration**: Configure sinks, queue sizes, log level, source-location output, line patterns, and timestamp formats
 - **Macro Fast Path**: Disabled log levels skip argument evaluation before queueing, globally and per sink
 - **Direct Sink Logging**: Route messages to a named sink or a sink reference when a message should not be broadcast
 - **Binary Payloads**: Log raw bytes and write them to a file verbatim with `BinarySink`, encoding entirely under your control
@@ -621,7 +622,140 @@ A custom sink's `flush()` is only ever called on the writer thread, so it does n
 
 An idle writer thread parks rather than polling on a timer, so an entry logged into an otherwise idle logger reaches its sink in tens of microseconds instead of waiting out a scheduler tick. Producers only signal a wake-up when the writer is actually parked, so this costs an atomic load and a predictable branch on the logging path. In `QueueMode::SharedCollector` the collector polls instead, because a producer in another process cannot signal it.
 
+### Log Pattern Formatting
+
+By default a line looks like this, and every field is fixed:
+
+```
+2026-09-19 14:02:11.481320 [INFO] [103836:app1] [main.cpp:81] work item 1 of 4
+ └ timestamp                └ level  └ pid:tag    └ source      └ message
+```
+
+`set_pattern()` replaces that layout with one of your own, using the same flags as spdlog:
+
+```cpp
+using namespace slick::logger;
+
+// Every sink, including sinks added later
+Logger::instance().set_pattern("%T.%e %^%-5l%$ %-20@ %v");
+
+// 14:02:11.481 INFO  main.cpp:81          work item 1 of 4
+// 14:02:11.482 WARN  net/client.cpp:204   retrying
+// 14:02:11.483 ERROR db.cpp:7             connection lost
+```
+
+Or per sink, which overrides the logger-wide default for that sink only:
+
+```cpp
+Logger::instance().add_file_sink("audit.log", "audit");
+Logger::instance().get_sink("audit")->set_pattern("%Y-%m-%dT%H:%M:%SZ|%l|%v");
+```
+
+It can also be set from `LogConfig`:
+
+```cpp
+LogConfig config;
+config.sinks.push_back(std::make_shared<FileSink>("app.log"));
+config.pattern = "%T.%e [%L] %v";
+Logger::instance().init(config);
+```
+
+#### Flags
+
+| Flag | Renders | Example |
+| --- | --- | --- |
+| `%v` | The formatted message | `work item 1 of 4` |
+| `%l` / `%L` | Level name / single letter | `INFO` / `I` |
+| `%t` | Producing thread id | `31488` |
+| `%P` | Producing process id | `103836` |
+| `%k` | Producer tag (slick extension) | `app1` |
+| `%n` | Sink name | `audit` |
+| `%s` / `%#` / `%@` | Source basename / line / `basename:line` | `main.cpp` / `81` / `main.cpp:81` |
+| `%Y` `%y` `%m` `%d` | Year (4 / 2 digit), month, day | `2026` `26` `09` `19` |
+| `%H` `%I` `%M` `%S` `%p` | Hour (24 / 12), minute, second, AM-PM | `14` `02` `02` `11` `PM` |
+| `%e` `%f` `%F` | Milli-, micro-, nanoseconds, zero padded | `481` `481320` `481320700` |
+| `%T` `%D` `%c` | `HH:MM:SS`, `MM/DD/YY`, `Www Mmm DD HH:MM:SS YYYY` | `14:02:11` `09/19/26` |
+| `%a` `%A` `%b` `%B` | Weekday and month names | `Sat` `Saturday` `Sep` `September` |
+| `%E` | Seconds since the epoch | `1789221731` |
+| `%^` `%$` | Begin / end the colored span (console only) | |
+| `%%` | A literal `%` | |
+| `%+` | The built-in layout above, byte for byte | |
+| `%q` | The sink's configured `TimestampFormatter` (slick extension) | |
+
+#### Width and alignment
+
+A flag takes an optional minimum width, and a leading `-` left-aligns it. This is what makes columns line up:
+
+```cpp
+Logger::instance().set_pattern("%-5l %-24@ %v");
+```
+
+A field wider than its width is never truncated, and widths are capped at 64. A width on `%%` is rejected — `%-5%` is far more likely a mistyped flag letter than a deliberately padded percent sign.
+
+#### Coloring part of a line
+
+Without `%^`, a color-enabled `ConsoleSink` colors the whole line, as it always has. With `%^`/`%$` it colors only the span between them:
+
+```cpp
+Logger::instance().set_pattern("%T.%e %^%-5l%$ %v");   // only the level is colored
+```
+
+The markers are inert on non-console sinks, so the same pattern can be shared between a console sink and a file sink without leaking escape codes into the file.
+
+A `%^` with no matching `%$` colors through to the end of the line and is closed there. spdlog leaves it open, which tints everything the terminal prints afterwards; slick-logger closes it, since "color from here on" can only sensibly mean "for the rest of this line".
+
+#### Notes
+
+- An unknown or unsupported flag throws `std::invalid_argument` from `set_pattern()`, naming the flag, and the sink keeps the layout it already had. Nothing renders as silently empty.
+- `%!` (function name), `%g` (full source path), and the elapsed-time flags `%o %i %u %O` are not supported — slick-logger does not capture that data.
+- `%n` maps to the **sink** name: slick-logger has one logger, not a registry of named loggers.
+- `%t` needs `SLICK_LOGGER_ENABLE_THREAD_ID`, which is on by default. See [Thread Id Capture](#thread-id-capture).
+- An empty pattern means "use the built-in layout", not "emit an empty line".
+- `set_pattern()` is safe to call while logging is in flight, but not concurrently with itself — it is a configuration call.
+- `ISink::pattern()` reports the layout actually in force on that sink, which is not always the string last passed to it: once `set_pattern("")` has cleared a per-sink override, it reads back the logger-wide pattern the sink has fallen back to. `Logger::pattern()` reports the logger-wide default itself, and is empty when there is none.
+
+#### Performance
+
+A pattern is parsed exactly once, inside `set_pattern()`, into a flat list of ops. Rendering walks that list on the writer thread and appends into a buffer the sink reuses, so a line costs no parsing and no allocation beyond the message itself. Date and time flags slice the broken-down time that is computed once per whole second and cached, and the weekday/month names come from static tables — there is no `strftime`, no `put_time` and no locale anywhere on this path. Runs of adjacent date/time flags are fused at compile time, so `%Y-%m-%d %H:%M:%S` becomes a single `memcpy` rather than twelve appends.
+
+Measured on Windows/MSVC `/O2`, minimum of many runs, rendering one line (no I/O):
+
+| Line layout | ns/line | vs 1.3.0 |
+| --- | --- | --- |
+| Built-in layout, 1.3.0 | 291 | — |
+| Built-in layout, now | 155 | **-47%** |
+| `%+` | 161 | -45% |
+| `%q\|%v` | 101 | -65% |
+| `%Y-%m-%d %H:%M:%S.%f [%l] [%s:%#] %v` | 243 | -16% |
+| `%T.%e %^%-5l%$ %-20@ %v` | 262 | -10% |
+| `[%l] %v` | 106 | -63% |
+
+The built-in layout got faster because the shared renderer builds the line in place: the timestamp and the level no longer become strings of their own, and the line is assembled straight into the sink's reusable buffer instead of a fresh `std::string` returned by value. A spelled-out pattern costs more than the built-in path — the per-op dispatch and, for aligned fields, the padding — but every layout above renders well ahead of what 1.3.0 shipped. On the producing thread the `LOG_*` call itself measured 96.6 → 97.8 ns, the cost of stamping the thread id.
+
+A pattern also pays only for the fields it actually renders:
+
+- **The message.** A pattern that renders neither the message nor a level skips the `std::format` pass altogether, which is the dominant cost of a line with arguments. On an entry with two arguments, `%T|%@` renders in **94 ns** against **705 ns** for `%T|%@|%l` — adding a level flag brings the message pass back, because a message that fails to format is reported at `ERROR` and that is only known by attempting it.
+- **The broken-down time.** Only a calendar field (`%Y`, `%H`, `%T`, `%c`, `%a` …) needs one. `%e`, `%f`, `%F` and `%E` are arithmetic on the entry's own timestamp, so a pattern built from those alone never consults the per-second cache at all.
+
+Width costs something either way, but right alignment costs more: `%-8l` appends its padding after a field that is already at the end of the line, while `%8l` has to put the padding in front of it. Measured at roughly 20ns per right-aligned field. Prefer left alignment where the column order allows it.
+
+`%q` delegates to the sink's `TimestampFormatter`, which appends its predefined formats straight into the same buffer — the row above shows what that costs. The exception is `Format::CUSTOM`, which carries the `strftime` cost described below; spell the date out with pattern flags instead of using a custom format string on a hot path.
+
+### Thread Id Capture
+
+`%t` renders the id of the thread that made the `LOG_*` call, not the writer thread that formatted it. The id is the real OS thread id — what a debugger, `top -H` or ETW shows — resolved once per thread and stamped into each entry with a single thread-local read.
+
+This adds a `uint32_t` to `LogEntry`. Because that struct is what shared-memory producers and collectors agree on, **all processes sharing a segment must be built with the same setting**; a mismatch is detected at attach time and reported, not silently mis-read. To restore the pre-1.4.0 layout byte for byte, at the cost of `%t`:
+
+```bash
+cmake -S . -B build -DSLICK_LOGGER_ENABLE_THREAD_ID=OFF
+```
+
+With the feature compiled out, `set_pattern("%t")` throws and names the option.
+
 ### Timestamp Formatting
+
+The pattern flags above cover date and time directly, so most users will not need this. `TimestampFormatter` remains the way to change the timestamp used by the **built-in layout** (and by `%+` and `%q`).
 
 Every built-in sink supports the default microsecond timestamp format, a predefined timestamp format enum, or a custom `strftime`-style format string:
 
@@ -647,7 +781,11 @@ Available predefined formats:
 
 The predefined formats are rendered by writing digits straight into a stack buffer, on top of a broken-down time that is computed once per whole second and cached. A burst of entries within the same second therefore costs no `localtime` call at all. The cache is `thread_local`, so a `TimestampFormatter` may be shared between threads, and every sink on the writer thread shares one `localtime` call per second.
 
-`Format::CUSTOM` is the exception: an arbitrary `strftime` pattern still goes through `std::put_time`, which measures more than an order of magnitude slower per entry than the predefined formats. Prefer a predefined format on a hot logging path.
+`format_timestamp()` returns a `std::string`; `append_timestamp(out, timestamp_ns)` appends to a string you already own, which is what the log line itself uses so that no timestamp allocates. `max_length()` gives the bound to `reserve()` for.
+
+`Format::CUSTOM` takes any `strftime` format string, plus one extension: `%f` expands to the microseconds within the second, with no leading zeros. A timestamp at 45.001200 seconds renders `%S.%f` as `45.1200`, not `45.001200` — reach for the zero-padded `%f` **pattern** flag above when you need six digits. Every `%f` in the format is expanded, and `%%f` is a literal `%f`. The format is split at those flags once, when it is set, so rendering parses nothing and allocates nothing.
+
+`strftime` itself is the floor, and it is why `Format::CUSTOM` still measures more than an order of magnitude slower per entry than the predefined formats. Measured on Windows/MSVC `/O2`, minimum of many runs, appending one timestamp to a buffer already sized for it: **25 ns** for `WITH_MICROSECONDS` against **590 ns** for `"%Y-%m-%d %H:%M:%S.%f"`. Prefer a predefined format, or the pattern flags above, on a hot logging path.
 
 ### Sharing the Logger Across Shared Libraries (Plugin / Strategy Pattern)
 
@@ -1018,11 +1156,13 @@ become other processes and the writer thread lives in the collector. See
 
 For optimal performance, the logger defers string formatting to the background thread:
 
-1. **Caller Thread**: Captures the format pointer, source location, and owned copies of any dynamic string data
+1. **Caller Thread**: Captures the format pointer, source location, thread id, and owned copies of any dynamic string data
 2. **Lock-Free Queue**: Stores a compact `LogEntry` in the ring buffer with minimal caller-side work
-3. **Writer Thread**: Formats the message and writes it to all matching sinks
+3. **Writer Thread**: Formats the message *and the line layout*, then writes to all matching sinks
 
 This approach moves potentially expensive formatting and I/O operations off the critical path, making logging calls extremely fast and suitable for high-frequency logging scenarios.
+
+Line patterns follow the same principle: `set_pattern()` parses the pattern once, at configuration time, into a flat list of ops. The caller thread never sees it, and the writer thread renders it by walking that list into a buffer each sink reuses — no parsing and, in steady state, no allocation per line. See [Log Pattern Formatting](#log-pattern-formatting).
 
 ### Multi-Sink Benefits
 
@@ -1082,6 +1222,35 @@ Logger::instance().add_sink(std::make_shared<JsonSink>("app.json"));
 ```
 
 A sink that writes to a file can inherit `FileSinkBase` instead, which supplies the stream, its buffer, directory creation, and `flush()`. That is what `FileSink` and `BinarySink` are built on.
+
+### Rendering a whole line from a custom sink
+
+`format_log_message()` gives you just the message body. If you want the full line — timestamp, level, source location, and whatever pattern the user configured — call the protected `format_log_entry()` instead. It is the same code `ConsoleSink` and `FileSink` use, so a custom sink honors `set_pattern()` for free:
+
+```cpp
+class SyslogSink : public slick::logger::ISink {
+public:
+    void write(const slick::logger::LogEntry& entry) override {
+        // Renders through this sink's pattern, or the built-in layout if none is set
+        std::string_view line = format_log_entry(entry);
+        ::syslog(LOG_INFO, "%.*s", static_cast<int>(line.size()), line.data());
+    }
+    void flush() override {}
+};
+```
+
+Two things to know:
+
+- The returned `std::string_view` points into a buffer the sink reuses, and is only valid until the next `format_log_entry()` call on that sink. Reusing the buffer is what keeps the line assembly allocation-free — copy the view if you need to keep it.
+- Pass the optional colour arguments only if your sink writes to a terminal. Omitting them means `%^`/`%$` render as nothing, so a pattern shared with a console sink will not leak escape codes into your output. The first argument is a *function* from level to escape sequence rather than a ready-made string, because an entry whose message cannot be formatted is reported at `ERROR`, and that is only known once rendering has begun:
+
+```cpp
+void write(const slick::logger::LogEntry& entry) override {
+    std::string_view line = format_log_entry(entry, &my_color_for, "\033[0m");
+    ...
+}
+static std::string_view my_color_for(slick::logger::LogLevel level) noexcept { ... }
+```
 
 ## Examples
 

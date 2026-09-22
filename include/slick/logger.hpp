@@ -36,6 +36,7 @@
 #include <thread>
 #include <atomic>
 #include <filesystem>
+#include <cassert>
 #include <memory>
 #include <functional>
 #include <iostream>
@@ -47,6 +48,7 @@
 #include <format>
 #include <utility>
 #include <vector>
+#include <deque>
 #include <span>
 #include <ranges>
 #include <string_view>
@@ -64,6 +66,28 @@
 #include <process.h>
 #else
 #include <unistd.h>
+#endif
+
+// Capture the producing thread id in every entry, for the %t pattern flag.
+// Turning this off restores the pre-1.4.0 LogEntry layout byte for byte, for
+// builds that must stay attach-compatible with existing shared-memory peers.
+#ifndef SLICK_LOGGER_ENABLE_THREAD_ID
+#define SLICK_LOGGER_ENABLE_THREAD_ID 1
+#endif
+
+#if SLICK_LOGGER_ENABLE_THREAD_ID
+// The real OS thread id is what a debugger, `top -H` and ETW show, so it is worth
+// a little platform code rather than hashing std::thread::id. GetCurrentThreadId
+// is declared here rather than by including <windows.h>, which this header
+// deliberately keeps out of every translation unit that logs. The declaration is
+// identical to the SDK's, so including <windows.h> either side of this is fine.
+#  if defined(_WIN32)
+extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
+#  elif defined(__linux__)
+#    include <sys/syscall.h>
+#  elif defined(__APPLE__)
+#    include <pthread.h>
+#  endif
 #endif
 
 #define SLICK_LOGGER_VERSION_MAJOR 1
@@ -134,6 +158,69 @@ inline void write_6_digits(char* out, uint32_t value) noexcept {
 }
 
 /**
+ * @brief Write a value in [0, 999] as three ASCII digits.
+ */
+inline void write_3_digits(char* out, uint32_t value) noexcept {
+    out[0] = static_cast<char>('0' + value / 100);
+    write_2_digits(out + 1, value % 100);
+}
+
+/**
+ * @brief Write nanoseconds in [0, 999999999] as nine ASCII digits.
+ */
+inline void write_9_digits(char* out, uint32_t value) noexcept {
+    out[0] = static_cast<char>('0' + value / 100000000);
+    write_2_digits(out + 1, (value / 1000000) % 100);
+    write_2_digits(out + 3, (value / 10000) % 100);
+    write_2_digits(out + 5, (value / 100) % 100);
+    write_2_digits(out + 7, value % 100);
+}
+
+/**
+ * @brief Append a value in decimal, without an intermediate std::string
+ *
+ * std::to_string() would allocate for anything past the small-string buffer and
+ * then copy; this writes the digits straight into the caller's buffer.
+ */
+inline void append_uint(std::string& out, uint64_t value) {
+    char buf[20];
+    char* const end = buf + sizeof(buf);
+    char* p = end;
+    do {
+        *--p = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    } while (value != 0);
+    out.append(p, static_cast<size_t>(end - p));
+}
+
+// Day and month names for the %a/%A/%b/%B pattern flags. Static ASCII tables
+// rather than strftime: the C locale spellings are the only ones a log file
+// should carry, and a table lookup keeps these flags as cheap as the rest.
+inline const char* weekday_short(int wday) noexcept {
+    static constexpr const char* kNames[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    return (wday >= 0 && wday < 7) ? kNames[wday] : "???";
+}
+
+inline const char* weekday_long(int wday) noexcept {
+    static constexpr const char* kNames[7] = {"Sunday", "Monday", "Tuesday", "Wednesday",
+                                              "Thursday", "Friday", "Saturday"};
+    return (wday >= 0 && wday < 7) ? kNames[wday] : "???";
+}
+
+inline const char* month_short(int mon) noexcept {
+    static constexpr const char* kNames[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    return (mon >= 0 && mon < 12) ? kNames[mon] : "???";
+}
+
+inline const char* month_long(int mon) noexcept {
+    static constexpr const char* kNames[12] = {"January", "February", "March", "April",
+                                               "May", "June", "July", "August",
+                                               "September", "October", "November", "December"};
+    return (mon >= 0 && mon < 12) ? kNames[mon] : "???";
+}
+
+/**
  * @brief Length of the "YYYY-MM-DD HH:MM:SS" prefix cached per whole second.
  */
 inline constexpr size_t kDateTimeLen = 19;
@@ -191,6 +278,68 @@ inline const second_cache* cached_second(int64_t seconds) noexcept {
     return &cache;
 }
 
+#if SLICK_LOGGER_ENABLE_THREAD_ID
+/**
+ * @brief This thread's OS thread id, resolved once per thread
+ *
+ * Stamped into every entry on the producing thread, so it costs one TLS read on
+ * the logging path and nothing else.
+ */
+inline uint32_t current_thread_id() noexcept {
+    thread_local const uint32_t id = []() noexcept -> uint32_t {
+    #if defined(_WIN32)
+        return static_cast<uint32_t>(::GetCurrentThreadId());
+    #elif defined(__linux__)
+        return static_cast<uint32_t>(::syscall(SYS_gettid));
+    #elif defined(__APPLE__)
+        uint64_t tid = 0;
+        ::pthread_threadid_np(nullptr, &tid);
+        return static_cast<uint32_t>(tid);
+    #else
+        // No portable OS thread id: a hash is still stable and unique among live
+        // threads, it just will not match what a debugger shows.
+        return static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    #endif
+    }();
+    return id;
+}
+#endif
+
+/**
+ * @brief This process's id, resolved once
+ *
+ * Local-mode entries carry pid 0, so the %P pattern flag falls back to this to
+ * print something meaningful rather than a bare zero.
+ */
+inline uint32_t current_process_id() noexcept {
+    static const uint32_t id = []() noexcept -> uint32_t {
+    #if defined(_WIN32)
+        return static_cast<uint32_t>(::_getpid());
+    #else
+        return static_cast<uint32_t>(::getpid());
+    #endif
+    }();
+    return id;
+}
+
+/**
+ * @brief The broken-down time to render when localtime() fails
+ *
+ * TimestampFormatter falls back to "1970-01-01 00:00:00.000000" rather than
+ * dropping the timestamp, so pattern date flags use the same placeholder. One
+ * line reporting two different stories - a 1970 date from %q next to an empty
+ * %Y - would be worse than either on its own.
+ */
+inline const second_cache& epoch_fallback_cache() noexcept {
+    static const second_cache fallback = []() noexcept {
+        second_cache cache;
+        std::memcpy(cache.date_time, "1970-01-01 00:00:00", kDateTimeLen);
+        cache.seconds = 0;
+        return cache;
+    }();
+    return fallback;
+}
+
 /// Traits of every ring the logger owns. read_last is dead weight for a log
 /// queue, so it stays off. Declared here rather than inside Logger so a test
 /// can name the exact traits when it attaches to a segment, without the type
@@ -228,6 +377,22 @@ inline constexpr const char* to_string(LogLevel level) noexcept {
     }
 }
 
+/**
+ * @brief One-character level name, for the %L pattern flag
+ */
+inline constexpr const char* to_short_string(LogLevel level) noexcept {
+    switch (level) {
+        case LogLevel::L_TRACE: return "T";
+        case LogLevel::L_DEBUG: return "D";
+        case LogLevel::L_INFO:  return "I";
+        case LogLevel::L_WARN:  return "W";
+        case LogLevel::L_ERROR: return "E";
+        case LogLevel::L_FATAL: return "F";
+        case LogLevel::L_OFF:   return "O";
+        default:              return "?";
+    }
+}
+
 inline LogLevel to_log_level(std::string_view level_str) {
     if (level_str == "TRACE" || level_str == "trace") return LogLevel::L_TRACE;
     if (level_str == "DEBUG" || level_str == "debug") return LogLevel::L_DEBUG;
@@ -255,10 +420,19 @@ public:
 
     TimestampFormatter(Format fmt = Format::WITH_MICROSECONDS) : format_(fmt) {}
     
-    TimestampFormatter(const std::string& custom_format) 
-        : format_(Format::CUSTOM), custom_format_(custom_format) {}
+    TimestampFormatter(const std::string& custom_format)
+        : format_(Format::CUSTOM), custom_format_(custom_format),
+          custom_segments_(split_custom_format(custom_format)) {}
 
-    std::string format_timestamp(uint64_t timestamp_ns) const {
+    /**
+     * @brief Append the timestamp to @p out
+     *
+     * The form every log line goes through: a sink renders into a buffer it
+     * reuses across entries, so appending here is what keeps a steady-state line
+     * free of allocations. format_timestamp() is this plus a string to put the
+     * result in.
+     */
+    void append_timestamp(std::string& out, uint64_t timestamp_ns) const {
         using namespace detail;
 
         // Whole seconds select the cached "YYYY-MM-DD HH:MM:SS" prefix; only the
@@ -268,27 +442,31 @@ public:
 
         const second_cache* cache = cached_second(seconds);
         if (!cache) [[unlikely]] {
-            return "1970-01-01 00:00:00.000000"; // fallback timestamp
+            out += "1970-01-01 00:00:00.000000"; // fallback timestamp
+            return;
         }
 
         // Longest output is ISO8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ" (27 chars).
         char buf[32];
         switch (format_) {
         case Format::DEFAULT:
-            return std::string(cache->date_time, kDateTimeLen);
+            out.append(cache->date_time, kDateTimeLen);
+            return;
 
         case Format::WITH_MICROSECONDS:
             std::memcpy(buf, cache->date_time, kDateTimeLen);
             buf[19] = '.';
             write_6_digits(buf + 20, us);
-            return std::string(buf, 26);
+            out.append(buf, 26);
+            return;
 
         case Format::WITH_MILLISECONDS:
             std::memcpy(buf, cache->date_time, kDateTimeLen);
             buf[19] = '.';
             write_2_digits(buf + 20, us / 10000);
             buf[22] = static_cast<char>('0' + (us / 1000) % 10);
-            return std::string(buf, 23);
+            out.append(buf, 23);
+            return;
 
         case Format::ISO8601:
             std::memcpy(buf, cache->date_time, kDateTimeLen);
@@ -296,33 +474,157 @@ public:
             buf[19] = '.';
             write_6_digits(buf + 20, us);
             buf[26] = 'Z';
-            return std::string(buf, 27);
+            out.append(buf, 27);
+            return;
 
         case Format::TIME_ONLY:
             std::memcpy(buf, cache->date_time + kTimeOffset, kTimeLen);
             buf[8] = '.';
             write_6_digits(buf + 9, us);
-            return std::string(buf, 15);
+            out.append(buf, 15);
+            return;
 
         case Format::CUSTOM:
-            if (!custom_format_.empty()) {
-                // %f placeholder uses unpadded microseconds, as today
-                std::ostringstream oss;
-                std::string format = custom_format_;
-                size_t pos = format.find("%f");
-                if (pos != std::string::npos)
-                    format.replace(pos, 2, std::to_string(us));
-                oss << std::put_time(&cache->tm, format.c_str());
-                return oss.str();
+            if (!custom_segments_.empty()) {
+                append_custom(out, cache->tm, us);
+                return;
             }
-            return std::string(cache->date_time, kDateTimeLen);
+            out.append(cache->date_time, kDateTimeLen);
+            return;
         }
-        return {};
+    }
+
+    /// The allocating form, for a caller that wants a string of its own.
+    std::string format_timestamp(uint64_t timestamp_ns) const {
+        std::string out;
+        append_timestamp(out, timestamp_ns);
+        return out;
+    }
+
+    /**
+     * @brief An upper bound on what append_timestamp() writes, for reserve()
+     *
+     * Exact for the built-in formats - ISO8601 is the longest, at 27 characters.
+     * A CUSTOM format expands through strftime, so there this is an estimate
+     * rather than a bound; reserve() takes a hint, not a promise.
+     */
+    size_t max_length() const noexcept {
+        return format_ == Format::CUSTOM ? custom_format_.size() + 32 : 27;
     }
 
 private:
+    /**
+     * @brief Render a CUSTOM format: one strftime per segment, %f between them
+     *
+     * Allocation-free in the steady state. The format was split at every %f when
+     * it was set, so nothing here parses it, and the microseconds are written
+     * unpadded - "123", not "000123" - which is what %f has always meant on this
+     * path.
+     */
+    void append_custom(std::string& out, const std::tm& tm, uint32_t us) const {
+        bool first = true;
+        for (const std::string& segment : custom_segments_) {
+            if (!first) {
+                detail::append_uint(out, us);
+            }
+            first = false;
+            append_strftime(out, segment, tm);
+        }
+    }
+
+    /**
+     * @brief Append one strftime() expansion, through a stack buffer
+     *
+     * strftime() reports "did not fit" and "expanded to nothing" the same way,
+     * with a 0 return, which is the whole difficulty here: a zero cannot simply be
+     * taken for empty, or a format too long for the buffer would render as nothing
+     * at all. The fast path is one call into a stack buffer; anything that does not
+     * fit there goes to grow_strftime(), which settles the ambiguity properly.
+     */
+    static void append_strftime(std::string& out, const std::string& format, const std::tm& tm) {
+        if (format.empty()) {
+            return;
+        }
+        // Wide enough that no realistic timestamp format reaches the growing path.
+        char buf[256];
+        if (const size_t written = std::strftime(buf, sizeof(buf), format.c_str(), &tm)) {
+            out.append(buf, written);
+            return;
+        }
+        grow_strftime(out, format, tm);
+    }
+
+    /**
+     * @brief Expand a format too long for the stack buffer, doubling until it fits
+     *
+     * Reached only by a format whose expansion needs 256 bytes or more, so this is
+     * where the allocations live rather than on the per-line path.
+     *
+     * A sentinel byte in front of the format is what makes growing terminable: the
+     * expansion can no longer be empty, so a 0 return means "too small" and only
+     * that, and the buffer can be doubled until strftime() succeeds. The sentinel
+     * leads rather than trails so that it cannot be read as part of a conversion
+     * the format ends on.
+     *
+     * The cap is the guard against the one case no buffer size fixes: a format
+     * strftime() rejects outright returns 0 however much room it is given.
+     */
+    static void grow_strftime(std::string& out, const std::string& format, const std::tm& tm) {
+        // 1 MiB of expanded timestamp is a mistake in the format, not a timestamp.
+        constexpr size_t kMaxExpansion = size_t{1} << 20;
+        std::string probe;
+        probe.reserve(format.size() + 1);
+        probe += '\x01';
+        probe += format;
+
+        std::vector<char> spacious;
+        for (size_t capacity = 512; capacity <= kMaxExpansion; capacity *= 2) {
+            spacious.assign(capacity, '\0');
+            const size_t written = std::strftime(spacious.data(), capacity, probe.c_str(), &tm);
+            if (written) {
+                // written counts the sentinel, which is not part of the timestamp.
+                out.append(spacious.data() + 1, written - 1);
+                return;
+            }
+        }
+    }
+
+    /**
+     * @brief Split a CUSTOM format at every %f, once, when the format is set
+     *
+     * The microseconds belong between consecutive segments, so a format with no
+     * %f yields a single segment and never pays for one. "%%" is stepped over
+     * whole, which is why the literal percent in "%%f" is not taken for the flag.
+     * Empty for an empty format, which means "use the built-in layout".
+     */
+    static std::vector<std::string> split_custom_format(const std::string& format) {
+        std::vector<std::string> segments;
+        if (format.empty()) {
+            return segments;
+        }
+        size_t start = 0;
+        for (size_t i = 0; i + 1 < format.size(); ) {
+            if (format[i] != '%') {
+                ++i;
+            } else if (format[i + 1] == 'f') {
+                segments.push_back(format.substr(start, i - start));
+                i += 2;
+                start = i;
+            } else {
+                i += 2; // "%%", or a conversion strftime handles itself
+            }
+        }
+        segments.push_back(format.substr(start));
+        return segments;
+    }
+
     Format format_;
     std::string custom_format_;
+    // custom_format_ split at every %f, once, when it was set. Rendering walks the
+    // segments and writes the microseconds between them, which is what keeps a
+    // CUSTOM line allocation-free: the ostringstream this replaced allocated twice
+    // per line, once for a copy of the format string and once for the result.
+    std::vector<std::string> custom_segments_;
 };
 
 enum class ArgType : uint8_t {
@@ -532,6 +834,9 @@ struct LogEntry {
     uint64_t timestamp; // nanoseconds since epoch
     StringRef file{}; // Source file name captured by LOG_* macros
     uint32_t pid = 0; // Producing process id; 0 in single-process (Local) mode
+#if SLICK_LOGGER_ENABLE_THREAD_ID
+    uint32_t thread_id = 0; // Producing thread id; see detail::current_thread_id()
+#endif
     uint32_t line = 0; // Source line captured by LOG_* macros
     int sink_index = -1; // Optional sink index, logged by that sink only
     LogLevel level;
@@ -550,6 +855,231 @@ struct LogEntry {
 inline constexpr bool has_source_location(const LogEntry& entry) noexcept {
     return (entry.flags & kEntryHasSourceLocation) != 0;
 }
+
+/**
+ * @brief A log line layout, compiled once from an spdlog-style pattern string
+ *
+ * Controls the whole line, not just the timestamp: which fields appear, in what
+ * order, how wide, and which part of a console line is colored.
+ *
+ * @code
+ * sink->set_pattern("%T.%e %^%-5l%$ [%s:%#] %v");
+ * // 14:02:11.481 INFO  [main.cpp:81] work item 1 of 4
+ * @endcode
+ *
+ * The pattern is parsed exactly once, here, into a flat vector of ops. Rendering
+ * walks that vector and appends into a buffer the caller owns, so a log line
+ * costs no parsing and no allocation. Every date and time flag reads the
+ * per-second cache behind detail::cached_second(), and the weekday/month names
+ * come from static tables - there is no strftime, no put_time, no ostringstream
+ * and no locale anywhere on this path.
+ *
+ * Supported flags:
+ *
+ * | Flag        | Renders                                                     |
+ * |-------------|-------------------------------------------------------------|
+ * | `%v`        | the formatted message                                        |
+ * | `%l` / `%L` | level name / single-letter level                             |
+ * | `%t`        | producing thread id (needs SLICK_LOGGER_ENABLE_THREAD_ID)     |
+ * | `%P`        | producing process id                                         |
+ * | `%k`        | producer tag (slick extension; empty outside shared memory)   |
+ * | `%n`        | sink name                                                    |
+ * | `%s` `%#` `%@` | source basename / line / `basename:line`                  |
+ * | `%Y` `%y` `%m` `%d` | year (4/2 digit), month, day                         |
+ * | `%H` `%I` `%M` `%S` `%p` | hour (24/12), minute, second, AM-PM              |
+ * | `%e` `%f` `%F` | milli-, micro-, nanoseconds, zero padded to 3/6/9        |
+ * | `%T` `%D` `%c` | `HH:MM:SS`, `MM/DD/YY`, `Www Mmm DD HH:MM:SS YYYY`       |
+ * | `%a` `%A` `%b` `%B` | `Mon` / `Monday` / `Jan` / `January`                 |
+ * | `%E`        | seconds since the epoch                                      |
+ * | `%^` `%$`   | begin / end the colored range (console sinks only)            |
+ * | `%%`        | a literal `%`                                                |
+ * | `%+`        | the built-in layout, byte for byte                           |
+ * | `%q`        | the sink's configured TimestampFormatter (slick extension)    |
+ *
+ * A flag may carry a minimum width and alignment, as `%-8l` (left aligned, padded
+ * to 8) or `%8l` (right aligned). A field wider than its width is never truncated.
+ *
+ * An unknown or unsupported flag throws std::invalid_argument rather than
+ * rendering as nothing, so a typo surfaces at configuration time.
+ */
+class PatternFormatter {
+public:
+    /// Largest minimum-width a flag may request.
+    static constexpr uint32_t kMaxFieldWidth = 64;
+
+    /// An empty formatter, meaning "use the built-in layout".
+    PatternFormatter() = default;
+
+    /// @throws std::invalid_argument if @p pattern contains an unknown flag
+    explicit PatternFormatter(std::string_view pattern) { compile(pattern); }
+
+    bool empty() const noexcept { return ops_.empty(); }
+    const std::string& pattern() const noexcept { return pattern_; }
+
+    /// True if the pattern delimits its own colored range with %^ / %$.
+    bool has_color_range() const noexcept { return has_color_range_; }
+
+    /**
+     * @brief True if rendering needs the formatted message
+     *
+     * False lets a caller skip the whole std::format pass for a pattern that
+     * renders neither the message nor a level - the level is only known to be
+     * ERROR once formatting the message has been attempted, so a pattern that
+     * shows a level still has to pay for it.
+     */
+    bool needs_message() const noexcept { return needs_message_; }
+
+    /**
+     * @brief Everything a pattern can render that does not live in the LogEntry
+     */
+    struct Context {
+        std::string_view message;      ///< already-formatted message body
+        /// The level the line reports, which is L_ERROR when the message could
+        /// not be formatted regardless of what the entry was logged at. Every
+        /// level-rendering flag must read this rather than LogEntry::level, so
+        /// %l and %L can never disagree about the same line.
+        LogLevel level = LogLevel::L_ERROR;
+        std::string_view level_name;   ///< text form of `level`
+        std::string_view sink_name;    ///< rendered by %n
+        const TimestampFormatter* timestamp = nullptr;  ///< backs %+ and %q
+        std::string_view color_start;  ///< empty unless the sink colors its output
+        std::string_view color_end;
+    };
+
+    /**
+     * @brief Append one rendered line to @p out
+     *
+     * Called on the writer thread only. When the sink colors its output but the
+     * pattern has no %^, the whole line is wrapped, matching the built-in layout.
+     */
+    void format(std::string& out, const LogEntry& entry, const Context& ctx) const;
+
+private:
+    enum class Flag : uint8_t {
+        // A run of date/time flags and their separators that turned out to be one
+        // contiguous slice of the cached "YYYY-MM-DD HH:MM:SS" text, fused by
+        // compile() into a single memcpy. literal_off/literal_len index that text
+        // rather than literals_.
+        kCachedSlice,
+        kLiteral, kMessage, kLevel, kLevelShort, kThreadId, kProcessId, kTag, kSinkName,
+        kSourceFile, kSourceLine, kSourceLoc,
+        kYear4, kYear2, kMonth, kDay, kHour24, kHour12, kAmPm, kMinute, kSecond,
+        kMillis, kMicros, kNanos, kTimeHMS, kDateMDY, kDateTimeFull, kEpochSeconds,
+        kWeekdayShort, kWeekdayLong, kMonthShort, kMonthLong,
+        kColorBegin, kColorEnd, kDefaultHeader, kConfiguredTimestamp
+    };
+
+    struct Op {
+        Flag flag = Flag::kLiteral;
+        bool left_align = false;
+        uint8_t width = 0;         // 0 means "natural width"
+        uint32_t literal_off = 0;  // offset into literals_, for kLiteral
+        uint32_t literal_len = 0;
+    };
+
+    void compile(std::string_view pattern);
+    /// Map a flag character to its op. @throws std::invalid_argument if unknown.
+    static Flag flag_for(char c, std::string_view pattern);
+
+    /**
+     * @brief True if @p flag renders a calendar field, and so reads the cache
+     *
+     * The one list of the flags that need a broken-down time: compile() asks it
+     * what to set needs_cache_ to, and format() hands append_op() a cache only
+     * when it says so. %e, %f, %F and %E are the time flags that answer false -
+     * they slice or divide the entry's own timestamp and never look at a tm.
+     */
+    static bool flag_needs_cache(Flag flag) noexcept;
+
+    /**
+     * @brief Fuse runs of date/time ops into single kCachedSlice copies
+     *
+     * "%Y-%m-%d %H:%M:%S" is twelve ops that between them reproduce, character
+     * for character, the nineteen bytes cached_second() already holds. Detecting
+     * that at compile time turns the commonest timestamp patterns into one
+     * memcpy, which is what keeps a spelled-out pattern as cheap as the built-in
+     * layout instead of paying a dispatch per field.
+     */
+    void fuse_cached_slices();
+    /// The slice of "YYYY-MM-DD HH:MM:SS" a flag reproduces, if it is exactly one.
+    static bool cached_slice_for(Flag flag, size_t& offset, size_t& length) noexcept;
+    /// The separator at an index of "YYYY-MM-DD HH:MM:SS", or '\0' at a digit.
+    static constexpr char cached_separator_at(size_t index) noexcept {
+        switch (index) {
+            case 4: case 7:   return '-';
+            case 10:          return ' ';
+            case 13: case 16: return ':';
+            default:          return '\0';
+        }
+    }
+    /// True if @p literal is exactly the cached text starting at @p offset.
+    static bool literal_matches_cached(std::string_view literal, size_t offset) noexcept;
+    /// Append one op's text. Width padding is applied by the caller.
+    void append_op(std::string& out, const Op& op, const LogEntry& entry,
+                   const Context& ctx, const detail::second_cache* cache,
+                   uint32_t subsecond_ns) const;
+
+    std::vector<Op> ops_;
+    std::string literals_;   // every literal run, concatenated once at compile time
+    std::string pattern_;    // kept verbatim for pattern() and diagnostics
+    bool has_color_range_ = false;
+    // Kept apart because they cost different things. A calendar field needs the
+    // per-second localtime() behind cached_second(); %e/%f/%F need one division
+    // of the entry's own timestamp. A pattern carrying only sub-second digits
+    // pays for neither the lookup nor the cache line it would touch.
+    bool needs_cache_ = false;      // %Y %y %m %d %H %I %p %M %S %T %D %c %a %A %b %B
+    bool needs_subsecond_ = false;  // %e %f %F
+    bool needs_message_ = false;  // skips the std::format pass entirely when false
+    // A %^ with no %$ after it. The escape would otherwise stay active past the
+    // end of the line and tint everything the terminal prints next.
+    bool color_left_open_ = false;
+};
+
+namespace detail {
+
+/**
+ * @brief Grow-only store of compiled patterns, shared by everything that points into one
+ *
+ * A compiled pattern reaches the writer thread as a bare pointer, and there is
+ * no safe point at which one could be reclaimed - the writer may have loaded it
+ * an instant ago - so nothing here is ever freed. What stops that from being a
+ * leak is the lookup: an identical pattern hands back the formatter already
+ * held, so a process that toggles between two layouts at runtime (debug detail
+ * on and off, say) keeps two formatters rather than one per call. The scan is
+ * linear over a handful of entries, on a configuration call.
+ *
+ * The deque is what makes the pointers safe: it never moves an element it
+ * already holds.
+ */
+class pattern_store {
+public:
+    /**
+     * @brief The formatter for @p pattern, compiling it if this is the first time
+     * @return Null for an empty pattern, which means the built-in layout
+     * @throws std::invalid_argument on an unknown flag, before anything is stored,
+     *         so a bad pattern leaves every caller on the layout it already had
+     */
+    const PatternFormatter* get(std::string_view pattern) {
+        if (pattern.empty()) {
+            return nullptr;
+        }
+        for (const PatternFormatter& owned : owned_) {
+            if (owned.pattern() == pattern) {
+                return &owned;
+            }
+        }
+        owned_.emplace_back(pattern);
+        return &owned_.back();
+    }
+
+    /// How many distinct patterns this store has compiled.
+    size_t size() const noexcept { return owned_.size(); }
+
+private:
+    std::deque<PatternFormatter> owned_;
+};
+
+} // namespace detail
 
 class Logger;
 
@@ -627,8 +1157,86 @@ public:
 
     int index() const noexcept { return index_; }
     void set_index(int idx) noexcept { index_ = idx; }
+
+    /**
+     * @brief Set this sink's line layout, overriding any logger-wide default
+     * @param pattern An spdlog-style pattern, or empty to stop overriding
+     * @throws std::invalid_argument if the pattern contains an unknown flag,
+     *         in which case the sink keeps the layout it already had
+     *
+     * Passing an empty pattern removes this sink's override rather than pinning
+     * it to the built-in layout: the sink goes back to following
+     * Logger::set_pattern(), including any default set later. On a sink with no
+     * logger-wide default that is the built-in layout, which is what an
+     * unconfigured sink uses anyway.
+     *
+     * The pattern is compiled here and published to the writer thread with a
+     * single release store, so logging never blocks on this and the writer never
+     * takes a lock to read it. Marking the sink explicitly patterned also stops a
+     * later Logger::set_pattern() from overwriting a deliberate choice.
+     *
+     * Safe to call while logging is in flight, but NOT concurrently with itself:
+     * it is a configuration call. Each call retains its compiled pattern for the
+     * life of the sink - a few hundred bytes - so a pointer the writer thread has
+     * already loaded can never dangle.
+     */
+    void set_pattern(std::string_view pattern);
+
+    /// The active pattern, or empty when the sink uses the built-in layout.
+    std::string_view pattern() const noexcept;
+
+    /// Change the timestamp rendered by the built-in layout, %+ and %q.
+    void set_timestamp_format(TimestampFormatter::Format format);
+    void set_timestamp_format(const std::string& custom_format);
+
 protected:
     std::pair<std::string, bool> format_log_message(const LogEntry& entry);
+
+    /// Maps a level to the escape sequence that opens its color. Null for a sink
+    /// that does not color its output.
+    using ColorFn = std::string_view (*)(LogLevel) noexcept;
+
+    /**
+     * @brief Render one entry into this sink's reusable buffer
+     * @param color_for Resolves the opening escape, or null for no color
+     * @param color_end Escape sequence closing it
+     * @return A view valid until the next format_log_entry() call on this sink
+     *
+     * The single implementation of a log line, shared by every text sink. Writer
+     * thread only. Reusing the buffer is what keeps a steady-state line free of
+     * allocations, so do not hold the view across calls - copy it if you must.
+     *
+     * The color is resolved from the level the line actually reports, which is
+     * why this takes a function rather than a ready-made escape: an entry whose
+     * message will not format is reported at ERROR, and that is only known once
+     * the message has been attempted, inside here.
+     */
+    std::string_view format_log_entry(const LogEntry& entry,
+                                      ColorFn color_for = nullptr,
+                                      std::string_view color_end = {});
+
+private:
+    friend class Logger;
+    /**
+     * @brief Record a new logger-wide default, already compiled
+     * @param store The logger's pattern store, kept alive for as long as this
+     *              sink might still render through @p compiled
+     * @param compiled The formatter for that default, or null for the built-in layout
+     *
+     * Takes effect unless this sink has a pattern of its own, but is remembered
+     * either way so set_pattern("") can fall back to whatever the default is at
+     * that point. The formatter arrives compiled because every sink inheriting
+     * the same default shares one, rather than each compiling the same text.
+     *
+     * noexcept, and deliberately so: Logger::set_pattern() walks every sink
+     * calling this, and a throw partway through would leave the sinks split
+     * between two layouts. Nothing here allocates - the formatter is already
+     * compiled, and the store arrives as a shared_ptr the caller copied.
+     */
+    void apply_default_pattern(std::shared_ptr<detail::pattern_store> store,
+                               const PatternFormatter* compiled) noexcept;
+    /// Publish the layout that currently wins: this sink's own, else the default.
+    void publish_active_pattern() noexcept;
 
 protected:
     std::string name_;
@@ -638,6 +1246,29 @@ protected:
     // so this stays lock-free.
     std::atomic<LogLevel> min_level_{LogLevel::L_TRACE}; // Minimum level for this sink
     bool dedicated_ = false; // Whether this sink is dedicated (logs only its own entries)
+    // Left deliberately default-constructed: TimestampFormatter's own default is
+    // Format::WITH_MICROSECONDS, which is the documented default timestamp for
+    // every sink. Do not "tidy" this into an explicit initializer.
+    TimestampFormatter timestamp_formatter_;
+    // Writer thread only; reused across entries so a steady-state line allocates
+    // nothing at all.
+    std::string format_buffer_;
+    // This sink's own patterns, from set_pattern(). Grow-only, so a pointer the
+    // writer thread already loaded stays valid even as set_pattern() publishes a
+    // replacement.
+    detail::pattern_store owned_patterns_;
+    // The logger's store, holding whatever inherited_pattern_ points at. Held by
+    // shared_ptr rather than trusted to outlive the sink: a caller can keep its
+    // own shared_ptr to a sink past Logger::reset(), or past the destruction of a
+    // Logger it installed with set_instance().
+    std::shared_ptr<detail::pattern_store> inherited_store_;
+    // The two layouts that compete, kept apart so the override is reversible:
+    // this sink's own wins while it is set, and clearing it falls back to
+    // whatever the logger-wide default is by then. Null means "not set".
+    const PatternFormatter* explicit_pattern_ = nullptr;
+    const PatternFormatter* inherited_pattern_ = nullptr;
+    // The winner of those two, which is all the writer thread reads.
+    std::atomic<const PatternFormatter*> active_pattern_{nullptr};
 };
 
 namespace detail {
@@ -674,13 +1305,11 @@ public:
     void flush() override;
 
 private:
-    std::string format_log_entry(const LogEntry& entry);
-    std::string get_color_code(LogLevel level);
-    std::string get_reset_code();
-    
+    static std::string_view get_color_code(LogLevel level) noexcept;
+    static std::string_view get_reset_code() noexcept;
+
     bool use_colors_;
     bool use_stderr_for_errors_;
-    TimestampFormatter timestamp_formatter_;
 };
 
 /**
@@ -731,11 +1360,6 @@ public:
     explicit FileSink(const std::filesystem::path& file_path, const std::string& custom_timestamp_format, std::string&& name = "");
 
     void write(const LogEntry& entry) override;
-
-protected:
-    std::string format_log_entry(const LogEntry& entry);
-
-    TimestampFormatter timestamp_formatter_;
 };
 
 class RotatingFileSink : public FileSink {
@@ -865,6 +1489,16 @@ struct LogConfig {
     /// no progress while entries are known to be reserved ahead, the collector
     /// skips the stalled slot. Zero disables the recovery.
     uint32_t stalled_entry_timeout_ms = 5000;
+
+    /// Line layout applied to every sink that has no pattern of its own.
+    /// See PatternFormatter for the flags.
+    ///
+    /// Empty means "do not change the current default", not "use the built-in
+    /// layout", so `set_pattern(p)` followed by `init(config)` keeps `p`. On a
+    /// logger that has never been given a pattern - including one just past
+    /// reset(), which clears it - that amounts to the built-in layout. To drop a
+    /// pattern without resetting, call `set_pattern("")`.
+    std::string pattern;
 };
 
 /**
@@ -1034,6 +1668,30 @@ public:
      * get_sink() round trip.
      */
     std::shared_ptr<BinarySink> add_binary_sink(const std::filesystem::path& path, std::string&& name = "");
+
+    /**
+     * @brief Set the line layout for every sink that has no pattern of its own
+     * @param pattern An spdlog-style pattern; empty restores the built-in layout
+     * @throws std::invalid_argument if the pattern contains an unknown flag,
+     *         in which case no sink is changed
+     *
+     * Applies to sinks already registered and to any added afterwards, so it can
+     * be called before or after the add_*_sink() calls. A sink configured through
+     * ISink::set_pattern() keeps its own layout and is never overwritten here.
+     *
+     * @code
+     * Logger::instance().set_pattern("%T.%e %^%-5l%$ [%s:%#] %v");
+     * @endcode
+     *
+     * See PatternFormatter for the full flag list.
+     */
+    void set_pattern(std::string_view pattern);
+
+    /// The logger-wide default pattern, or empty when none is set.
+    std::string_view pattern() const noexcept {
+        return default_pattern_ ? std::string_view{default_pattern_->pattern()}
+                                : std::string_view{};
+    }
 
     /**
      * @brief Get the sink of givent type
@@ -1357,6 +2015,15 @@ private:
     static constexpr uint8_t kSourceLocationEnabled = 0x01;
     std::atomic<uint8_t> source_location_options_{kSourceLocationEnabled};
     std::unordered_map<std::string_view, int> sinkname_index_map_;
+    /// Layout handed to sinks that have none of their own, including sinks added
+    /// after set_pattern(). Null means the built-in layout. The one compiled copy
+    /// every inheriting sink renders through, and the only record of the default:
+    /// pattern() reads its text back out of it.
+    const PatternFormatter* default_pattern_ = nullptr;
+    /// Owns the formatters default_pattern_ points at. Shared with every sink
+    /// that inherits one, so the store outlives this logger if a sink does.
+    std::shared_ptr<detail::pattern_store> pattern_store_ =
+        std::make_shared<detail::pattern_store>();
 
     // ---- Multi-process state; all inert while mode_ is Local ----
     QueueMode mode_ = QueueMode::Local;
@@ -2020,21 +2687,573 @@ inline size_t process_id_size(const LogEntry& entry) {
     return size;
 }
 
-inline ConsoleSink::ConsoleSink(bool use_colors, bool use_stderr_for_errors,
-                                TimestampFormatter::Format timestamp_format, std::string&& name)
-    : ISink(std::move(name)), use_colors_(use_colors), use_stderr_for_errors_(use_stderr_for_errors)
-    , timestamp_formatter_(timestamp_format) {
+/**
+ * @brief Append the built-in log line: "<time> [LEVEL][ [pid[:tag]]][ [file:line]] <message>"
+ *
+ * The one definition of the default layout. Both the no-pattern path and the %+
+ * flag call it, so the two cannot drift apart. The timestamp is whatever the
+ * sink is configured for, microseconds unless the caller changed it.
+ */
+inline void append_default_layout(std::string& out, const LogEntry& entry,
+                                  const TimestampFormatter& timestamp_formatter,
+                                  std::string_view level_name, std::string_view message) {
+    // Reserved before the timestamp is rendered rather than after, so the line
+    // takes at most one growth and the timestamp needs no string of its own.
+    out.reserve(out.size() + timestamp_formatter.max_length() + level_name.size()
+                + process_id_size(entry) + source_location_size(entry) + message.size() + 4);
+    timestamp_formatter.append_timestamp(out, entry.timestamp);
+    out += " [";
+    out += level_name;
+    out += ']';
+    append_process_id(out, entry);
+    append_source_location(out, entry);
+    out += ' ';
+    out += message;
 }
 
-inline ConsoleSink::ConsoleSink(const std::string& custom_timestamp_format, bool use_colors, 
+inline PatternFormatter::Flag PatternFormatter::flag_for(char c, std::string_view pattern) {
+    switch (c) {
+        case 'v': return Flag::kMessage;
+        case 'l': return Flag::kLevel;
+        case 'L': return Flag::kLevelShort;
+        case 'P': return Flag::kProcessId;
+        case 'k': return Flag::kTag;
+        case 'n': return Flag::kSinkName;
+        case 's': return Flag::kSourceFile;
+        case '#': return Flag::kSourceLine;
+        case '@': return Flag::kSourceLoc;
+        case 'Y': return Flag::kYear4;
+        case 'y': return Flag::kYear2;
+        case 'm': return Flag::kMonth;
+        case 'd': return Flag::kDay;
+        case 'H': return Flag::kHour24;
+        case 'I': return Flag::kHour12;
+        case 'p': return Flag::kAmPm;
+        case 'M': return Flag::kMinute;
+        case 'S': return Flag::kSecond;
+        case 'e': return Flag::kMillis;
+        case 'f': return Flag::kMicros;
+        case 'F': return Flag::kNanos;
+        case 'T': return Flag::kTimeHMS;
+        case 'D': return Flag::kDateMDY;
+        case 'c': return Flag::kDateTimeFull;
+        case 'E': return Flag::kEpochSeconds;
+        case 'a': return Flag::kWeekdayShort;
+        case 'A': return Flag::kWeekdayLong;
+        case 'b': return Flag::kMonthShort;
+        case 'B': return Flag::kMonthLong;
+        case '^': return Flag::kColorBegin;
+        case '$': return Flag::kColorEnd;
+        case '+': return Flag::kDefaultHeader;
+        case 'q': return Flag::kConfiguredTimestamp;
+        case 't':
+        #if SLICK_LOGGER_ENABLE_THREAD_ID
+            return Flag::kThreadId;
+        #else
+            throw std::invalid_argument(
+                "slick-logger: pattern flag '%t' needs SLICK_LOGGER_ENABLE_THREAD_ID, which "
+                "this build switched off, so entries carry no thread id. Pattern: "
+                + std::string(pattern));
+        #endif
+
+        // spdlog flags this logger has no data for. Named apart from the unknown
+        // case so the message can say why rather than just "unrecognized".
+        case '!': case 'g': case 'o': case 'i': case 'u': case 'O': case 'z':
+            throw std::invalid_argument(
+                std::string("slick-logger: pattern flag '%") + c + "' is not supported. See "
+                "PatternFormatter for the flags that are. Pattern: " + std::string(pattern));
+
+        default:
+            throw std::invalid_argument(
+                std::string("slick-logger: unknown pattern flag '%") + c + "' in pattern: "
+                + std::string(pattern));
+    }
+}
+
+inline void PatternFormatter::compile(std::string_view pattern) {
+    ops_.clear();
+    literals_.clear();
+    pattern_.assign(pattern);
+    has_color_range_ = false;
+    needs_cache_ = false;
+    needs_subsecond_ = false;
+
+    // Literal runs are accumulated and flushed as one op each, so "a%lb%vc" costs
+    // three literal ops rather than one per character.
+    std::string literal;
+    auto flush_literal = [&]() {
+        if (literal.empty()) {
+            return;
+        }
+        Op op;
+        op.flag = Flag::kLiteral;
+        op.literal_off = static_cast<uint32_t>(literals_.size());
+        op.literal_len = static_cast<uint32_t>(literal.size());
+        literals_ += literal;
+        literal.clear();
+        ops_.push_back(op);
+    };
+
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if (pattern[i] != '%') {
+            literal += pattern[i];
+            continue;
+        }
+
+        // "%[-][width]<flag>"
+        size_t j = i + 1;
+        bool left_align = false;
+        uint32_t width = 0;
+        if (j < pattern.size() && pattern[j] == '-') {
+            left_align = true;
+            ++j;
+        }
+        while (j < pattern.size() && pattern[j] >= '0' && pattern[j] <= '9') {
+            width = std::min(width * 10 + static_cast<uint32_t>(pattern[j] - '0'), kMaxFieldWidth);
+            ++j;
+        }
+        if (j >= pattern.size()) {
+            throw std::invalid_argument(
+                "slick-logger: pattern ends with a dangling '%': " + std::string(pattern));
+        }
+        if (pattern[j] == '%') {
+            // "%-5%" would silently drop the -5. A width on an escaped percent is
+            // meaningless, so it is far more likely a mistyped flag than intent.
+            if (left_align || width != 0) {
+                throw std::invalid_argument(
+                    "slick-logger: '%%' takes no width or alignment; did you mean a flag "
+                    "letter? Pattern: " + std::string(pattern));
+            }
+            literal += '%';
+            i = j;
+            continue;
+        }
+
+        // Resolved before the literal is flushed so an invalid flag throws with
+        // the formatter still untouched.
+        const Flag flag = flag_for(pattern[j], pattern);
+        flush_literal();
+
+        Op op;
+        op.flag = flag;
+        op.left_align = left_align;
+        op.width = static_cast<uint8_t>(width);
+        ops_.push_back(op);
+
+        if (flag == Flag::kColorBegin) {
+            has_color_range_ = true;
+        }
+        if (flag_needs_cache(flag)) {
+            needs_cache_ = true;
+        } else if (flag == Flag::kMillis || flag == Flag::kMicros || flag == Flag::kNanos) {
+            needs_subsecond_ = true;
+        }
+        // %+ renders the message itself, and the level flags need to know whether
+        // formatting the message failed, so all four force the format pass.
+        if (flag == Flag::kMessage || flag == Flag::kDefaultHeader ||
+            flag == Flag::kLevel || flag == Flag::kLevelShort) {
+            needs_message_ = true;
+        }
+        i = j;
+    }
+    flush_literal();
+
+    // Whether the last %^ was ever closed. Fixed by the op list, so it is settled
+    // here rather than tracked per line.
+    color_left_open_ = false;
+    for (const Op& op : ops_) {
+        if (op.flag == Flag::kColorBegin) {
+            color_left_open_ = true;
+        } else if (op.flag == Flag::kColorEnd) {
+            color_left_open_ = false;
+        }
+    }
+
+    fuse_cached_slices();
+}
+
+inline bool PatternFormatter::flag_needs_cache(Flag flag) noexcept {
+    switch (flag) {
+        // A fused run is only ever built out of the calendar flags below, so it
+        // belongs here with them.
+        case Flag::kCachedSlice:
+        case Flag::kYear4: case Flag::kYear2: case Flag::kMonth: case Flag::kDay:
+        case Flag::kHour24: case Flag::kHour12: case Flag::kAmPm:
+        case Flag::kMinute: case Flag::kSecond:
+        case Flag::kTimeHMS: case Flag::kDateMDY: case Flag::kDateTimeFull:
+        case Flag::kWeekdayShort: case Flag::kWeekdayLong:
+        case Flag::kMonthShort: case Flag::kMonthLong:
+            return true;
+        // %+ and %q render a timestamp of their own through TimestampFormatter,
+        // which keeps its own cache lookup, so they do not need one here either.
+        default:
+            return false;
+    }
+}
+
+inline bool PatternFormatter::cached_slice_for(Flag flag, size_t& offset, size_t& length) noexcept {
+    switch (flag) {
+        case Flag::kYear4:   offset = 0;  length = 4; return true;
+        case Flag::kYear2:   offset = 2;  length = 2; return true;
+        case Flag::kMonth:   offset = 5;  length = 2; return true;
+        case Flag::kDay:     offset = 8;  length = 2; return true;
+        case Flag::kHour24:  offset = 11; length = 2; return true;
+        case Flag::kMinute:  offset = 14; length = 2; return true;
+        case Flag::kSecond:  offset = 17; length = 2; return true;
+        case Flag::kTimeHMS: offset = detail::kTimeOffset; length = detail::kTimeLen; return true;
+        default: return false;
+    }
+}
+
+inline bool PatternFormatter::literal_matches_cached(std::string_view literal,
+                                                     size_t offset) noexcept {
+    if (offset + literal.size() > detail::kDateTimeLen) {
+        return false;
+    }
+    for (size_t i = 0; i < literal.size(); ++i) {
+        // Only separators can match: a digit position varies per timestamp, so a
+        // literal digit there would be a coincidence this must not act on.
+        if (literal[i] != cached_separator_at(offset + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline void PatternFormatter::fuse_cached_slices() {
+    std::vector<Op> fused;
+    fused.reserve(ops_.size());
+
+    for (const Op& op : ops_) {
+        size_t offset = 0;
+        size_t length = 0;
+
+        // A padded field has to stay its own op: the padding is measured against
+        // that field alone, not against whatever it would be fused with.
+        if (op.width == 0 && !fused.empty() && fused.back().flag == Flag::kCachedSlice) {
+            Op& run = fused.back();
+            const size_t run_end = run.literal_off + run.literal_len;
+
+            if (cached_slice_for(op.flag, offset, length) && offset == run_end) {
+                run.literal_len += static_cast<uint32_t>(length);
+                continue;
+            }
+            if (op.flag == Flag::kLiteral &&
+                literal_matches_cached(std::string_view{literals_}.substr(op.literal_off, op.literal_len),
+                                       run_end)) {
+                run.literal_len += op.literal_len;
+                continue;
+            }
+        }
+
+        if (op.width == 0 && cached_slice_for(op.flag, offset, length)) {
+            Op slice;
+            slice.flag = Flag::kCachedSlice;
+            slice.literal_off = static_cast<uint32_t>(offset);
+            slice.literal_len = static_cast<uint32_t>(length);
+            fused.push_back(slice);
+            continue;
+        }
+
+        fused.push_back(op);
+    }
+
+    ops_ = std::move(fused);
+}
+
+inline void PatternFormatter::append_op(std::string& out, const Op& op, const LogEntry& entry,
+                                        const Context& ctx, const detail::second_cache* cache,
+                                        uint32_t subsecond_ns) const {
+    using namespace detail;
+    char buf[32];
+
+    // Every date and time flag slices the "YYYY-MM-DD HH:MM:SS" text that
+    // cached_second() renders once per whole second, so none of them convert a
+    // time_t or touch the locale. The caller supplies a cache for exactly the
+    // flags that read one, the epoch placeholder standing in when localtime
+    // fails, so a flag missing from flag_needs_cache() is a bug in that list
+    // rather than a null this should quietly render around.
+    assert(!flag_needs_cache(op.flag) || cache != nullptr);
+
+    const auto append_cached = [&](size_t offset, size_t length) {
+        out.append(cache->date_time + offset, length);
+    };
+
+    switch (op.flag) {
+        case Flag::kCachedSlice:
+            out.append(cache->date_time + op.literal_off, op.literal_len);
+            break;
+        case Flag::kLiteral:
+            out.append(literals_, op.literal_off, op.literal_len);
+            break;
+        case Flag::kMessage:
+            out += ctx.message;
+            break;
+        case Flag::kLevel:
+            out += ctx.level_name;
+            break;
+        case Flag::kLevelShort:
+            out += to_short_string(ctx.level);
+            break;
+        case Flag::kThreadId:
+        #if SLICK_LOGGER_ENABLE_THREAD_ID
+            append_uint(out, entry.thread_id);
+        #endif
+            break;
+        case Flag::kProcessId:
+            // A Local-mode entry carries no pid, but it was produced right here,
+            // so print this process rather than a bare zero.
+            append_uint(out, entry.pid ? entry.pid : current_process_id());
+            break;
+        case Flag::kTag:
+            out.append(entry.tag, strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE));
+            break;
+        case Flag::kSinkName:
+            out += ctx.sink_name;
+            break;
+        case Flag::kSourceFile:
+            if (has_source_location(entry)) {
+                out += view_string_ref(entry.file);
+            }
+            break;
+        case Flag::kSourceLine:
+            if (has_source_location(entry)) {
+                append_uint(out, entry.line);
+            }
+            break;
+        case Flag::kSourceLoc:
+            if (has_source_location(entry)) {
+                out += view_string_ref(entry.file);
+                out += ':';
+                append_uint(out, entry.line);
+            }
+            break;
+        case Flag::kYear4:   append_cached(0, 4); break;
+        case Flag::kYear2:   append_cached(2, 2); break;
+        case Flag::kMonth:   append_cached(5, 2); break;
+        case Flag::kDay:     append_cached(8, 2); break;
+        case Flag::kHour24:  append_cached(11, 2); break;
+        case Flag::kMinute:  append_cached(14, 2); break;
+        case Flag::kSecond:  append_cached(17, 2); break;
+        case Flag::kTimeHMS: append_cached(kTimeOffset, kTimeLen); break;
+        case Flag::kHour12: {
+            int hour = cache->tm.tm_hour % 12;
+            if (hour == 0) {
+                hour = 12;
+            }
+            write_2_digits(buf, static_cast<uint32_t>(hour));
+            out.append(buf, 2);
+            break;
+        }
+        case Flag::kAmPm:
+            out += (cache->tm.tm_hour < 12) ? "AM" : "PM";
+            break;
+        case Flag::kMillis:
+            write_3_digits(buf, subsecond_ns / 1000000u);
+            out.append(buf, 3);
+            break;
+        case Flag::kMicros:
+            write_6_digits(buf, subsecond_ns / 1000u);
+            out.append(buf, 6);
+            break;
+        case Flag::kNanos:
+            write_9_digits(buf, subsecond_ns);
+            out.append(buf, 9);
+            break;
+        case Flag::kDateMDY:
+            std::memcpy(buf, cache->date_time + 5, 2);      // MM
+            buf[2] = '/';
+            std::memcpy(buf + 3, cache->date_time + 8, 2);  // DD
+            buf[5] = '/';
+            std::memcpy(buf + 6, cache->date_time + 2, 2);  // YY
+            out.append(buf, 8);
+            break;
+        case Flag::kDateTimeFull:
+            // "Www Mmm DD HH:MM:SS YYYY", the shape std::asctime produces.
+            out += weekday_short(cache->tm.tm_wday);
+            out += ' ';
+            out += month_short(cache->tm.tm_mon);
+            out += ' ';
+            out.append(cache->date_time + 8, 2);
+            out += ' ';
+            out.append(cache->date_time + kTimeOffset, kTimeLen);
+            out += ' ';
+            out.append(cache->date_time, 4);
+            break;
+        case Flag::kEpochSeconds:
+            append_uint(out, entry.timestamp / 1000000000ULL);
+            break;
+        case Flag::kWeekdayShort: out += weekday_short(cache->tm.tm_wday); break;
+        case Flag::kWeekdayLong:  out += weekday_long(cache->tm.tm_wday); break;
+        case Flag::kMonthShort:   out += month_short(cache->tm.tm_mon); break;
+        case Flag::kMonthLong:    out += month_long(cache->tm.tm_mon); break;
+        case Flag::kColorBegin:   out += ctx.color_start; break;
+        case Flag::kColorEnd:     out += ctx.color_end; break;
+        case Flag::kDefaultHeader:
+            if (ctx.timestamp) {
+                append_default_layout(out, entry, *ctx.timestamp, ctx.level_name, ctx.message);
+            }
+            break;
+        case Flag::kConfiguredTimestamp:
+            if (ctx.timestamp) {
+                ctx.timestamp->append_timestamp(out, entry.timestamp);
+            }
+            break;
+    }
+}
+
+inline void PatternFormatter::format(std::string& out, const LogEntry& entry,
+                                     const Context& ctx) const {
+    // Null exactly when the pattern renders no calendar field, which is the only
+    // case in which nothing reads it: every op that does is a flag_needs_cache()
+    // flag, and those are what set needs_cache_. When one is present the pointer
+    // is never null - a localtime failure renders the same 1970 placeholder the
+    // built-in layout uses, which keeps every date op free of a null check.
+    const detail::second_cache* cache = nullptr;
+    if (needs_cache_) {
+        cache = detail::cached_second(static_cast<int64_t>(entry.timestamp / 1000000000ULL));
+        if (!cache) [[unlikely]] {
+            cache = &detail::epoch_fallback_cache();
+        }
+    }
+    uint32_t subsecond_ns = 0;
+    if (needs_subsecond_) {
+        subsecond_ns = static_cast<uint32_t>(entry.timestamp % 1000000000ULL);
+    }
+
+    // A pattern that does not mark its own range colors the whole line, which is
+    // what the built-in layout does.
+    const bool wrap_color = !ctx.color_start.empty() && !has_color_range_;
+    if (wrap_color) {
+        out += ctx.color_start;
+    }
+
+    for (const Op& op : ops_) {
+        const size_t start = out.size();
+        append_op(out, op, entry, ctx, cache, subsecond_ns);
+        if (op.width == 0) {
+            continue;
+        }
+        const size_t written = out.size() - start;
+        if (written >= op.width) {
+            continue;  // never truncate a field to fit its width
+        }
+        const size_t pad = op.width - written;
+        if (op.left_align) {
+            out.append(pad, ' ');
+        } else {
+            // The field is already at the tail, so this shifts only its own bytes
+            // - at most kMaxFieldWidth of them - not the line before it. Sliding
+            // them by hand instead, with memmove or a byte loop, measured no
+            // faster than letting the string do it.
+            out.insert(start, pad, ' ');
+        }
+    }
+
+    if (wrap_color) {
+        out += ctx.color_end;
+    } else if (color_left_open_) {
+        // "%^" with no "%$" means "color from here to the end of the line", not
+        // "leave the terminal tinted for everything printed afterwards".
+        out += ctx.color_end;
+    }
+}
+
+inline void ISink::publish_active_pattern() noexcept {
+    active_pattern_.store(explicit_pattern_ ? explicit_pattern_ : inherited_pattern_,
+                          std::memory_order_release);
+}
+
+inline void ISink::set_pattern(std::string_view pattern) {
+    // Compiled before anything is assigned, so an invalid pattern throws with the
+    // sink still on the layout it already had.
+    explicit_pattern_ = owned_patterns_.get(pattern);
+    publish_active_pattern();
+}
+
+inline void ISink::apply_default_pattern(std::shared_ptr<detail::pattern_store> store,
+                                        const PatternFormatter* compiled) noexcept {
+    // Recorded even while an explicit pattern wins, so that clearing the
+    // explicit one later falls back to the default in force at that moment.
+    inherited_store_ = std::move(store);
+    inherited_pattern_ = compiled;
+    publish_active_pattern();
+}
+
+inline std::string_view ISink::pattern() const noexcept {
+    const PatternFormatter* active = active_pattern_.load(std::memory_order_acquire);
+    return active ? std::string_view{active->pattern()} : std::string_view{};
+}
+
+inline void ISink::set_timestamp_format(TimestampFormatter::Format format) {
+    timestamp_formatter_ = TimestampFormatter(format);
+}
+
+inline void ISink::set_timestamp_format(const std::string& custom_format) {
+    timestamp_formatter_ = TimestampFormatter(custom_format);
+}
+
+inline std::string_view ISink::format_log_entry(const LogEntry& entry,
+                                                ColorFn color_for,
+                                                std::string_view color_end) {
+    const PatternFormatter* active = active_pattern_.load(std::memory_order_acquire);
+
+    // The message comes first because a format error overrides the level that
+    // gets printed, so neither the level nor its color can be resolved until the
+    // message has been built. A pattern that renders neither skips the whole
+    // std::format pass; needs_message() is what says so.
+    std::string message;
+    bool good = true;
+    if (!active || active->needs_message()) {
+        auto formatted = format_log_message(entry);
+        message = std::move(formatted.first);
+        good = formatted.second;
+    }
+    // A message that could not be formatted is reported at ERROR whatever it was
+    // logged at. Derived once here so every level-rendering flag, and the color,
+    // agree on what the line says.
+    const LogLevel level = good ? entry.level : LogLevel::L_ERROR;
+    const std::string_view level_name = to_string(level);
+    const std::string_view color_start = color_for ? color_for(level) : std::string_view{};
+
+    format_buffer_.clear();
+    if (active) {
+        PatternFormatter::Context ctx;
+        ctx.message = message;
+        ctx.level = level;
+        ctx.level_name = level_name;
+        ctx.sink_name = name_;
+        ctx.timestamp = &timestamp_formatter_;
+        ctx.color_start = color_start;
+        ctx.color_end = color_end;
+        active->format(format_buffer_, entry, ctx);
+    } else {
+        format_buffer_ += color_start;
+        append_default_layout(format_buffer_, entry, timestamp_formatter_, level_name, message);
+        format_buffer_ += color_end;
+    }
+    return format_buffer_;
+}
+
+inline ConsoleSink::ConsoleSink(bool use_colors, bool use_stderr_for_errors,
+                                TimestampFormatter::Format timestamp_format, std::string&& name)
+    : ISink(std::move(name)), use_colors_(use_colors), use_stderr_for_errors_(use_stderr_for_errors) {
+    set_timestamp_format(timestamp_format);
+}
+
+inline ConsoleSink::ConsoleSink(const std::string& custom_timestamp_format, bool use_colors,
                                 bool use_stderr_for_errors, std::string&& name)
-    : ISink(std::move(name)), use_colors_(use_colors), use_stderr_for_errors_(use_stderr_for_errors)
-    , timestamp_formatter_(custom_timestamp_format) {
+    : ISink(std::move(name)), use_colors_(use_colors), use_stderr_for_errors_(use_stderr_for_errors) {
+    set_timestamp_format(custom_timestamp_format);
 }
 
 inline void ConsoleSink::write(const LogEntry& entry) {
-    std::string formatted = format_log_entry(entry);
-    
+    // The color follows the level the line reports, not entry.level: an entry
+    // whose message will not format prints as ERROR and must look like it.
+    const std::string_view formatted = use_colors_
+        ? format_log_entry(entry, &get_color_code, get_reset_code())
+        : format_log_entry(entry);
+
     if (use_stderr_for_errors_ && (entry.level >= LogLevel::L_WARN)) {
         std::cerr << formatted << std::endl;
     } else {
@@ -2047,33 +3266,7 @@ inline void ConsoleSink::flush() {
     std::cerr.flush();
 }
 
-inline std::string ConsoleSink::format_log_entry(const LogEntry& entry) {
-    std::string level_str = to_string(entry.level);
-    std::string timestamp = timestamp_formatter_.format_timestamp(entry.timestamp);
-    auto [message, good] = format_log_message(entry);
-    if (!good) [[unlikely]] {
-        level_str = "ERROR";
-    }
-    std::string result;
-    result.reserve(timestamp.size() + level_str.size() + process_id_size(entry)
-                   + source_location_size(entry) + message.size() + 4);
-    result += timestamp;
-    result += " [";
-    result += level_str;
-    result += ']';
-    append_process_id(result, entry);
-    append_source_location(result, entry);
-    result += ' ';
-    result += message;
-
-    if (use_colors_) {
-        return get_color_code(entry.level) + result + get_reset_code();
-    }
-    
-    return result;
-}
-
-inline std::string ConsoleSink::get_color_code(LogLevel level) {
+inline std::string_view ConsoleSink::get_color_code(LogLevel level) noexcept {
     switch (level) {
         case LogLevel::L_TRACE: return "\033[90m";   // Dark gray
         case LogLevel::L_DEBUG: return "\033[36m";   // Cyan
@@ -2085,7 +3278,7 @@ inline std::string ConsoleSink::get_color_code(LogLevel level) {
     }
 }
 
-inline std::string ConsoleSink::get_reset_code() {
+inline std::string_view ConsoleSink::get_reset_code() noexcept {
     return "\033[0m";
 }
 
@@ -2122,39 +3315,21 @@ inline void FileSinkBase::flush() {
 
 inline FileSink::FileSink(const std::filesystem::path& file_path,
                           TimestampFormatter::Format timestamp_format, std::string&& name)
-    : FileSinkBase(file_path, std::ios::app, std::move(name)), timestamp_formatter_(timestamp_format) {
+    : FileSinkBase(file_path, std::ios::app, std::move(name)) {
+    set_timestamp_format(timestamp_format);
 }
 
 inline FileSink::FileSink(const std::filesystem::path& file_path,
                           const std::string& custom_timestamp_format, std::string&& name)
-    : FileSinkBase(file_path, std::ios::app, std::move(name)), timestamp_formatter_(custom_timestamp_format) {
+    : FileSinkBase(file_path, std::ios::app, std::move(name)) {
+    set_timestamp_format(custom_timestamp_format);
 }
 
 inline void FileSink::write(const LogEntry& entry) {
     if (file_stream_) {
-        file_stream_ << format_log_entry(entry) << "\n";
+        const std::string_view formatted = format_log_entry(entry);
+        file_stream_ << formatted << "\n";
     }
-}
-
-inline std::string FileSink::format_log_entry(const LogEntry& entry) {
-    std::string level_str = to_string(entry.level);
-    std::string timestamp = timestamp_formatter_.format_timestamp(entry.timestamp);
-    auto [message, good] = format_log_message(entry);
-    if (!good) [[unlikely]] {
-        level_str = "ERROR";
-    }
-    std::string result;
-    result.reserve(timestamp.size() + level_str.size() + process_id_size(entry)
-                   + source_location_size(entry) + message.size() + 4);
-    result += timestamp;
-    result += " [";
-    result += level_str;
-    result += ']';
-    append_process_id(result, entry);
-    append_source_location(result, entry);
-    result += ' ';
-    result += message;
-    return result;
 }
 
 inline RotatingFileSink::RotatingFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
@@ -2177,9 +3352,9 @@ inline void RotatingFileSink::write(const LogEntry& entry) {
     check_rotation();
     
     if (file_stream_) {
-        std::string formatted = format_log_entry(entry);
+        const std::string_view formatted = format_log_entry(entry);
         file_stream_ << formatted << "\n";
-        current_file_size_ += formatted.length() + 1; // +1 for newline
+        current_file_size_ += formatted.size() + 1; // +1 for newline
     }
 }
 
@@ -2342,9 +3517,9 @@ inline void DailyFileSink::write(const LogEntry& entry) {
     check_rotation();
 
     if (file_stream_) {
-        std::string formatted = format_log_entry(entry);
+        const std::string_view formatted = format_log_entry(entry);
         file_stream_ << formatted << "\n";
-        current_file_size_ += formatted.length() + 1; // +1 for newline
+        current_file_size_ += formatted.size() + 1; // +1 for newline
     }
 }
 
@@ -2595,6 +3770,13 @@ inline void Logger::init(const LogConfig& config) {
         throw std::runtime_error("No sink. Sinks should be added in the config.");
     }
 
+    // Before the sinks are registered, so add_sink() hands each one the default.
+    // An empty config.pattern leaves any earlier set_pattern() alone rather than
+    // silently clearing it.
+    if (!config.pattern.empty()) {
+        set_pattern(config.pattern);
+    }
+
     for (auto& sink : config.sinks) {
         add_sink(sink);
     }
@@ -2721,9 +3903,30 @@ inline void Logger::setup_shared_queues(const LogConfig& config, uint32_t queue_
 
 inline void Logger::add_sink(std::shared_ptr<ISink> sink) {
     sink->set_index(static_cast<int>(sinks_.size()));
+    // The single place every sink passes through, so applying the default here is
+    // what lets set_pattern() be called before or after the add_*_sink() calls.
+    // Unconditional even when there is no default, so the sink's record of what
+    // it would inherit always matches this logger.
+    sink->apply_default_pattern(pattern_store_, default_pattern_);
     sinks_.push_back(sink);
     if (!sink->name().empty()) {
         sinkname_index_map_[sink->name()] = sink->index();
+    }
+}
+
+inline void Logger::set_pattern(std::string_view pattern) {
+    // Compiled exactly once, here. An invalid pattern throws before any sink has
+    // been touched, so a typo cannot leave half the sinks reformatted, and the
+    // sinks that do take it then share the one formatter rather than each
+    // compiling the same text over again. The loop itself cannot fail at all -
+    // apply_default_pattern() is noexcept - so the compile is the only step that
+    // can, and it happens before the first sink is reached.
+    const PatternFormatter* compiled = pattern_store_->get(pattern);
+    default_pattern_ = compiled;
+    for (auto& sink : sinks_) {
+        if (sink) {
+            sink->apply_default_pattern(pattern_store_, compiled);
+        }
     }
 }
 
@@ -2912,6 +4115,9 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
     entry.timestamp = ns;
     entry.flags = entry_flags_;
     entry.pid = pid_;
+#if SLICK_LOGGER_ENABLE_THREAD_ID
+    entry.thread_id = detail::current_thread_id();
+#endif
     std::memcpy(entry.tag, tag_, sizeof(entry.tag));
     if (has_source_location(file_name, line)) {
         // A static file name lives in the caller's read-only data, which no other
@@ -3294,6 +4500,11 @@ inline void Logger::reset() {
     read_index_.store(0, std::memory_order_relaxed);
     log_level_.store(LogLevel::L_TRACE);
     source_location_options_.store(kSourceLocationEnabled, std::memory_order_relaxed);
+    // Cleared for the same reason as log_level_ above. init(config) deliberately
+    // treats an empty config.pattern as "leave the current default alone", so a
+    // pattern surviving reset() would silently reappear on sinks registered by
+    // the next init() - exactly the cross-contamination reset() exists to avoid.
+    default_pattern_ = nullptr;
 
     // shutdown() has joined the writer thread, so nothing else can be touching the
     // wake and flush state by now. None of this is required for correctness: the

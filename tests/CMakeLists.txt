@@ -31,6 +31,11 @@ if(BUILD_SLICK_LOGGER_TESTING)
     target_link_libraries(slick_logger_timestamp_tests slick::logger GTest::gtest_main)
     add_test(NAME slick_logger_timestamp_tests COMMAND slick_logger_timestamp_tests)
 
+    add_executable(slick_logger_pattern_tests test_pattern.cpp)
+    target_include_directories(slick_logger_pattern_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(slick_logger_pattern_tests slick::logger GTest::gtest_main)
+    add_test(NAME slick_logger_pattern_tests COMMAND slick_logger_pattern_tests)
+
     # --- Shared-library integration test ---
     # Build a minimal plugin as a real shared library (.dll/.so), then load it
     # at runtime to verify LOG_* calls inside the plugin are routed to the host

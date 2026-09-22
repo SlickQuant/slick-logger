@@ -41,6 +41,7 @@
 *.dwo
 
 build/
+build*/
 .vscode/
 .claude/
 .codex/
