@@ -1,4 +1,4 @@
-# v2.0.0 - 09-22-2026
+# v2.0.0 - 09-23-2026
 Three user-facing additions: log lines you can lay out yourself, runtime statistics for the internal queues, and the producing thread id. Rendering the built-in layout also got 47% faster.
 
 - **Breaking changes.** All three are in the custom-sink API or the shared-memory wire format. Code that only calls `LOG_*` and uses the built-in sinks is unaffected and needs no changes
