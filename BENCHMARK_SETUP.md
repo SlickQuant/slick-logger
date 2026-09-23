@@ -15,7 +15,7 @@ cd slick-logger
 mkdir build && cd build
 
 # Configure with benchmarks enabled
-cmake -DBUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release ..
+cmake -DBUILD_SLICK_LOGGER_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release ..
 
 # Build all targets
 cmake --build . --config Release
@@ -59,75 +59,20 @@ benchmarks\run_benchmarks.bat full
 
 ## Expected Output
 
-### Throughput Comparison
-```
-=== THROUGHPUT BENCHMARKS ===
+Real measured output, the hardware it was measured on, and how to read each
+table live in [benchmarks/README.md](benchmarks/README.md). The numbers are not
+duplicated here, so there is only one place to update after a re-run.
 
---- Small Messages ---
+Two things to know before comparing anything:
 
-Testing with 1 thread(s):
-Library               Mean      Median         P95         P99      StdDev
---------------------------------------------------------------------------------
-slick_logger_small   2847291   2856543   2801234   2745123        45.2
-spdlog_async_small   1934521   1945123   1876543   1823451        52.1
-spdlog_sync_small     876543    881234    845123    823456        28.9
-std_ofstream_small    654321    661234    634567    612345        31.4
-
-Unit: ops/sec
-
-Testing with 4 thread(s):
-Library               Mean      Median         P95         P99      StdDev
---------------------------------------------------------------------------------
-slick_logger_small   8234567   8345123   8123456   7987654        123.4
-spdlog_async_small   6543210   6612345   6234567   5987654        167.8
-spdlog_sync_small    2345678   2398765   2234567   2123456         89.2
-```
-
-### Latency Analysis
-```
-=== DETAILED LATENCY ANALYSIS ===
-
-Samples: 10000
-Mean:    342.5 ns
-Median:  298.0 ns  
-P95:     567.0 ns
-P99:     845.0 ns
-P99.9:   1234.0 ns
-
-Latency Distribution:
-0-100ns     :    156 (1.6%)
-100-500ns   :   8234 (82.3%)  
-500ns-1μs   :   1456 (14.6%)
-1-5μs       :    145 (1.5%)
->5μs        :      9 (0.1%)
-```
-
-### Memory Usage
-```
-=== MEMORY USAGE COMPARISON ===
-Logger         Queue Size   Peak MB   Bytes/Msg   Efficiency
---------------------------------------------------------------
-SlickLogger          8192        45        18.2         5495
-spdlog_async         8192        67        27.3         3663
-
-Efficiency = Messages per MB of memory used
-```
-
-## Performance Expectations
-
-Based on typical hardware (modern multi-core CPU, SSD storage):
-
-### SlickLogger Performance Targets
-- **Throughput**: 2-5M messages/sec (single thread), 8-20M messages/sec (multi-thread)
-- **Latency**: <500ns mean, <1μs P99 for small messages
-- **Memory**: <50 bytes per queued message
-- **Scaling**: >80% efficiency with 4 threads
-
-### Comparison with spdlog
-- SlickLogger should show **2-3x higher throughput** due to lock-free queue
-- SlickLogger should show **2-5x lower latency** due to deferred formatting  
-- Memory usage should be **comparable or better**
-- Multi-threading scaling should be **significantly better**
+- **Put the log output on local storage.** The synchronous scenarios are bounded
+  by the storage device, so a build tree on a network share measures the share.
+  On an SMB mount `spdlog_sync` came out 144x lower than on a local SSD while
+  `slick-logger` barely moved - which makes the comparison meaningless and
+  flatters this library.
+- **Build Release and pass both flags.** `benchmarks/` is only added when
+  `BUILD_SLICK_LOGGER_BENCHMARKS` is ON *and* `CMAKE_BUILD_TYPE` matches
+  Release. Miss either and the benchmark targets silently do not exist.
 
 ## Troubleshooting
 
@@ -141,8 +86,8 @@ Based on typical hardware (modern multi-core CPU, SSD storage):
 # Ubuntu/Debian
 sudo apt-get install libspdlog-dev libfmt-dev
 
-# Use system packages
-cmake -DBUILD_BENCHMARKS=ON -DUSE_SYSTEM_SPDLOG=ON ..
+# An installed spdlog/fmt is picked up automatically; otherwise CMake
+# fetches spdlog 1.12.0 and fmt 10.1.1 on the first configure.
 ```
 
 **C++20 support issues:**
@@ -156,7 +101,7 @@ export CXX=g++-10  # or clang++-12
 # Use Visual Studio 2019 or later
 # Open "Developer Command Prompt" or "x64 Native Tools Command Prompt"
 
-cmake -DBUILD_BENCHMARKS=ON -A x64 ..
+cmake -DBUILD_SLICK_LOGGER_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release -A x64 ..
 cmake --build . --config Release
 ```
 

@@ -27,7 +27,7 @@ echo.
 if not exist "%BUILD_DIR%" (
     echo [ERROR] Build directory not found. Please run cmake first:
     echo   mkdir build ^&^& cd build
-    echo   cmake -DBUILD_BENCHMARKS=ON ..
+    echo   cmake -DBUILD_SLICK_LOGGER_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release ..
     echo   cmake --build . --config Release
     exit /b 1
 )

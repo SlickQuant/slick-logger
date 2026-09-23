@@ -19,7 +19,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage: producer --name <shm-name> [--tag <tag>] [--count <n>]\n"
                  "                [--queue-size <n>] [--string-buffer-size <n>]\n"
-                 "                [--linger-ms <n>]\n");
+                 "                [--linger-ms <n>] [--ready-file <path>]\n");
     return 2;
 }
 
@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
     size_t queue_size = 1024;
     size_t string_buffer_size = 1 << 16;
     int linger_ms = 0;
+    std::string ready_file;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -46,6 +47,11 @@ int main(int argc, char** argv) {
             queue_size = static_cast<size_t>(std::atoll(argv[++i]));
         } else if (arg == "--string-buffer-size" && has_value) {
             string_buffer_size = static_cast<size_t>(std::atoll(argv[++i]));
+        } else if (arg == "--ready-file" && has_value) {
+            // Touched once every entry above is published, so a collector that
+            // must attach to a segment that ALREADY holds a backlog can wait on a
+            // fact instead of guessing at a sleep.
+            ready_file = argv[++i];
         } else if (arg == "--linger-ms" && has_value) {
             // Keep the process (and therefore the shared mapping) alive a while
             // longer, so a collector that starts second still finds the segment.
@@ -85,6 +91,16 @@ int main(int argc, char** argv) {
     LOG_INFO("producer payload {}", slick::logger::as_binary(payload, sizeof(payload)));
 
     LOG_WARN("producer done");
+
+    if (!ready_file.empty()) {
+        // After the entries, before the linger: everything this producer logs is
+        // published by the time the file appears, because a SharedProducer has no
+        // writer thread of its own - LOG_* publishes into the ring inline.
+        if (std::FILE* marker = std::fopen(ready_file.c_str(), "wb")) {
+            std::fputs("ready\n", marker);
+            std::fclose(marker);
+        }
+    }
 
     if (linger_ms > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(linger_ms));

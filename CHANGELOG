@@ -1,3 +1,24 @@
+# v2.0.0 - 09-22-2026
+Three user-facing additions: log lines you can lay out yourself, runtime statistics for the internal queues, and the producing thread id. Rendering the built-in layout also got 47% faster.
+
+- **Breaking changes.** All three are in the custom-sink API or the shared-memory wire format. Code that only calls `LOG_*` and uses the built-in sinks is unaffected and needs no changes
+  - `format_log_entry()` is now a single shared `ISink` method returning a `std::string_view` into a buffer the sink reuses, rather than a `std::string` that `ConsoleSink` and `FileSink` each implemented separately. Copy the view if you need it past the next call on that sink
+  - Coloring moved out of `ConsoleSink::get_color_code()`/`get_reset_code()` and into optional arguments to `format_log_entry()`, so a sink now opts into escape codes rather than inheriting them. Omit them and `%^`/`%$` render as nothing
+  - `LogEntry` gained a thread id field, so shared-memory producers and collectors must be built from the same major version. A 1.3.0 peer cannot share a segment with a 2.0.0 one
+- **Custom log line layouts.** `set_pattern()` replaces the fixed header with one of your own, using the same flags as spdlog
+  - `Logger::instance().set_pattern("%T.%e %^%-5l%$ %-20@ %v")` applies to every sink, including sinks added later. A single sink can override it through `ISink::set_pattern()`, and `LogConfig::pattern` sets it at `init()`
+  - Beyond the spdlog set: `%k` (producer tag), `%q` (the sink's configured `TimestampFormatter`) and `%+` (the built-in layout, byte for byte)
+  - A flag takes an optional minimum width, and a leading `-` left-aligns it, which is what makes columns line up. A field wider than its width is never truncated
+  - A pattern is parsed once inside `set_pattern()` into a flat op list, so a line costs no parsing and no allocation beyond the message itself - no `strftime`, no `put_time`, no locale on the path. The built-in layout went from 291 to 155 ns/line, and a pattern pays only for the fields it actually names: one that renders neither the message nor a level skips the `std::format` pass entirely
+- **Runtime statistics.** Opt in with `config.enable_stats = true` to see the queues backing up before it costs you a log line
+  - A background thread publishes throughput, queue fullness and drop counts. Read them live with `Logger::stats_snapshot()`, or set `stats_file` to append a CSV row per interval, rolled to `<stem>.1.csv` at `stats_max_file_size`
+  - Fullness is a gauge, so a burst that fills the queue and drains between two rows would be invisible. The gauges are sampled every `stats_sample_interval_ms` and each row reports the interval's **peak** - `entry_queue_pct_max` is the field to alert on, with `sample_count` showing the fidelity behind it
+  - Your logging threads pay nothing either way: the figures come from cursors the queues already maintain. The one added cost is two cursor reads per drained batch on the writer thread
+  - New `statistics_example` demonstrates it under load
+- **Thread id capture.** `%t` renders the id of the thread that made the `LOG_*` call, not the writer thread that formatted it - the real OS thread id, as a debugger or `top -H` shows it, resolved once per thread
+  - The `LogEntry` field is reserved in every build, so processes sharing a segment need not agree on the setting. Build with `-DSLICK_LOGGER_ENABLE_THREAD_ID=OFF` to drop the per-call capture and `%t`; entries then carry thread id 0 and the layout is unchanged
+- `ISink::format_log_entry()` is protected and available to custom sinks, so one that renders a whole line honors `set_pattern()` for free rather than reimplementing the layout
+
 # v1.3.0 - 09-09-2026
 - Add `BinarySink` and binary payload logging
   - `as_binary(ptr, size)` - or `as_binary(range)` over any contiguous range of trivially copyable elements - turns raw bytes into a log argument, carried through the queue as the new `ArgType::BLOB`. Packets, wire messages and serialized records now take the same asynchronous path as text, instead of needing a second I/O path in the application

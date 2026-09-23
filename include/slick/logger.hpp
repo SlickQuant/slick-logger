@@ -32,6 +32,7 @@
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <algorithm>
 #include <thread>
 #include <atomic>
@@ -68,9 +69,11 @@
 #include <unistd.h>
 #endif
 
-// Capture the producing thread id in every entry, for the %t pattern flag.
-// Turning this off restores the pre-1.4.0 LogEntry layout byte for byte, for
-// builds that must stay attach-compatible with existing shared-memory peers.
+// Stamp the producing thread id into every entry, for the %t pattern flag.
+// Turning this off drops the per-call capture - one thread-local read - and
+// leaves every entry carrying thread id 0. It does NOT change the LogEntry
+// layout: the field is always reserved, so processes sharing a segment stay
+// attach-compatible whatever each of them chose here.
 #ifndef SLICK_LOGGER_ENABLE_THREAD_ID
 #define SLICK_LOGGER_ENABLE_THREAD_ID 1
 #endif
@@ -90,10 +93,10 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void
 #  endif
 #endif
 
-#define SLICK_LOGGER_VERSION_MAJOR 1
-#define SLICK_LOGGER_VERSION_MINOR 3
+#define SLICK_LOGGER_VERSION_MAJOR 2
+#define SLICK_LOGGER_VERSION_MINOR 0
 #define SLICK_LOGGER_VERSION_PATCH 0
-#define SLICK_LOGGER_VERSION "1.3.0"
+#define SLICK_LOGGER_VERSION "2.0.0"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20
@@ -834,9 +837,9 @@ struct LogEntry {
     uint64_t timestamp; // nanoseconds since epoch
     StringRef file{}; // Source file name captured by LOG_* macros
     uint32_t pid = 0; // Producing process id; 0 in single-process (Local) mode
-#if SLICK_LOGGER_ENABLE_THREAD_ID
+    // Always present, even where SLICK_LOGGER_ENABLE_THREAD_ID is off and it stays
+    // 0: the layout is the shared-memory contract, so the option must not move it.
     uint32_t thread_id = 0; // Producing thread id; see detail::current_thread_id()
-#endif
     uint32_t line = 0; // Source line captured by LOG_* macros
     int sink_index = -1; // Optional sink index, logged by that sink only
     LogLevel level;
@@ -1283,6 +1286,41 @@ inline ISink* sink_ptr(const std::shared_ptr<T>& sink) noexcept { return sink.ge
 template<typename T, typename D>
 inline ISink* sink_ptr(const std::unique_ptr<T, D>& sink) noexcept { return sink.get(); }
 
+/**
+ * @brief Open @p path into @p stream with an explicit buffer, creating parents first
+ *
+ * Factored out of FileSinkBase::open_stream() so the statistics CSV writer can
+ * reuse it: the statistics thread is not a sink - sinks belong to the writer
+ * thread alone - so it cannot reach that protected member, and duplicating the
+ * body would leave two copies of the buffering and directory rules to keep in
+ * step.
+ *
+ * Callers check @p stream afterwards and report failures in their own terms.
+ * Directory creation is best-effort: if it fails the open fails too, which the
+ * caller already handles.
+ *
+ * @p buffer backs the stream and must outlive it - pubsetbuf() does not take
+ * ownership - and is only installed while the stream is closed, which is the
+ * only state in which it takes effect.
+ */
+/// Size of the explicit stream buffer open_buffered_stream() installs.
+inline constexpr size_t kStreamBufferSize = 64 * 1024;
+
+inline void open_buffered_stream(std::ofstream& stream, std::vector<char>& buffer,
+                                 const std::filesystem::path& path,
+                                 std::ios::openmode mode, size_t buffer_size) {
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec); // no-op when it already exists
+    }
+    if (buffer.empty()) {
+        buffer.resize(buffer_size);
+    }
+    stream.rdbuf()->pubsetbuf(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    stream.open(path, mode);
+}
+
 } // namespace detail
 
 struct RotationConfig {
@@ -1342,7 +1380,7 @@ protected:
     void open_stream(const std::filesystem::path& path, std::ios::openmode mode);
 
     /// Size of the explicit stream buffer installed by open_stream().
-    static constexpr size_t kStreamBufferSize = 64 * 1024;
+    static constexpr size_t kStreamBufferSize = detail::kStreamBufferSize;
 
     std::filesystem::path file_path_;
     std::ofstream file_stream_;
@@ -1457,6 +1495,117 @@ protected:
 };
 
 /**
+ * @brief One sample of the logging pipeline, published by the statistics thread
+ *
+ * Most fields are derived from counters that already exist - the two ring write
+ * cursors, the writer thread's read cursor and slick-queue's loss counter - so
+ * the producer path is untouched: logging costs exactly what it did before,
+ * enabled or not.
+ *
+ * The string occupancy fields are the exception, and only just: with statistics
+ * enabled the writer reads the two ring cursors once per drained BATCH (not per
+ * entry) and compares one of them against its own read cursor. It never looks
+ * inside an entry to do it. That is the whole cost enabling statistics adds to
+ * the logging pipeline, and none of it lands on the producing thread.
+ *
+ * Read it with Logger::stats_snapshot(). A zeroed instance is what a logger with
+ * statistics disabled returns.
+ */
+struct LogStats {
+    // ---- Sample identity ----
+
+    /// Wall-clock time of the sample, in nanoseconds since the epoch. Same clock
+    /// and epoch as LogEntry::timestamp, so it lines up with the log itself.
+    uint64_t timestamp_ns = 0;
+    /// Measured seconds since the previous sample; 0.0 on the first one. Rates
+    /// below divide by this rather than by the configured interval, so a late
+    /// wake-up on a loaded machine does not distort them.
+    double interval_sec = 0.0;
+    /// How many oversampling ticks fed the _max and _mean figures below. Exposes
+    /// the fidelity behind them: a low count means the peak may have been missed.
+    uint32_t sample_count = 0;
+
+    // ---- Log entry ring ----
+
+    /// Cumulative entries reserved by producers.
+    uint64_t entries_produced = 0;
+    /// Cumulative entries claimed by the writer thread. Always 0 in
+    /// QueueMode::SharedProducer, which has no writer thread of its own.
+    uint64_t entries_consumed = 0;
+    /// produced - consumed at report time: how far the reader is behind.
+    uint64_t entry_queue_depth = 0;
+    /// Peak depth across the reporting interval. THIS is the figure to alert on -
+    /// entry_queue_depth is a single point sample and will miss a burst that
+    /// filled the ring and drained again between two reports.
+    uint64_t entry_queue_depth_max = 0;
+    /// Mean depth across the reporting interval.
+    double entry_queue_depth_mean = 0.0;
+    uint32_t entry_queue_capacity = 0;
+    /// entry_queue_depth as a percentage of capacity, clamped to 100.
+    double entry_queue_pct = 0.0;
+    /// entry_queue_depth_max as a percentage of capacity, clamped to 100.
+    double entry_queue_pct_max = 0.0;
+    /// Messages per second entering the queue - the log throughput figure.
+    double produced_per_sec = 0.0;
+    /// Messages per second leaving it. Steady state has the two roughly equal;
+    /// consumed lagging produced is what makes the depth grow.
+    double consumed_per_sec = 0.0;
+
+    // ---- String ring: occupancy ----
+
+    /// Bytes between the oldest string the writer thread still needs and the
+    /// producers' write cursor - the true in-flight span of the string ring.
+    ///
+    /// The logger never calls read() on the string ring, so there is no read
+    /// cursor to subtract. Computed instead as write_cursor - frontier, where the
+    /// frontier is the position the writer publishes once it has provably drained
+    /// past every string below it - see stats_string_frontier_ for the cursor-pair
+    /// rule behind that. Entry contents are never read to derive it. Only
+    /// meaningful when string_pct_valid.
+    uint64_t string_inflight_bytes = 0;
+    /// Peak in-flight span across the reporting interval. Like
+    /// entry_queue_depth_max, this is the figure to alert on: a burst that backs
+    /// the string ring up and drains again between two reports is invisible to
+    /// string_inflight_bytes, which is a single point sample.
+    uint64_t string_inflight_bytes_max = 0;
+    uint32_t string_buffer_capacity = 0;
+    /// string_inflight_bytes as a percentage of capacity, clamped to 100.
+    double string_pct = 0.0;
+    /// string_inflight_bytes_max as a percentage of capacity, clamped to 100.
+    double string_pct_max = 0.0;
+    /// False only when there is no string ring to measure at all - the logger is
+    /// not running, or was built with a zero-capacity ring - in which case
+    /// string_inflight_bytes and string_pct carry the previous sample's values
+    /// rather than a misleading zero. Whenever a ring exists a measurement is
+    /// always available: the frontier is seeded at start(), so there is always a
+    /// floor to measure from, and a fully drained queue reports a valid zero.
+    bool string_pct_valid = false;
+
+    // ---- String ring: write-cursor rates ----
+
+    /// Cumulative bytes reserved in the string ring.
+    uint64_t string_bytes_written = 0;
+    double string_bytes_per_sec = 0.0;
+    /// Bytes written this interval as a percentage of capacity: how much of the
+    /// ring was recycled. This is a RATE, not an occupancy - 100 means the ring
+    /// turned over exactly once during the interval. string_pct is the occupancy.
+    double string_turnover_pct = 0.0;
+    /// The same figure expressed as whole ring wraps per second.
+    double string_wraps_per_sec = 0.0;
+
+    // ---- Loss ----
+
+    /// Entries a producer overwrote before the writer thread could read them.
+    /// Reads 0 unless the queues were built with loss-detecting traits, since
+    /// slick::queue_traits::enable_loss_detection defaults to false.
+    uint64_t entry_loss_count = 0;
+    /// Structurally always 0: slick-queue counts losses inside read(), and the
+    /// logger never calls read() on the string ring - strings are reached by
+    /// pointer. Present so the CSV schema stays symmetric and self-describing.
+    uint64_t string_loss_count = 0;
+};
+
+/**
  * @brief Configuration struct for initializing the logger
  */
 struct LogConfig {
@@ -1499,6 +1648,36 @@ struct LogConfig {
     /// reset(), which clears it - that amounts to the built-in layout. To drop a
     /// pattern without resetting, call `set_pattern("")`.
     std::string pattern;
+
+    // ---- Statistics; all inert unless enable_stats is true ----
+
+    /// Run the background statistics thread. It samples the queue cursors, never
+    /// touches a sink and never logs, so it cannot perturb what it measures.
+    ///
+    /// The producer path is unaffected either way. The one cost of enabling this
+    /// falls on the writer thread, which then reads the two ring reservation
+    /// cursors once per drained batch to publish the string-ring frontier. It
+    /// never looks inside an entry to do it - see LogStats.
+    bool enable_stats = false;
+    /// Where the statistics CSV is written. Leave empty to run the thread for
+    /// stats_snapshot() alone and write no file.
+    std::filesystem::path stats_file;
+    /// How often a row is appended and a snapshot published.
+    uint32_t stats_interval_ms = 1000;
+    /// How often the queue-depth gauges are sampled between reports.
+    ///
+    /// Depth is instantaneous: read only once per report, a burst that fills the
+    /// ring and drains again in between is never seen at all. Sampling faster and
+    /// reporting the peak is what makes LogStats::entry_queue_pct_max meaningful.
+    /// Clamped into [1, stats_interval_ms]; setting it equal to stats_interval_ms
+    /// turns oversampling off.
+    ///
+    /// This is also how quickly the thread notices shutdown, so a long reporting
+    /// interval never delays shutdown() by more than one tick.
+    uint32_t stats_sample_interval_ms = 10;
+    /// Roll the CSV to "<stem>.1.csv" once it reaches this size, so a long-running
+    /// process cannot fill a disk. Zero lets it grow without bound.
+    size_t stats_max_file_size = 16 * 1024 * 1024;
 };
 
 /**
@@ -1705,6 +1884,34 @@ public:
      * @return The shared_ptr of the given sink name. It could be null if the sink of give name doesn't exist
      */
     std::shared_ptr<ISink> get_sink(std::string_view name) const noexcept;
+
+    /**
+     * @brief The most recent statistics sample
+     * @return The last published LogStats, or a zeroed one when statistics are off
+     *
+     * Safe to call from any thread and at any time, including before init() and
+     * after shutdown(): it returns a copy of an immutable published sample, so no
+     * reader can observe a half-written one.
+     *
+     * shutdown() clears the published sample, so this reads zeroed once the
+     * logger is stopped rather than serving the finished run's numbers. Read them
+     * before shutting down if you want them.
+     *
+     * Never touches the logging hot path. It is not, however, guaranteed
+     * wait-free: the sample is held in a std::atomic<std::shared_ptr>, which is
+     * lock-free only where the implementation says so (MSVC uses an internal lock),
+     * so a caller can briefly contend with the once-per-interval publish. That is
+     * the price of a snapshot that is race-free by the memory model rather than
+     * merely in practice; see publish_stats().
+     *
+     * Enable the sampling with LogConfig::enable_stats.
+     *
+     * @code
+     * const auto stats = Logger::instance().stats_snapshot();
+     * if (stats.entry_queue_pct_max > 80.0) { ... }
+     * @endcode
+     */
+    LogStats stats_snapshot() const noexcept;
 
     /**
      * @brief Get the current log level
@@ -1933,6 +2140,31 @@ private:
     void wait_until_ready(Predicate ready);
     void set_source_location_options(bool enabled) noexcept;
 
+    // ---- Statistics ----
+
+    /// Sample tick, gauge accumulation and periodic reporting. The whole body of
+    /// the statistics thread.
+    void stats_thread_func();
+    /// Accumulate one queue-depth sample into the interval's max/sum/count.
+    void accumulate_stats_sample() noexcept;
+    /// Build a full sample from the queue cursors and the accumulators.
+    LogStats sample_stats() noexcept;
+    /// Fold one drained batch into the string frontier. Writer thread only; see
+    /// the cursor-pair rule documented at stats_string_frontier_.
+    void advance_string_frontier() noexcept;
+    /// Turn the writer-published frontier into an in-flight span. Returns false
+    /// only when there is no string ring to measure, leaving @p stats untouched.
+    bool sample_string_occupancy(LogStats& stats) noexcept;
+    /// Publish @p stats for stats_snapshot() readers. Statistics thread only.
+    void publish_stats(const LogStats& stats) noexcept;
+    /// Open the CSV and write its header. Throws if the file cannot be created.
+    void open_stats_csv();
+    void write_stats_row(const LogStats& stats);
+    void write_stats_header();
+    /// Roll the CSV to "<stem>.1.csv" and reopen it empty.
+    void roll_stats_csv();
+
+
     // Helper function to round up to next power of 2
     static size_t round_up_to_power_of_2(size_t value) noexcept;
 
@@ -2035,6 +2267,77 @@ private:
     std::string shm_name_;
     bool collect_backlog_ = true;
     uint32_t stalled_entry_timeout_ms_ = 0;
+    // ---- Statistics state; all inert unless stats_enabled_ ----
+
+    std::thread stats_thread_;
+    /// The published sample, immutable once stored. The statistics thread swaps in
+    /// a fresh one per report and readers only ever see a completed object, so
+    /// stats_snapshot() involves no data race - see publish_stats().
+    std::atomic<std::shared_ptr<const LogStats>> stats_latest_;
+    /// Position just past the last string the writer thread has finished with, so
+    /// everything from here to the write cursor is still outstanding. Published by
+    /// the writer thread because only it holds entries that read() has already
+    /// confirmed published; the statistics thread must never read the entry ring
+    /// itself, where a reserved-but-unfilled slot would give it torn data. Relaxed
+    /// both ways: it carries a position and orders nothing else.
+    std::atomic<uint64_t> stats_string_frontier_{0};
+    // The cursor pair the frontier is promoted from, and the rule behind it.
+    //
+    // A producer reserves its string bytes BEFORE it reserves an entry slot, so
+    // string order and slot order are two independent races and neither implies
+    // the other. Taking the frontier from the string of whichever entry the
+    // writer happened to drain last is therefore unsound: a producer holding
+    // earlier string bytes can take a later slot, and the frontier sails past
+    // bytes still in use, reporting an idle ring while the ring is not.
+    //
+    // So the frontier is never read out of an entry at all. The writer instead
+    // snapshots the entry reservation cursor and then the string reservation
+    // cursor, and promotes the string half only once its read cursor has passed
+    // the entry half. At that moment every slot taken before the snapshot has
+    // been drained, and every one of those strings was reserved before the
+    // snapshot too, so the whole string ring below it is provably free - whatever
+    // order the producers published in. Between promotions the frontier simply
+    // stays put, which is the conservative direction: the span grows and the
+    // gauge reads fuller, which is what a stalled writer means.
+    //
+    // The one window it cannot see is a producer that has reserved string bytes
+    // and not yet taken a slot: it is invisible in both orderings, so a producer
+    // preempted there still hides its bytes until it publishes. Closing that
+    // needs the producer to announce the reservation, which is not worth what it
+    // would cost the logging path.
+    //
+    // Writer thread only. Relaxed everywhere: these carry positions and order
+    // nothing else.
+    uint64_t stats_gen_entry_ = 0;
+    uint64_t stats_gen_string_ = 0;
+    bool stats_gen_open_ = false;
+    // Configuration, written by init() before the thread starts and read only by
+    // it afterwards, so it needs no synchronization.
+    bool stats_enabled_ = false;
+    uint32_t stats_interval_ms_ = 0;
+    uint32_t stats_sample_interval_ms_ = 0;
+    size_t stats_max_file_size_ = 0;
+    std::filesystem::path stats_file_;
+    // Everything below is touched only by the statistics thread, between the
+    // point start() spawns it and the point shutdown() joins it.
+    uint64_t stats_depth_max_ = 0;
+    uint64_t stats_depth_sum_ = 0;
+    uint32_t stats_sample_count_ = 0;
+    uint64_t stats_string_inflight_max_ = 0;
+    /// Last in-flight span any tick in this interval resolved, and whether one
+    /// did. A row with neither reports unknown rather than a misleading zero.
+    uint64_t stats_string_last_ = 0;
+    bool stats_string_seen_ = false;
+    std::ofstream stats_stream_;
+    std::vector<char> stats_stream_buffer_;
+    size_t stats_bytes_written_ = 0;
+    /// Cumulative counters as of the previous report, for the rate deltas.
+    LogStats stats_previous_{};
+    bool stats_has_previous_ = false;
+    std::chrono::steady_clock::time_point stats_last_report_{};
+    /// Whether a CSV write has already failed, so the diagnostic is printed once
+    /// rather than on every interval.
+    bool stats_write_failed_ = false;
     // Scratch used by the writer thread to rebase shared-memory entries. Owned by
     // that thread alone, so no synchronization is needed.
     LogEntry rebase_scratch_{};
@@ -2752,8 +3055,8 @@ inline PatternFormatter::Flag PatternFormatter::flag_for(char c, std::string_vie
         #else
             throw std::invalid_argument(
                 "slick-logger: pattern flag '%t' needs SLICK_LOGGER_ENABLE_THREAD_ID, which "
-                "this build switched off, so entries carry no thread id. Pattern: "
-                + std::string(pattern));
+                "this build switched off, so every entry would render a thread id of 0. "
+                "Pattern: " + std::string(pattern));
         #endif
 
         // spdlog flags this logger has no data for. Named apart from the unknown
@@ -2996,9 +3299,7 @@ inline void PatternFormatter::append_op(std::string& out, const Op& op, const Lo
             out += to_short_string(ctx.level);
             break;
         case Flag::kThreadId:
-        #if SLICK_LOGGER_ENABLE_THREAD_ID
             append_uint(out, entry.thread_id);
-        #endif
             break;
         case Flag::kProcessId:
             // A Local-mode entry carries no pid, but it was produced right here,
@@ -3283,19 +3584,9 @@ inline std::string_view ConsoleSink::get_reset_code() noexcept {
 }
 
 inline void FileSinkBase::open_stream(const std::filesystem::path& path, std::ios::openmode mode) {
-    const auto parent = path.parent_path();
-    if (!parent.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(parent, ec); // no-op when it already exists
-    }
-    // Must be set while the stream is closed to take effect. Every caller either
-    // opens for the first time or has just closed the previous file.
-    if (stream_buffer_.empty()) {
-        stream_buffer_.resize(kStreamBufferSize);
-    }
-    file_stream_.rdbuf()->pubsetbuf(stream_buffer_.data(),
-                                    static_cast<std::streamsize>(stream_buffer_.size()));
-    file_stream_.open(path, mode);
+    // The buffer must be installed while the stream is closed to take effect. Every
+    // caller either opens for the first time or has just closed the previous file.
+    detail::open_buffered_stream(file_stream_, stream_buffer_, path, mode, kStreamBufferSize);
 }
 
 inline FileSinkBase::FileSinkBase(const std::filesystem::path& file_path, std::ios::openmode mode,
@@ -3708,6 +3999,401 @@ inline void Logger::clear_instance_override() noexcept {
     override_instance_.store(&instance_, std::memory_order_release);
 }
 
+inline LogStats Logger::stats_snapshot() const noexcept {
+    const std::shared_ptr<const LogStats> latest =
+        stats_latest_.load(std::memory_order_acquire);
+    return latest ? *latest : LogStats{};
+}
+
+inline void Logger::publish_stats(const LogStats& stats) noexcept {
+    // Each report publishes a fresh, immutable LogStats and swaps the pointer, so
+    // a reader is never looking at storage the statistics thread is writing.
+    //
+    // A seqlock over a shared LogStats would be cheaper, but it is a data race by
+    // the letter of the memory model - the reader copies the payload while the
+    // writer assigns it and only afterwards learns the generation moved - which is
+    // undefined behavior no fence can repair. One allocation per reporting
+    // interval (once a second by default), entirely off the logging path, is a
+    // trivial price for a snapshot that is actually race-free.
+    try {
+        stats_latest_.store(std::make_shared<const LogStats>(stats),
+                            std::memory_order_release);
+    } catch (const std::bad_alloc&) {
+        // Keep the previous snapshot rather than terminating a background thread.
+    }
+}
+
+inline void Logger::accumulate_stats_sample() noexcept {
+    if (!log_queue_) {
+        return;
+    }
+    // Consumed first: the two loads are not atomic together, and loading the
+    // producer cursor second makes it the fresher of the pair, so the common case
+    // needs no clamp. The clamp below still covers the reverse ordering.
+    const uint64_t consumed = read_index_.load(std::memory_order_relaxed);
+    const uint64_t produced = log_queue_->initial_reading_index();
+    const uint64_t depth = produced > consumed ? produced - consumed : 0;
+
+    if (depth > stats_depth_max_) {
+        stats_depth_max_ = depth;
+    }
+    stats_depth_sum_ += depth;
+    ++stats_sample_count_;
+
+    // The string ring is a gauge too, and is invisible to a once-per-report read
+    // for exactly the same reason the depth is: by the time a report lands, the
+    // burst that backed the ring up has usually drained. Sampling it costs three
+    // relaxed loads - the writer's read cursor and the two ring cursors - so it is
+    // cheap enough to run on the tick.
+    if (mode_ == QueueMode::SharedProducer) {
+        return; // no local reader, so there is no frontier to measure against
+    }
+    LogStats probe;
+    if (sample_string_occupancy(probe)) {
+        stats_string_seen_ = true;
+        stats_string_last_ = probe.string_inflight_bytes;
+        if (probe.string_inflight_bytes > stats_string_inflight_max_) {
+            stats_string_inflight_max_ = probe.string_inflight_bytes;
+        }
+    }
+}
+
+inline void Logger::advance_string_frontier() noexcept {
+    // Called by the writer once per drained batch, with the batch already
+    // dispatched. Implements the cursor-pair rule described at
+    // stats_string_frontier_: hold one (entry cursor, string cursor) snapshot and
+    // promote the string half only once the read cursor has passed the entry half.
+    if (!stats_gen_open_) {
+        // Order matters and is the whole proof. R is read FIRST: every entry with
+        // a slot below R had already taken that slot, and a producer reserves its
+        // string before it takes a slot, so every one of those strings was
+        // reserved before R was read - and therefore before S, read after it. So
+        // "all slots below R drained" really does mean "everything below S
+        // consumed". Reading S first would let a slot below R reserve a string
+        // above S in between, and the promotion would free bytes still in use.
+        stats_gen_entry_ = log_queue_->initial_reading_index();
+        stats_gen_string_ = string_queue_->initial_reading_index();
+        stats_gen_open_ = true;
+    }
+    // read_index_ is this thread's own cursor, already advanced past the batch
+    // just written, so a relaxed load sees the writer's own last store.
+    if (read_index_.load(std::memory_order_relaxed) >= stats_gen_entry_) {
+        stats_string_frontier_.store(stats_gen_string_, std::memory_order_relaxed);
+        stats_gen_open_ = false;
+    }
+}
+
+inline bool Logger::sample_string_occupancy(LogStats& stats) noexcept {
+    if (!log_queue_ || !string_queue_) {
+        return false;
+    }
+    const uint64_t capacity = string_queue_->size();
+    if (capacity == 0) {
+        return false;
+    }
+
+    // The entry ring's reservation cursor is NOT a publication boundary: a producer
+    // reserves a slot, then fills it, then publishes. Reading a slot off that
+    // cursor would race the fill and yield torn data, so the statistics thread
+    // never touches the entry ring directly. The writer thread instead publishes
+    // the frontier below, taken from an entry read() has already handed it.
+    if (read_index_.load(std::memory_order_relaxed) >=
+        log_queue_->initial_reading_index()) {
+        // Nothing outstanding, so nothing in the string ring is still needed. A
+        // real measurement of zero, not an absent one: reporting it as invalid
+        // would hide the healthiest state the pipeline has.
+        stats.string_inflight_bytes = 0;
+        stats.string_pct = 0.0;
+        stats.string_pct_valid = true;
+        return true;
+    }
+
+    // Everything from the frontier to the write cursor is still outstanding. The
+    // frontier starts life at the ring cursor start() saw, so there is always a
+    // floor to measure from: before the writer has confirmed a single drain,
+    // nothing has been consumed, and the whole span since start really is in
+    // flight. That is a measurement, not an absence - reporting it as unknown
+    // would blank the row exactly while a startup burst was filling the ring.
+    const uint64_t watermark = stats_string_frontier_.load(std::memory_order_relaxed);
+    const uint64_t write_cursor = string_queue_->initial_reading_index();
+    // An absolute reserve index in both modes, so the span is a plain
+    // subtraction. Keeping it absolute is what lets an exactly full ring read as
+    // capacity instead of aliasing to zero, and makes a genuine overrun visible
+    // as a distance past capacity rather than silently folding back into range.
+    uint64_t behind = write_cursor > watermark ? write_cursor - watermark : 0;
+    if (behind > capacity) {
+        behind = capacity;
+    }
+
+    stats.string_inflight_bytes = behind;
+    stats.string_pct = std::min(
+        100.0, static_cast<double>(behind) * 100.0 / static_cast<double>(capacity));
+    stats.string_pct_valid = true;
+    return true;
+}
+inline LogStats Logger::sample_stats() noexcept {
+    LogStats stats;
+    const auto now = std::chrono::system_clock::now();
+    stats.timestamp_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    stats.sample_count = stats_sample_count_;
+
+    if (!log_queue_ || !string_queue_) {
+        return stats;
+    }
+
+    const uint64_t consumed = read_index_.load(std::memory_order_relaxed);
+    const uint64_t produced = log_queue_->initial_reading_index();
+    const uint64_t depth = produced > consumed ? produced - consumed : 0;
+    const uint64_t entry_capacity = log_queue_->size();
+    // A shared-memory producer has no writer thread, so read_index_ never advances
+    // and anything derived from it would be a fiction. Report those as zero, the
+    // same reasoning flush() uses to return early in that mode.
+    const bool has_reader = (mode_ != QueueMode::SharedProducer);
+
+    stats.entries_produced = produced;
+    stats.entries_consumed = has_reader ? consumed : 0;
+    stats.entry_queue_depth = has_reader ? depth : 0;
+    // The report-time reading is a sample too, and is taken after the last tick,
+    // so fold it in - otherwise the "peak" could come out below the value in the
+    // very same row.
+    stats.entry_queue_depth_max = has_reader ? std::max(stats_depth_max_, depth) : 0;
+    stats.entry_queue_capacity = static_cast<uint32_t>(entry_capacity);
+    if (has_reader && stats_sample_count_ != 0) {
+        stats.entry_queue_depth_mean =
+            static_cast<double>(stats_depth_sum_) / static_cast<double>(stats_sample_count_);
+    }
+    if (has_reader && entry_capacity != 0) {
+        const double capacity_d = static_cast<double>(entry_capacity);
+        stats.entry_queue_pct =
+            std::min(100.0, static_cast<double>(depth) * 100.0 / capacity_d);
+        stats.entry_queue_pct_max = std::min(
+            100.0, static_cast<double>(stats.entry_queue_depth_max) * 100.0 / capacity_d);
+    }
+
+    const uint64_t string_capacity = string_queue_->size();
+    stats.string_bytes_written = string_queue_->initial_reading_index();
+    stats.string_buffer_capacity = static_cast<uint32_t>(string_capacity);
+    stats.entry_loss_count = log_queue_->loss_count();
+    stats.string_loss_count = string_queue_->loss_count();
+
+    if (has_reader) {
+        // string_pct_valid covers the whole row, point value and peak alike. A row
+        // whose ticks never resolved a frontier reports unknown rather than a
+        // confident zero: a zero peak would read as "no pressure" at exactly the
+        // moment the ring might be filling unobserved.
+        if (sample_string_occupancy(stats)) {
+            stats_string_seen_ = true;
+            stats_string_last_ = stats.string_inflight_bytes;
+        } else if (stats_string_seen_) {
+            // This read found nothing, but a tick in this interval did. Report
+            // that rather than the previous interval's, which is staler.
+            stats.string_inflight_bytes = stats_string_last_;
+            stats.string_pct_valid = true;
+        } else {
+            // Nothing seen at all this interval; carry the last known value so a
+            // consumer sees the previous reading rather than a spurious zero.
+            stats.string_inflight_bytes = stats_previous_.string_inflight_bytes;
+            stats.string_pct_valid = false;
+        }
+
+        if (stats.string_pct_valid) {
+            // The peak comes from the oversampling ticks, which catch the bursts a
+            // single point sample misses.
+            stats.string_inflight_bytes_max =
+                std::max(stats_string_inflight_max_, stats.string_inflight_bytes);
+        }
+        if (string_capacity != 0) {
+            const double capacity_d = static_cast<double>(string_capacity);
+            stats.string_pct = std::min(
+                100.0, static_cast<double>(stats.string_inflight_bytes) * 100.0 / capacity_d);
+            stats.string_pct_max = std::min(
+                100.0,
+                static_cast<double>(stats.string_inflight_bytes_max) * 100.0 / capacity_d);
+        }
+    }
+
+    if (stats_has_previous_) {
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - stats_last_report_).count();
+        stats.interval_sec = elapsed;
+        if (elapsed > 0.0) {
+            // Deltas over the MEASURED elapsed time, so a late wake-up shifts when
+            // a sample lands but never distorts the rate it reports.
+            const auto delta = [](uint64_t now_v, uint64_t then_v) noexcept -> double {
+                return now_v > then_v ? static_cast<double>(now_v - then_v) : 0.0;
+            };
+            const double bytes =
+                delta(stats.string_bytes_written, stats_previous_.string_bytes_written);
+            stats.produced_per_sec =
+                delta(stats.entries_produced, stats_previous_.entries_produced) / elapsed;
+            stats.consumed_per_sec =
+                delta(stats.entries_consumed, stats_previous_.entries_consumed) / elapsed;
+            stats.string_bytes_per_sec = bytes / elapsed;
+            if (string_capacity != 0) {
+                const double capacity_d = static_cast<double>(string_capacity);
+                stats.string_turnover_pct = bytes * 100.0 / capacity_d;
+                stats.string_wraps_per_sec = bytes / capacity_d / elapsed;
+            }
+        }
+    }
+    return stats;
+}
+
+inline void Logger::stats_thread_func() {
+    using clock = std::chrono::steady_clock;
+    const auto tick = std::chrono::milliseconds(stats_sample_interval_ms_);
+    const auto report_every = std::chrono::milliseconds(stats_interval_ms_);
+
+    stats_last_report_ = clock::now();
+    auto next_report = stats_last_report_ + report_every;
+
+    while (running_.load(std::memory_order_relaxed)) {
+        // Sleeping one tick at a time is what keeps shutdown prompt: atomic::wait
+        // has no timeout in C++20, and a condition variable would need a mutex the
+        // rest of this logger does without. The tick doubles as the oversampling
+        // rate, so shutdown latency and gauge fidelity come from one knob.
+        std::this_thread::sleep_for(tick);
+        if (!running_.load(std::memory_order_relaxed)) {
+            break;
+        }
+        accumulate_stats_sample();
+
+        const auto now = clock::now();
+        if (now < next_report) {
+            continue;
+        }
+        const LogStats stats = sample_stats();
+        publish_stats(stats);
+        write_stats_row(stats);
+
+        stats_previous_ = stats;
+        stats_has_previous_ = true;
+        stats_last_report_ = now;
+        stats_depth_max_ = 0;
+        stats_depth_sum_ = 0;
+        stats_sample_count_ = 0;
+        stats_string_inflight_max_ = 0;
+        stats_string_last_ = 0;
+        stats_string_seen_ = false;
+        // Advance from the previous boundary rather than from now, so a late tick
+        // does not push every later report further and further out.
+        next_report += report_every;
+        if (next_report <= now) {
+            next_report = now + report_every;
+        }
+    }
+
+    // A last report, so both the file and the snapshot capture the end state.
+    accumulate_stats_sample();
+    const LogStats final_stats = sample_stats();
+    publish_stats(final_stats);
+    write_stats_row(final_stats);
+}
+
+inline void Logger::write_stats_header() {
+    static constexpr std::string_view kHeader =
+        "timestamp,interval_sec,sample_count,"
+        "entries_produced,entries_consumed,produced_per_sec,consumed_per_sec,"
+        "entry_queue_depth,entry_queue_depth_max,entry_queue_depth_mean,"
+        "entry_queue_capacity,entry_queue_pct,entry_queue_pct_max,"
+        "string_inflight_bytes,string_inflight_bytes_max,string_buffer_capacity,"
+        "string_pct,string_pct_max,string_pct_valid,"
+        "string_bytes_written,string_bytes_per_sec,string_turnover_pct,"
+        "string_wraps_per_sec,entry_loss_count,string_loss_count\n";
+    stats_stream_ << kHeader;
+    stats_bytes_written_ = kHeader.size();
+}
+
+inline void Logger::open_stats_csv() {
+    if (stats_file_.empty()) {
+        return; // snapshots only; nothing to write
+    }
+    detail::open_buffered_stream(stats_stream_, stats_stream_buffer_, stats_file_,
+                                 std::ios::out | std::ios::trunc,
+                                 detail::kStreamBufferSize);
+    if (!stats_stream_) {
+        throw std::runtime_error("Failed to open statistics file: " + stats_file_.string());
+    }
+    write_stats_header();
+}
+
+inline void Logger::roll_stats_csv() {
+    stats_stream_.flush();
+    stats_stream_.close();
+
+    std::filesystem::path backup = stats_file_;
+    backup.replace_extension();
+    backup += ".1.csv";
+
+    std::error_code ec;
+    std::filesystem::remove(backup, ec);
+    std::filesystem::rename(stats_file_, backup, ec);
+    if (ec) {
+        // Same fallback the daily sink uses: a rename across devices fails, a
+        // copy does not.
+        std::filesystem::copy_file(stats_file_, backup,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        if (!ec) {
+            std::filesystem::remove(stats_file_, ec);
+        }
+    }
+
+    detail::open_buffered_stream(stats_stream_, stats_stream_buffer_, stats_file_,
+                                 std::ios::out | std::ios::trunc,
+                                 detail::kStreamBufferSize);
+    if (stats_stream_) {
+        write_stats_header();
+    }
+}
+
+inline void Logger::write_stats_row(const LogStats& stats) {
+    if (stats_file_.empty() || !stats_stream_.is_open()) {
+        return;
+    }
+    if (stats_max_file_size_ != 0 && stats_bytes_written_ >= stats_max_file_size_) {
+        roll_stats_csv();
+        if (!stats_stream_.is_open()) {
+            return;
+        }
+    }
+
+    std::string row;
+    row.reserve(256);
+    TimestampFormatter{TimestampFormatter::Format::WITH_MICROSECONDS}
+        .append_timestamp(row, stats.timestamp_ns);
+    // No field can contain a comma, so the rows need no quoting.
+    std::format_to(std::back_inserter(row),
+                   ",{:.6f},{},{},{},{:.3f},{:.3f},{},{},{:.2f},{},{:.2f},{:.2f},"
+                   "{},{},{},{:.2f},{:.2f},{},{},{:.3f},{:.3f},{:.3f},{},{}\n",
+                   stats.interval_sec, stats.sample_count,
+                   stats.entries_produced, stats.entries_consumed,
+                   stats.produced_per_sec, stats.consumed_per_sec,
+                   stats.entry_queue_depth, stats.entry_queue_depth_max,
+                   stats.entry_queue_depth_mean, stats.entry_queue_capacity,
+                   stats.entry_queue_pct, stats.entry_queue_pct_max,
+                   stats.string_inflight_bytes, stats.string_inflight_bytes_max,
+                   stats.string_buffer_capacity,
+                   stats.string_pct, stats.string_pct_max,
+                   stats.string_pct_valid ? 1 : 0,
+                   stats.string_bytes_written, stats.string_bytes_per_sec,
+                   stats.string_turnover_pct, stats.string_wraps_per_sec,
+                   stats.entry_loss_count, stats.string_loss_count);
+
+    stats_stream_ << row;
+    stats_stream_.flush(); // a crash is exactly when these rows matter most
+    stats_bytes_written_ += row.size();
+
+    if (!stats_stream_ && !stats_write_failed_) {
+        // Never throw here: this runs on a background thread, and a failed CSV must
+        // not take the process down or stop stats_snapshot() from working. Say so
+        // once rather than on every interval.
+        stats_write_failed_ = true;
+        std::fprintf(stderr, "SlickLogger: failed writing statistics to %s\n",
+                     stats_file_.string().c_str());
+    }
+}
+
 inline void Logger::set_source_location_options(bool enabled) noexcept {
     source_location_options_.store(enabled ? kSourceLocationEnabled : 0, std::memory_order_release);
 }
@@ -3727,6 +4413,49 @@ inline void Logger::init(const std::filesystem::path& log_file, size_t log_queue
 }
 
 inline void Logger::start() {
+    // Before running_ and before any thread: open_stats_csv() throws on a file it
+    // cannot create, and a throw from here must leave the logger untouched rather
+    // than half-started with a live writer thread the failed caller never expects.
+    if (stats_enabled_) {
+        stats_depth_max_ = 0;
+        stats_depth_sum_ = 0;
+        stats_sample_count_ = 0;
+        stats_string_inflight_max_ = 0;
+        stats_string_last_ = 0;
+        stats_string_seen_ = false;
+        stats_bytes_written_ = 0;
+        stats_has_previous_ = false;
+        stats_write_failed_ = false;
+        // Seeded with the ring cursor as it stands now, not with a "nothing known
+        // yet" sentinel. Nothing this run reserves can end at or below it, so it
+        // is a true floor, and until the first promotion it is also the exact
+        // answer: the writer has confirmed no drain, so everything reserved since
+        // start is still in flight. A fresh local ring starts at zero; a shared
+        // segment starts wherever it was attached, which is why this is read
+        // rather than assumed.
+        stats_gen_entry_ = 0;
+        stats_gen_string_ = 0;
+        stats_gen_open_ = false;
+        uint64_t string_floor =
+            string_queue_ ? string_queue_->initial_reading_index() : 0;
+        if (mode_ == QueueMode::SharedCollector && collect_backlog_) {
+            // A collector replaying a backlog is the one case where the attach
+            // point is NOT a floor. It deliberately rewinds its entry reader
+            // below that point (see below), so the entries it is about to drain
+            // own strings that producers reserved before it ever attached -
+            // strings the attach cursor would declare free from the first
+            // sample, reporting an idle ring throughout the replay. Rewind the
+            // floor exactly the way the reader is rewound, to the oldest
+            // position the ring can still hold: anything older than that has
+            // been overwritten anyway, and what is left really is in flight
+            // until the replay has drained it.
+            const uint64_t capacity = string_queue_ ? string_queue_->size() : 0;
+            string_floor = string_floor > capacity ? string_floor - capacity : 0;
+        }
+        stats_string_frontier_.store(string_floor, std::memory_order_relaxed);
+        open_stats_csv();
+    }
+
     running_ = true;
 
     // A shared-memory producer has no sinks and no writer thread: the collector
@@ -3753,6 +4482,12 @@ inline void Logger::start() {
         writer_thread_ = std::thread([this]() { writer_thread_func(); });
     }
     log(LogLevel::L_INFO, "SlickLogger v{}", SLICK_LOGGER_VERSION);
+
+    // Spawned last, so the banner above is already in the queue rather than
+    // racing the first sample. The CSV is already open by this point.
+    if (stats_enabled_) {
+        stats_thread_ = std::thread([this]() { stats_thread_func(); });
+    }
 }
 
 inline void Logger::init(const LogConfig& config) {
@@ -3783,6 +4518,17 @@ inline void Logger::init(const LogConfig& config) {
 
     set_level(config.min_level);
     set_source_location_options(config.include_source_location);
+
+    // Written before start() spawns the statistics thread, which is the only
+    // reader of these afterwards, so they need no synchronization.
+    stats_enabled_ = config.enable_stats;
+    stats_file_ = config.stats_file;
+    stats_interval_ms_ = std::max(1u, config.stats_interval_ms);
+    // Oversampling faster than the reporting interval is the point; slower than it
+    // would starve the reports, so clamp rather than honour it.
+    stats_sample_interval_ms_ =
+        std::clamp(config.stats_sample_interval_ms, 1u, stats_interval_ms_);
+    stats_max_file_size_ = config.stats_max_file_size;
 
     // Ensure queue_size is power of 2
     size_t log_queue_size = round_up_to_power_of_2(config.log_queue_size);
@@ -4420,7 +5166,30 @@ inline void Logger::shutdown(bool clear_sinks) {
         if (writer_thread_.joinable()) {
             writer_thread_.join();
         }
+        // Must be joined before the queues are released below: the statistics
+        // thread dereferences both of them on every tick. It notices running_
+        // within one sample tick, so this never blocks for long.
+        if (stats_thread_.joinable()) {
+            stats_thread_.join();
+        }
     }
+    if (stats_stream_.is_open()) {
+        stats_stream_.flush();
+        stats_stream_.close();
+    }
+    stats_enabled_ = false;
+    // Dropped here rather than only in reset(), because shutdown() is what turns
+    // statistics off and stats_snapshot() documents a zeroed LogStats for a logger
+    // with them disabled. Left in place, the last snapshot of a finished run stays
+    // readable afterwards, and - since init() shuts down first - would resurface as
+    // live-looking data after a re-init with statistics off, or after an init()
+    // that threw out of open_stats_csv(). The statistics thread was joined above,
+    // so nothing can publish a new snapshot over this one.
+    stats_latest_.store(nullptr, std::memory_order_release);
+    stats_file_.clear();
+    stats_interval_ms_ = 0;
+    stats_sample_interval_ms_ = 0;
+    stats_max_file_size_ = 0;
     
     if (clear_sinks) {
         // Release sinks to free file handles and other resources, and to detach
@@ -4519,6 +5288,26 @@ inline void Logger::reset() {
     flush_done_.store(0, std::memory_order_relaxed);
     wake_token_.store(0, std::memory_order_relaxed);
     writer_parked_.store(false, std::memory_order_relaxed);
+
+    // Same reasoning: shutdown() above joined the statistics thread, so nothing
+    // else can be touching any of this, and clearing it leaves a reused Logger
+    // indistinguishable from a fresh one. The published snapshot is not among
+    // them - shutdown() drops that itself, so it is gone for every caller, not
+    // just the ones that go on to reset().
+    stats_previous_ = LogStats{};
+    stats_has_previous_ = false;
+    stats_string_frontier_.store(0, std::memory_order_relaxed);
+    stats_gen_entry_ = 0;
+    stats_gen_string_ = 0;
+    stats_gen_open_ = false;
+    stats_depth_max_ = 0;
+    stats_depth_sum_ = 0;
+    stats_sample_count_ = 0;
+    stats_string_inflight_max_ = 0;
+    stats_string_last_ = 0;
+    stats_string_seen_ = false;
+    stats_bytes_written_ = 0;
+    stats_write_failed_ = false;
 }
 
 inline Logger::DrainResult Logger::drain_pending() {
@@ -4533,6 +5322,13 @@ inline Logger::DrainResult Logger::drain_pending() {
 
     if (entry_ptr && count) {
         write_log_entry(entry_ptr, count);
+
+        if (stats_enabled_ && string_queue_) {
+            // Placed AFTER the dispatch: the promotion below means "the writer is
+            // done with everything under this position", which is only true once
+            // the batch has actually been written.
+            advance_string_frontier();
+        }
         stalled_since_ = {};
         return DrainResult::Wrote;
     }

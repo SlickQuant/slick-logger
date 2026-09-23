@@ -556,3 +556,124 @@ TEST_F(SharedMemoryTest, LocalModeOutputIsUnchanged) {
     EXPECT_NE(contents.find("local message 1"), std::string::npos);
     EXPECT_EQ(contents.find(own_pid), std::string::npos) << "local mode should not stamp a pid";
 }
+
+// ---------------------------------------------------------------------------
+// Statistics across a collector backlog replay
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Holds the collector inside write() so a backlog replay can be sampled while
+/// it is still running rather than after it has finished.
+class BacklogStallingSink : public slick::logger::ISink {
+public:
+    BacklogStallingSink() : ISink("backlog-stalling") {}
+    void write(const slick::logger::LogEntry&) override {
+        writes_.fetch_add(1, std::memory_order_release);
+        const int ms = stall_ms_.load(std::memory_order_relaxed);
+        if (ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+    }
+    void flush() override {}
+    void set_stall_ms(int ms) noexcept { stall_ms_.store(ms, std::memory_order_relaxed); }
+    uint32_t writes() const noexcept { return writes_.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<int> stall_ms_{0};
+    std::atomic<uint32_t> writes_{0};
+};
+
+} // namespace
+
+// Regression: a collector replaying a backlog rewinds its entry reader below the
+// point it attached, but the string frontier was seeded AT that point. Every
+// string those replayed entries own was reserved before the collector attached,
+// so it sat below the frontier and read as free from the very first sample: a
+// collector attaching to a segment stuffed with undrained entries reported an
+// idle string ring for the whole replay - precisely when that ring is at its
+// fullest. The floor is rewound with the reader now.
+TEST_F(SharedMemoryTest, BacklogReplayReportsTheStringsItHasNotDrainedYet) {
+    const auto log_path = temp_log("test_shm_backlog_stats.log");
+    const auto segment = unique_segment_name("slt_bs_");
+    constexpr int kProduced = 40;
+
+    // A real producer process fills the segment first and then lingers, so the
+    // segment is still there for the collector to attach to. Everything it logs
+    // is published - and undrained - before the collector exists.
+    const auto ready_marker = temp_log("test_shm_backlog_ready.marker");
+    std::thread producer([&] {
+        run_producer("--name " + segment + " --tag pre --count " + std::to_string(kProduced) +
+                     " --queue-size 1024 --string-buffer-size 65536 --linger-ms 3000"
+                     " --ready-file " + ready_marker.string());
+    });
+    // A sleep would only make the backlog PROBABLE: lose the race and the
+    // collector creates the segment itself, there is no backlog to replay, and
+    // the test silently stops testing anything. Wait for the producer to say it
+    // has published instead.
+    ASSERT_TRUE(wait_for([&] { return std::filesystem::exists(ready_marker); }))
+        << "the producer never signalled that it had filled the segment";
+
+    auto sink = std::make_shared<BacklogStallingSink>();
+    sink->set_stall_ms(80); // keeps the replay running while we sample it
+
+    LogConfig config;
+    config.mode = QueueMode::SharedCollector;
+    config.shared_memory_name = segment;
+    config.log_queue_size = 1024;
+    config.string_buffer_size = 1 << 16;
+    config.enable_stats = true;
+    config.stats_interval_ms = 20;
+    config.stats_sample_interval_ms = 2;
+    config.sinks.push_back(sink);
+    ASSERT_TRUE(config.collect_backlog) << "this test needs the default";
+    Logger::instance().init(config);
+
+    ASSERT_TRUE(wait_for([&] { return sink->writes() >= 1; }))
+        << "the collector never started replaying the backlog";
+
+    // read() hands back the whole published backlog as one run, so read_index_
+    // jumps to the end of it before the first sink write and the queue reads as
+    // drained for the entire dispatch - which short-circuits the occupancy to a
+    // valid zero whatever the frontier says. A few live entries behind the
+    // replay keep the queue genuinely non-empty, so the frontier is what is
+    // being measured here. They are logged before the sample, so the write
+    // cursor is static by the time it is read.
+    for (int i = 0; i < 3; ++i) {
+        LOG_INFO("live entry {} behind the replay", i);
+    }
+
+    // Demand a sample published AFTER those entries: the first report can land
+    // within a few ms of init(), long before any of this, and asserting on it
+    // would be asserting on the state before the test set it up.
+    const uint64_t logged_at = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    slick::logger::LogStats stats{};
+    const bool sampled = wait_for([&] {
+        stats = Logger::instance().stats_snapshot();
+        return stats.timestamp_ns >= logged_at && stats.sample_count > 0;
+    }, std::chrono::seconds(3));
+    const uint32_t writes_at_sample = sink->writes();
+    sink->set_stall_ms(0);
+
+    ASSERT_TRUE(sampled) << "no statistics sample landed during the replay";
+    ASSERT_LT(writes_at_sample, static_cast<uint32_t>(kProduced))
+        << "the replay finished before it could be sampled";
+    ASSERT_GT(stats.entry_queue_depth, 0u) << "the backlog should still be queued";
+    ASSERT_GT(stats.string_bytes_written, 1000u)
+        << "the producer should have left several KB of strings behind";
+    ASSERT_LT(stats.string_bytes_written, stats.string_buffer_capacity)
+        << "the backlog must fit in one lap, so the rewound floor lands at zero";
+    ASSERT_TRUE(stats.string_pct_valid);
+
+    // The producer stopped before the collector attached and the collector logs
+    // nothing but its own banner, so the write cursor is static here. This
+    // collector has consumed almost none of it, so essentially the whole ring is
+    // in flight for it - the seeded-at-attach frontier called all of it free.
+    EXPECT_EQ(stats.string_inflight_bytes, stats.string_bytes_written)
+        << "the replayed backlog's strings were reported free from the first sample";
+
+    Logger::instance().shutdown();
+    producer.join();
+}

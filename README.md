@@ -24,6 +24,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 - **Binary Payloads**: Log raw bytes and write them to a file verbatim with `BinarySink`, encoding entirely under your control
 - **Shared-Library Redirection**: Route plugin or strategy-library logs into a host application's logger
 - **Multi-Process Logging**: Several processes can log into one shared-memory queue drained by a single collector process
+- **Runtime Statistics**: An optional background thread samples throughput, queue fullness and drop counts, and writes them to a CSV
 - **Header-Only**: No linking required - just include and use
 - **Cross-Platform**: Supports Windows, Linux, and macOS
 - **Multi-Threaded**: Safe for concurrent logging from multiple threads
@@ -579,6 +580,11 @@ int main() {
 - `log_queue_size`: internal log-entry queue size, rounded up to a power of two
 - `string_buffer_size`: internal string-storage queue size, rounded up to a power of two
 - `include_source_location`: include file and line for `LOG_*` macro calls, default `true`
+- `enable_stats`: run the statistics thread, default `false` (see [Runtime Statistics](#runtime-statistics))
+- `stats_file`: where the statistics CSV is written; empty runs the thread for `stats_snapshot()` alone
+- `stats_interval_ms`: how often a CSV row is appended and a snapshot published, default `1000`
+- `stats_sample_interval_ms`: how often the queue-fullness gauges are sampled between reports, default `10`
+- `stats_max_file_size`: roll the CSV to `<stem>.1.csv` at this size, default 16 MB; `0` disables rolling
 
 ### Lifecycle and Runtime Controls
 
@@ -621,6 +627,85 @@ The writer thread flushes the file sinks once it has drained the queue, not afte
 A custom sink's `flush()` is only ever called on the writer thread, so it does not need its own locking against `write()`.
 
 An idle writer thread parks rather than polling on a timer, so an entry logged into an otherwise idle logger reaches its sink in tens of microseconds instead of waiting out a scheduler tick. Producers only signal a wake-up when the writer is actually parked, so this costs an atomic load and a predictable branch on the logging path. In `QueueMode::SharedCollector` the collector polls instead, because a producer in another process cannot signal it.
+
+### Runtime Statistics
+
+Both internal rings are lossy: if producers outrun the writer thread, older entries are overwritten. Statistics make that visible before it costs you a log line. A background thread samples the queues and publishes throughput, fullness and drop counts, both as a live snapshot and as rows in a CSV.
+
+It is opt-in, and **your logging threads pay nothing either way**: most figures are derived from cursors the queues already maintain, so no counter is touched when you call `LOG_*`, enabled or not. (Measured: the difference in enqueue throughput between statistics on and off was smaller than the run-to-run spread of repeating the same configuration, so it could not be resolved either way.)
+
+There is one cost, and it is on the *writer* thread rather than yours. String-ring occupancy needs a position that only the writer can read safely, so with statistics enabled it reads the two ring reservation cursors once per drained batch and compares one of them against its own read cursor. Two cursor reads per *batch*, not per entry, and it never inspects entry contents to do it - but not zero, and not something this README will put a number on.
+
+```cpp
+using namespace slick::logger;
+
+LogConfig config;
+config.sinks.push_back(std::make_shared<FileSink>("app.log"));
+config.enable_stats = true;
+config.stats_file = "app_stats.csv";
+config.stats_interval_ms = 1000;        // one CSV row per second
+config.stats_sample_interval_ms = 10;   // sample the gauges 100x per row
+config.stats_max_file_size = 16 * 1024 * 1024;
+
+Logger::instance().init(config);
+
+// ... later, from any thread ...
+const LogStats stats = Logger::instance().stats_snapshot();
+if (stats.entry_queue_pct_max > 80.0) {
+    // the queue peaked above 80% this interval - the writer is falling behind
+}
+```
+
+#### Two cadences, and why peaks matter
+
+Throughput and drop counts are cumulative counters, so they are exact whenever they are read. Queue fullness is not: it is an instantaneous gauge, and a burst that drives the queue to 90% and drains again in 200 ms is simply invisible to a once-per-second read.
+
+So the thread samples the gauges every `stats_sample_interval_ms` and reports the **peak** across each `stats_interval_ms` window:
+
+| Field | Meaning |
+| --- | --- |
+| `entry_queue_pct` / `string_pct` | a single point sample, taken when the row was written |
+| `entry_queue_pct_max` / `string_pct_max` | the peak across the whole interval - **this is the field to alert on** |
+| `sample_count` | how many ticks fed those peaks, so you can see the fidelity behind them |
+
+The sample interval is also how quickly the thread notices shutdown, so a long reporting interval never delays `shutdown()` by more than one tick. It is clamped into `[1, stats_interval_ms]`.
+
+#### What is measured
+
+- **Throughput** - `produced_per_sec` is messages entering the queue, `consumed_per_sec` is messages leaving it. In steady state the two match; `consumed` lagging `produced` is what makes the depth grow. Both are computed over the *measured* elapsed time, so a late wake-up on a loaded machine never distorts them.
+- **Entry queue fullness** - `entry_queue_depth` is how far the writer thread is behind the producers, against `entry_queue_capacity`.
+- **String ring occupancy** - `string_inflight_bytes` is the span between the frontier - the position below which the ring is provably free - and the producers' write cursor. The logger never calls `read()` on the string ring, so there is no read cursor to subtract, and the frontier is deliberately *not* read out of the entries the writer drains. It cannot be: a producer reserves its string bytes while it builds the entry and its entry slot only at the end, so slot order and string order are two independent races and neither implies the other. A producer holding earlier string bytes can take a later slot, so freeing the ring up to a drained entry's own string releases bytes an entry still queued behind it owns - the gauge reads idle over a ring that is not, and the frontier then lurches backwards when that entry finally drains.
+
+  Instead the writer snapshots the entry reservation cursor and *then* the string reservation cursor, and promotes the string half only once its own read cursor has passed the entry half. The order is the proof: every slot below the snapshot had already been taken, and a string is always reserved before its slot, so every one of those strings was reserved before the string cursor was read. When the writer has drained past the entry half, the whole ring below the string half is free - whatever order the producers published in. Between promotions the frontier simply stays put, which is the conservative direction: the span grows and the gauge reads fuller, which is exactly what a writer falling behind means. The frontier is an absolute reserve index, not a position within the ring, so a ring filled to exactly its capacity reads as `capacity` / `100%` instead of aliasing back to zero, and a genuine overrun shows as a distance past capacity that is then clamped. It is seeded at `start()` with the ring cursor as it stands, so there is always a floor to measure from: before the first promotion nothing has been confirmed drained, and the whole span since start really is in flight. A collector replaying a backlog is the exception: `collect_backlog` rewinds its entry reader below the point it attached, so the entries it is about to drain own strings reserved before it existed, and the attach cursor would call every one of them free for the whole replay. Its floor is rewound the same way the reader is - to the oldest position the ring can still hold - so the replay is reported as the in-flight backlog it is. `string_pct_valid` covers the whole row, point value and peak alike; with a string ring present a measurement is always available, and a fully drained queue is reported as a valid zero. The cost is two cursor reads per drained batch on the writer thread - it never inspects entry contents for this - and nothing at all on the producing thread.
+
+  One window stays invisible: a producer that has reserved string bytes but has not yet taken an entry slot appears in neither ordering, so if it is preempted there its bytes are unaccounted for until it publishes. Closing that would mean having producers announce reservations before publishing, which is not worth what it would cost the logging path.
+- **String ring pressure** - `string_bytes_per_sec`, `string_turnover_pct` and `string_wraps_per_sec` describe how fast the ring is being recycled. `string_turnover_pct` is a *rate*, not an occupancy: 100 means the ring turned over exactly once during the interval.
+- **Loss** - `entry_loss_count` is entries overwritten before the writer could read them. It reads `0` unless the queues were built with loss-detecting traits, since `slick::queue_traits::enable_loss_detection` defaults to off. `string_loss_count` is structurally always `0`: slick-queue counts losses inside `read()`, and the logger never calls it on the string ring.
+
+#### The CSV
+
+Opened fresh (truncated) on `init()` with a header row, one row appended per interval, and rolled to `<stem>.1.csv` when `stats_max_file_size` is reached. Columns, in order:
+
+```
+timestamp,interval_sec,sample_count,
+entries_produced,entries_consumed,produced_per_sec,consumed_per_sec,
+entry_queue_depth,entry_queue_depth_max,entry_queue_depth_mean,
+entry_queue_capacity,entry_queue_pct,entry_queue_pct_max,
+string_inflight_bytes,string_inflight_bytes_max,string_buffer_capacity,
+string_pct,string_pct_max,string_pct_valid,
+string_bytes_written,string_bytes_per_sec,string_turnover_pct,
+string_wraps_per_sec,entry_loss_count,string_loss_count
+```
+
+Leave `stats_file` empty to run the thread for `stats_snapshot()` alone and write no file. A CSV that cannot be created makes `init()` throw, exactly as an unopenable sink does; a write failure afterwards is reported once to `stderr` and never takes the process down.
+
+#### Notes
+
+- The statistics thread never touches a sink and never calls `log()`, so it cannot perturb what it measures. Sinks remain owned exclusively by the writer thread. It never reads the entry ring either - only cursors and the frontier the writer publishes.
+- `stats_snapshot()` returns a copy of an immutable published sample, so it is safe to call concurrently from any number of threads and no reader can observe a half-written one. It is not guaranteed wait-free: the sample lives in a `std::atomic<std::shared_ptr>`, which is lock-free only where the implementation says so (MSVC uses an internal lock), so a caller may briefly contend with the once-per-interval publish. It never touches the logging path.
+- `shutdown()` drops the last published sample along with the statistics thread, so `stats_snapshot()` reads as a zeroed `LogStats` once the logger is stopped - and stays zeroed through a re-`init()` with `enable_stats` off, or one that throws because the CSV cannot be created. Read the closing numbers *before* shutting down if you need them.
+- If the CSV cannot be created, `init()` throws before anything starts, leaving the logger stopped rather than half-initialized.
+- In `QueueMode::SharedProducer` there is no local writer thread, so `entries_consumed`, the depth fields and `consumed_per_sec` are reported as `0` - only the collector process can observe consumption. Produced counts and string-ring rates are still real.
 
 ### Log Pattern Formatting
 
@@ -745,13 +830,15 @@ Width costs something either way, but right alignment costs more: `%-8l` appends
 
 `%t` renders the id of the thread that made the `LOG_*` call, not the writer thread that formatted it. The id is the real OS thread id — what a debugger, `top -H` or ETW shows — resolved once per thread and stamped into each entry with a single thread-local read.
 
-This adds a `uint32_t` to `LogEntry`. Because that struct is what shared-memory producers and collectors agree on, **all processes sharing a segment must be built with the same setting**; a mismatch is detected at attach time and reported, not silently mis-read. To restore the pre-1.4.0 layout byte for byte, at the cost of `%t`:
+This adds a `uint32_t` to `LogEntry`, and that field is reserved in **every** build — the option costs the capture, never the layout. So processes sharing a segment need not agree on the setting: a producer built with it off simply publishes entries carrying thread id 0, and a collector reads them exactly as it reads anyone else's.
+
+To drop the per-call capture — one thread-local read on the producing thread — at the cost of `%t`:
 
 ```bash
 cmake -S . -B build -DSLICK_LOGGER_ENABLE_THREAD_ID=OFF
 ```
 
-With the feature compiled out, `set_pattern("%t")` throws and names the option.
+With the capture off, `set_pattern("%t")` throws and names the option, rather than rendering a flat `0` on every line.
 
 ### Timestamp Formatting
 
@@ -1261,6 +1348,7 @@ The repository includes comprehensive examples:
 - **`timestamp_example.exe`**: Demonstrates predefined and custom timestamp formats
 - **`multi_process_example.exe`**: Collector and producer roles logging across process boundaries
 - **`binary_sink_example.exe`**: Raw binary capture, custom framing, and the `LOG_SINK_*` fast path
+- **`statistics_example.exe`**: Live throughput, queue-fullness peaks, and the statistics CSV under load
 
 ## Building Examples/Tests  
 
@@ -1278,6 +1366,7 @@ cmake --build . --config Debug
 ./examples/Debug/multi_sink_example.exe
 ./examples/Debug/timestamp_example.exe
 ./examples/Debug/binary_sink_example.exe
+./examples/Debug/statistics_example.exe
 
 # Multi-process example: run the collector in one terminal and producers in others
 ./examples/Debug/multi_process_example.exe --collector --name demo_log
@@ -1287,6 +1376,7 @@ cmake --build . --config Debug
 ./tests/Debug/slick_logger_tests.exe
 ./tests/Debug/slick_logger_sink_tests.exe
 ./tests/Debug/slick_logger_timestamp_tests.exe
+./tests/Debug/slick_logger_statistics_tests.exe
 ./tests/Debug/slick_logger_shared_lib_tests.exe
 ./tests/Debug/slick_logger_shm_tests.exe
 ```

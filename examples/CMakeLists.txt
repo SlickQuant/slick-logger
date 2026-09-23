@@ -17,6 +17,9 @@ if(BUILD_SLICK_LOGGER_EXAMPLES)
     add_executable(binary_sink_example binary_sink_example.cpp)
     target_link_libraries(binary_sink_example slick::logger)
 
+    add_executable(statistics_example statistics_example.cpp)
+    target_link_libraries(statistics_example slick::logger)
+
     message(STATUS "Building slick-logger examples")
 else()
     message(STATUS "Skipping slick-logger examples")

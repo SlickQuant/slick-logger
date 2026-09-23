@@ -1,389 +1,346 @@
 # SlickLogger Benchmark Suite
 
-A comprehensive performance benchmarking suite for comparing SlickLogger against other popular C++ logging libraries.
-
-## Overview
-
-This benchmark suite provides detailed performance analysis across multiple dimensions:
-
-- **Throughput**: Messages per second under various thread loads
-- **Latency**: Time per individual log call (nanosecond precision)  
-- **Memory Usage**: Peak memory consumption and efficiency
-- **Scalability**: Performance scaling with thread count
-- **Burst Performance**: Handling of sudden logging spikes
-- **Resource Monitoring**: CPU usage and memory tracking
+Performance benchmarks comparing SlickLogger against other C++ logging libraries.
 
 ## Compared Libraries
 
-- **SlickLogger**: Our lock-free async logger with deferred formatting
-- **spdlog (sync)**: Popular synchronous logging library  
-- **spdlog (async)**: spdlog's asynchronous mode
-- **std::ofstream**: Baseline direct file output with fmt formatting
-- **fmt library**: Direct fmt::print to file (when available)
+| Name in results | What it is |
+|-----------------|------------|
+| `slick-logger` | This library: lock-free queue, deferred formatting, async writer thread |
+| `spdlog_sync` | spdlog 1.12.0 writing through `basic_file_sink_mt` on the calling thread |
+| `spdlog_async` | spdlog 1.12.0 in async mode (8192-slot queue, one worker thread) |
+| `std_ofstream` | Baseline: `fmt::format` into an `std::ofstream` with `std::endl` per line |
 
-## Quick Start
+spdlog and fmt are fetched automatically by `benchmarks/CMakeLists.txt` (spdlog 1.12.0, fmt 10.1.0).
 
-### Prerequisites
+## Results
 
-- CMake 3.20 or later
-- C++20 compatible compiler
-- Internet connection (to download dependencies)
+Everything below is a real run of the suite at its default settings. Re-run it
+yourself before quoting any of it — these numbers describe one machine.
 
-### Building
+### Measured on
+
+| Property | Value |
+|----------|-------|
+| CPU | AMD Ryzen 9 5900HX (8 cores / 16 threads, 3.3 GHz base) |
+| RAM | 32 GB |
+| OS | Windows 11 Pro 26200 |
+| Compiler | MSVC 19.44 (toolset 14.44.35207), `/O2 /DNDEBUG`, C++20 |
+| Log output | Local NVMe SSD |
+| Settings | 50,000 iterations × 3 runs (the defaults) |
+| Date | 2026-09-22 |
+
+### Read this before the tables
+
+**Put the log output on a local disk.** Every library here ultimately writes to
+a file, so the storage device sets the ceiling for the synchronous ones. The
+same suite run with its working directory on an SMB share measured
+`spdlog_sync` at 9,021 ops/sec and `std_ofstream` at 202 ops/sec — 144× and
+310× below the local-disk numbers in the table below. `slick-logger` barely
+moved (8.8M vs 7.7M), because its producer threads never touch the file. That
+asymmetry makes a network-mounted run useless for comparison and flattering to
+this library. The runner scripts cd into the build tree, so check where your
+build tree actually lives.
+
+### Throughput (ops/sec, higher is better)
+
+**Small messages** — one literal, no arguments:
+
+| Threads | slick-logger | spdlog_async | spdlog_sync | std_ofstream |
+|--------:|-------------:|-------------:|------------:|-------------:|
+| 1 | 7,669,915 | 3,765,386 | 1,298,350 | 62,700 |
+| 2 | 6,018,601 | 2,852,539 | 822,326 | — |
+| 4 | 8,723,449 | 2,242,966 | 725,643 | — |
+| 8 | 10,960,620 | 1,925,261 | 490,994 | — |
+
+**Medium messages** — three arguments (int, double, string):
+
+| Threads | slick-logger | spdlog_async | spdlog_sync | std_ofstream |
+|--------:|-------------:|-------------:|------------:|-------------:|
+| 1 | 4,750,287 | 899,182 | 575,968 | 59,732 |
+| 2 | 4,285,896 | 1,343,762 | 408,128 | — |
+| 4 | 4,487,423 | 1,444,199 | 296,298 | — |
+| 8 | 5,097,901 | 1,395,898 | 211,542 | — |
+
+**Large messages** — eleven arguments:
+
+| Threads | slick-logger | spdlog_async | spdlog_sync | std_ofstream |
+|--------:|-------------:|-------------:|------------:|-------------:|
+| 1 | 3,152,905 | 445,112 | 173,023 | 47,921 |
+| 2 | 2,738,959 | 735,008 | 147,620 | — |
+| 4 | 3,051,647 | 1,121,690 | 107,400 | — |
+| 8 | 3,192,537 | 1,219,525 | 82,540 | — |
+
+The baseline only runs single-threaded; a shared `std::ofstream` across threads
+is not a meaningful comparison.
+
+The 2-thread dip for `slick-logger` on small messages is reproducible: at one
+thread the producer has the queue's cacheline to itself, and at two it starts
+paying for the contention without yet having enough parallelism to cover it.
+
+### Latency (ns per call, lower is better)
+
+Producer-side cost of a `LOG_*` call — the time to stamp and enqueue, not the
+time until the line reaches disk.
+
+| Message size | Mean | Median |
+|--------------|-----:|-------:|
+| Small | 169 | 177 |
+| Medium | 288 | 302 |
+| Large | 337 | 340 |
+
+From `latency_benchmark`, which times each call individually (10,000 samples):
+
+| Metric | slick-logger | spdlog_sync |
+|--------|-------------:|------------:|
+| Mean | 173 ns | 1,420 ns |
+| Median | 200 ns | 500 ns |
+| P95 | 200 ns | 900 ns |
+| P99 | 300 ns | 32,800 ns |
+| P99.9 | 2,600 ns | 92,100 ns |
+| Max | 42,800 ns | 156,700 ns |
+
+The tail is the point: `spdlog_sync`'s P99 is 66× its median, because a
+synchronous call eventually waits on the file. SlickLogger's P99 is 1.5× its
+median — the writer thread absorbs the I/O.
+
+**Timer granularity.** `latency_benchmark` reports a 100 ns minimum and a
+median landing exactly on 200 ns because Windows' `high_resolution_clock` ticks
+at 100 ns. Per-call figures below roughly 100 ns cannot be resolved by this
+harness, which is why its distribution collapses into the 100–500 ns bucket
+(99.5% of samples). The aggregate figures in the table above — total elapsed
+time divided by iterations — are the more precise measurement.
+
+**Latency under background load** (`latency_benchmark`):
+
+| Background load | Mean | P99 |
+|-----------------|-----:|----:|
+| idle | 170 ns | 300 ns |
+| 1,000 msg/sec | 318 ns | 500 ns |
+| 5,000 msg/sec | 209 ns | 300 ns |
+| 10,000 msg/sec | 187 ns | 200 ns |
+
+### Thread scaling (`throughput_benchmark`)
+
+Medium messages, a separate harness from the table above, so absolute numbers
+differ:
+
+| Threads | slick-logger | Efficiency | spdlog_async | Efficiency |
+|--------:|-------------:|-----------:|-------------:|-----------:|
+| 1 | 3,461,010 | 100.0% | 1,654,210 | 100.0% |
+| 2 | 4,015,298 | 58.0% | 658,008 | 19.9% |
+| 4 | 6,052,820 | 43.7% | 255,286 | 3.9% |
+| 8 | 8,607,713 | 31.1% | 140,065 | 1.1% |
+| 16 | 9,359,610 | 16.9% | 113,637 | 0.4% |
+
+Efficiency is per-thread, so it falls as threads are added even while total
+throughput rises. What matters is the direction: SlickLogger's total keeps
+climbing through 16 threads, while `spdlog_async`'s total *drops* — 1.65M at
+one thread down to 114K at sixteen, a 14× regression under contention.
+
+**Burst handling** — five bursts of 50,000 messages, one second apart:
+
+| Logger | Mean | StdDev |
+|--------|-----:|-------:|
+| slick-logger | 3,083,616 ops/sec | 56,461 |
+| spdlog_async | 1,429,902 ops/sec | 96,855 |
+
+### Memory (`memory_benchmark`)
+
+| Logger | Queue size | Peak MB |
+|--------|-----------:|--------:|
+| SlickLogger | 1,024 | 257 |
+| SlickLogger | 8,192 | 259 |
+| SlickLogger | 65,536 | 285 |
+| SlickLogger | 262,144 | 357 |
+| spdlog_async | 1,024 | 0 |
+| spdlog_async | 8,192 | 3 |
+| spdlog_async | 65,536 | 25 |
+| spdlog_async | 262,144 | 102 |
+
+**Read the peak column carefully, and ignore the `Bytes/Msg` and `Efficiency`
+columns the tool prints.** Those divide peak memory by the message count, and
+since SlickLogger's footprint is dominated by a fixed allocation that has
+nothing to do with message count, they say nothing useful.
+
+The ~256 MB floor is real, and it is not the entry queue. `Logger::init()`
+defaults `string_buffer_size` to `1 << 24`, and the string ring is a
+`slick::queue<char>` — one element per *byte*. slick-queue allocates a 16-byte
+control slot per element, so a 16 MB string buffer carries a 256 MB control
+array. That is the number in the table, at every queue size. Size
+`string_buffer_size` deliberately if memory matters; it costs 17× what its name
+suggests.
+
+Steady-state behaviour is unremarkable by comparison — the sustained-load test
+logged 300,006 messages at 10,000 msg/sec with a 5 MB peak and 5 MB final, and
+ten fragmentation cycles produced 0 MB of growth.
+
+## Building
+
+The benchmarks are gated on **two** conditions — the option, and a Release
+build type. Miss either and `benchmarks/` is silently skipped, with no error:
 
 ```bash
-# Clone and build with benchmarks enabled
-git clone <your-repo-url>
-cd slick-logger
-mkdir build && cd build
-
-# Enable benchmarks during cmake configuration
-cmake -DBUILD_BENCHMARKS=ON ..
-
-# Build all benchmarks
-cmake --build . --config Release
-
-# Or build specific benchmarks
-cmake --build . --target slick_logger_benchmark
-cmake --build . --target latency_benchmark  
-cmake --build . --target throughput_benchmark
-cmake --build . --target memory_benchmark
+cmake -S . -B build-bench -DBUILD_SLICK_LOGGER_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-bench --config Release
 ```
 
-### Running Benchmarks
+`-DCMAKE_BUILD_TYPE=Release` is required even for multi-config generators
+(Visual Studio, Ninja Multi-Config), because the top-level `CMakeLists.txt`
+tests that variable directly:
+
+```cmake
+if(BUILD_SLICK_LOGGER_BENCHMARKS AND CMAKE_BUILD_TYPE MATCHES Release)
+    add_subdirectory(benchmarks)
+endif()
+```
+
+The first configure clones and builds spdlog and fmt, which takes a few
+minutes; later configures reuse them.
+
+## Running
+
+Executables land in `build-bench/benchmarks/Release/` (multi-config) or
+`build-bench/benchmarks/` (single-config).
+
+Run them from a directory on **local storage** — each writes its log files to
+`benchmark_logs/` relative to the working directory:
 
 ```bash
-# Run comprehensive benchmark suite
-./slick_logger_benchmark
-
-# Run with custom parameters (iterations, runs)  
-./slick_logger_benchmark 100000 5
-
-# Run individual benchmark suites
-./latency_benchmark
-./throughput_benchmark
-./memory_benchmark
+cd /path/to/local/scratch
+/path/to/build-bench/benchmarks/Release/slick_logger_benchmark.exe
 ```
+
+The main suite takes roughly 10 minutes at default settings. Pass a smaller
+iteration count and run count for a quick check:
+
+```bash
+# iterations, runs
+slick_logger_benchmark 5000 1
+```
+
+`run_benchmarks.sh` / `run_benchmarks.bat` wrap all four programs and accept
+`quick` or `full`. They locate the build tree next to the repository, so they
+inherit whatever storage that tree sits on.
 
 ## Benchmark Programs
 
-### 1. slick_logger_benchmark (Main Suite)
+### slick_logger_benchmark
 
-Comprehensive comparison across all libraries and scenarios:
+The main suite: throughput across three message sizes and 1/2/4/8 threads,
+aggregate latency, and a coarse memory comparison. Takes `[iterations] [runs]`
+(defaults 50,000 and 3).
 
-```bash
-./slick_logger_benchmark [iterations] [runs]
 ```
-
-**Parameters:**
-- `iterations`: Number of log calls per test (default: 50,000)
-- `runs`: Number of test runs for statistical averaging (default: 3)
-
-**Test Scenarios:**
-- Single-threaded throughput (small, medium, large messages)
-- Multi-threaded throughput (1, 2, 4, 8 threads)
-- Latency measurements (nanosecond precision)
-- Memory usage analysis
-- Mixed message size performance
-
-**Sample Output:**
-```
-=== THROUGHPUT BENCHMARKS ===
-
---- Small Messages ---
-
 Testing with 1 thread(s):
-Library               Mean      Median     P95       P99         StdDev
+Library                     Mean      Median         P95         P99      StdDev
 --------------------------------------------------------------------------------
-slick_logger_small   2847291   2856543   2801234   2745123        45.2
-spdlog_async_small   1934521   1945123   1876543   1823451        52.1
-spdlog_sync_small     876543    881234    845123    823456        28.9
-std_ofstream_small    654321    661234    634567    612345        31.4
+slick-logger             7669915     7078844     7078844     7078844    844687.7
+spdlog_sync              1298350     1332406     1332406     1332406    118814.6
+spdlog_async             3765386     3825643     3825643     3825643    518847.3
+std_ofstream               62700       62549       62549       62549      2653.1
 
 Unit: ops/sec
 ```
 
-### 2. latency_benchmark (Detailed Latency Analysis)
+With the default 3 runs, P95 and P99 are taken from three samples, so they
+equal the maximum. They only become meaningful with a larger `runs` argument.
 
-In-depth latency measurement with distribution analysis:
+### latency_benchmark
 
-```bash
-./latency_benchmark
+Per-call latency with a distribution histogram, a warmup-vs-steady-state
+comparison, and latency under background load.
+
 ```
-
-**Features:**
-- Individual call latency measurement
-- Latency distribution histograms  
-- Timeline analysis (warmup effects)
-- Queue pressure impact testing
-- P99.9 latency percentiles
-
-**Sample Output:**
-```
-=== DETAILED LATENCY ANALYSIS ===
-
+=== Call Latency (ns) ===
 Samples: 10000
-Mean:    58.00
-Median:  51.00
-Min:     40.00
-Max:     6415.00
-StdDev:  72.97
-P95:     80.00
-P99:     141.00
-P99.9:   312.00
+Mean:    173.22
+Median:  200.00
+Min:     100.00
+Max:     42800.00
+StdDev:  571.48
+P95:     200.00
+P99:     300.00
+P99.9:   2600.00
 
 Latency Distribution:
-0-100ns     :   9745 (97.5%)
-100-500ns   :    253 (2.5%)
-500ns-1μs  :      0 (0.0%)
-1-5μs      :      1 (0.0%)
-5-10μs     :      1 (0.0%)
-10-50μs    :      0 (0.0%)
-50-100μs   :      0 (0.0%)
->100μs     :      0 (0.0%)
+0-100ns     :      0 (0.0%)
+100-500ns   :   9946 (99.5%)
+500ns-1us   :     21 (0.2%)
+1-5us       :     29 (0.3%)
+5-10us      :      2 (0.0%)
+10-50us     :      2 (0.0%)
 ```
 
-### 3. throughput_benchmark (Scaling Analysis)
+Its "Timeline Analysis" compares the first 100 calls against the last 100 and
+prints a "degraded by N%" line. Treat that as noise: 100 samples at 100 ns
+timer resolution is far too small a window to conclude anything from, and it
+fires for spdlog too.
 
-Detailed throughput testing with thread scaling analysis:
+### throughput_benchmark
 
-```bash
-./throughput_benchmark
-```
+Thread scaling from 1 to 16, with CPU and memory sampling, plus the burst test.
 
-**Features:**
-- Thread scaling from 1 to 16 threads
-- Efficiency analysis (scaling effectiveness)
-- Burst performance testing
-- CPU and memory monitoring during tests
-- Contention analysis
-
-**Sample Output:**
 ```
 === SCALING ANALYSIS ===
 Logger          Threads  Throughput     CPU % Memory MB  Efficiency
 ---------------------------------------------------------------------------
-SlickLogger           1     6913828       0.0         2      100.0%
-SlickLogger           2     7800319       0.0         2       56.4%
-SlickLogger           4    12884857       0.0         0       46.6%
-SlickLogger           8    16699893       0.0         0       30.2%
-SlickLogger          16    21878777       0.0         0       19.8%
-
-spdlog_async          1     4979162       0.0         0      100.0%
-spdlog_async          2      446211       0.0         0        4.5%
-spdlog_async          4       84410       0.0         0        0.4%
-spdlog_async          8       91394       0.0         0        0.2%
-spdlog_async         16       99235       0.0         0        0.1%
-
-spdlog_sync           1     4187016       0.0         0      100.0%
-spdlog_sync           2     1871659       0.0         0       22.4%
-spdlog_sync           4     1666028       0.0         0        9.9%
+SlickLogger           1     3461010     169.8         1      100.0%
+SlickLogger           2     4015298     249.9         2       58.0%
+SlickLogger           4     6052820     455.3         4       43.7%
+SlickLogger           8     8607713     792.5        11       31.1%
+SlickLogger          16     9359610     791.6        16       16.9%
 ```
 
-### 4. memory_benchmark (Memory Analysis)
+### memory_benchmark
 
-Comprehensive memory usage analysis:
-
-```bash
-./memory_benchmark
-```
-
-**Features:**
-- Peak memory consumption measurement
-- Memory-per-message efficiency
-- Queue size impact analysis
-- Sustained load memory stability
-- Memory fragmentation detection
-- Memory leak detection
-
-**Sample Output:**
-```
-=== MEMORY USAGE COMPARISON ===
-Logger         Queue Size   Peak MB   Bytes/Msg  Efficiency
-----------------------------------------------------------------------
-SlickLogger          1024        68     35036.0          29
-spdlog_async         1024         0       186.0        5376
-SlickLogger          8192        68      4414.0         227
-spdlog_async         8192         0         0.0         inf
-SlickLogger         65536        81       655.4        1526
-spdlog_async        65536        25       204.0        4901
-SlickLogger        262144       137       274.7        3641
-spdlog_async       262144       102       204.0        4902
-
-Efficiency = Messages per MB of memory used
-```
-
-## Benchmark Configuration
-
-### Environment Variables
-
-```bash
-# Set CPU affinity for consistent results
-export SLICK_BENCHMARK_CPU_AFFINITY=0,1,2,3
-
-# Set output directory  
-export SLICK_BENCHMARK_OUTPUT_DIR=./benchmark_results
-
-# Enable detailed output
-export SLICK_BENCHMARK_VERBOSE=1
-```
-
-### Compile-Time Options
-
-```cmake
-# Enable additional debug information in benchmarks
--DBENCHMARK_DEBUG_OUTPUT=ON
-
-# Use system spdlog instead of fetching
--DUSE_SYSTEM_SPDLOG=ON
-
-# Disable specific benchmarks
--DENABLE_MEMORY_BENCHMARKS=OFF
-```
-
-## Understanding Results
-
-### Throughput Metrics
-
-- **ops/sec**: Operations (log calls) per second
-- Higher values indicate better performance
-- Linear scaling with threads indicates good parallelization
-- Compare against baseline (std::ofstream) for context
-
-### Latency Metrics  
-
-- **Mean/Median**: Average response time per call
-- **P95/P99**: 95th and 99th percentile latencies
-- **P99.9**: Critical for understanding tail latencies
-- Lower values indicate better responsiveness
-
-### Memory Metrics
-
-- **Peak Memory**: Maximum memory used during test
-- **Bytes/Message**: Memory efficiency indicator  
-- **Efficiency Score**: Messages processed per MB
-- Lower peak memory and bytes/message is better
-
-### Scaling Efficiency
+Peak memory across four queue sizes, a 30-second sustained-load test, and a
+fragmentation check. Runs for about a minute.
 
 ```
-Efficiency = (Throughput_N_threads / Throughput_1_thread) / N_threads * 100%
+=== SUSTAINED LOAD MEMORY TEST ===
+Running sustained load test for 30 seconds at 10000 msgs/sec
+SlickLogger sustained load results:
+  Messages logged: 300006
+  Peak memory: 5 MB
+  Final memory: 5 MB
 ```
 
-- 100% = perfect linear scaling
-- >80% = good scaling
-- <60% = poor scaling, likely contention issues
+`simple_benchmark` and `quick_benchmark` also build. They are scratch programs
+for checking that a build works, not measurement tools — they report a single
+timing with no statistics.
 
-## Optimization Tips
+## Getting Trustworthy Numbers
 
-Based on benchmark results:
+- Build Release. A Debug build measures nothing useful.
+- Write logs to local storage (see above).
+- Close other applications; a background compile moves these numbers by more
+  than most of the differences being measured.
+- Raise `runs` above the default 3 before reading P95/P99.
+- Check for thermal throttling on laptops — the 5900HX here sustains its clocks
+  for a single suite run, but back-to-back runs drift.
 
-### For High Throughput
-- Use async logging libraries (SlickLogger, spdlog async)
-- Increase queue size for better batching
-- Consider multiple writer threads for very high loads
+## Extending
 
-### For Low Latency  
-- Prefer SlickLogger's deferred formatting
-- Use smaller queue sizes to reduce memory pressure
-- Consider sync logging for ultra-low latency requirements
-
-### For Memory Efficiency
-- Tune queue sizes based on expected load
-- Monitor for memory fragmentation in long-running applications
-- Consider message size impact on memory usage
-
-## Troubleshooting
-
-### Common Issues
-
-**Build Errors:**
-```bash
-# Missing dependencies
-sudo apt-get install build-essential cmake
-
-# C++20 support issues  
-export CXX=g++-10  # or clang++-12
-```
-
-**Runtime Issues:**
-```bash
-# Permission errors with log files
-mkdir -p benchmark_logs
-chmod 755 benchmark_logs
-
-# Memory allocation failures
-ulimit -v unlimited
-```
-
-**Inconsistent Results:**
-```bash
-# Disable CPU frequency scaling
-echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# Disable hyperthreading if needed
-echo off | sudo tee /sys/devices/system/cpu/smt/control
-```
-
-### Performance Tuning
-
-**For Accurate Benchmarks:**
-- Run in Release mode only (`-DCMAKE_BUILD_TYPE=Release`)
-- Close unnecessary applications
-- Use CPU affinity to pin threads
-- Run multiple iterations and average results
-- Consider system warm-up time
-
-**System Configuration:**
-```bash
-# Increase file descriptor limits
-ulimit -n 65536
-
-# Increase memory limits
-ulimit -m unlimited
-
-# Set process priority
-nice -n -10 ./slick_logger_benchmark
-```
-
-## Extending Benchmarks
-
-### Adding New Libraries
-
-1. Create benchmark scenario class inheriting from `ThroughputScenario` or `LatencyScenario`
-2. Implement logger-specific setup/cleanup and log_message methods
-3. Add to benchmark runner in appropriate test functions
-4. Update CMakeLists.txt with new dependencies
-
-### Custom Test Scenarios
+To add a library, derive from `BenchmarkScenario` in `benchmark_main.cpp`:
 
 ```cpp
-// Example custom scenario
-class CustomThroughputScenario : public ThroughputScenario<YourLogger> {
+class MyLoggerScenario : public BenchmarkScenario {
 public:
-    CustomThroughputScenario(size_t threads) 
-        : ThroughputScenario(nullptr, "your_logger", threads) {}
-    
-    void setup() override {
-        // Initialize your logger
-    }
-    
-    void log_message() override {
-        // Call your logger's log function
-    }
+    MyLoggerScenario(MessageSize s) : BenchmarkScenario("my_logger"), msg_size_(s) {}
+    void setup() override      { /* construct, warm up */ }
+    void cleanup() override    { /* flush and destroy */ }
+    void log_single_message() override { /* one call, no timing code */ }
 };
 ```
 
-## Contributing
+Then add it to `run_throughput_benchmarks()` and `run_latency_benchmarks()`,
+and link the dependency in `benchmarks/CMakeLists.txt`.
 
-When adding new benchmarks or improvements:
-
-1. Follow existing code structure and naming conventions
-2. Add appropriate statistical analysis
-3. Include documentation for new test scenarios  
-4. Ensure cross-platform compatibility
-5. Add example output to documentation
+`setup()` and `cleanup()` are outside the timed region. Put warmup in `setup()`
+and any flush or shutdown in `cleanup()` — a flush left in `log_single_message()`
+measures the disk instead of the library.
 
 ## License
 
-This benchmark suite is part of SlickLogger and follows the same MIT license.
+Part of SlickLogger; same MIT license.

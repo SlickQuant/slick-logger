@@ -16,12 +16,13 @@ using namespace slick::logger;
 // LogEntry is the layout shared-memory producers and collectors agree on, so its
 // size is part of the ABI, not an implementation detail. Pinned here so a field
 // added without thinking about multi-process peers fails the build rather than a
-// user's attach. %t adds exactly one uint32_t to the 1.3.0 layout.
+// user's attach. The thread id adds exactly one uint32_t to the 1.3.0 layout, and
+// the field is reserved whatever SLICK_LOGGER_ENABLE_THREAD_ID says - a flat size
+// here is what pins that: the option may cost the capture, never the layout.
 #if (defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)) \
     && SLICK_LOGGER_MAX_ARGS == 20 && SLICK_LOGGER_TAG_SIZE == 16
-static_assert(sizeof(LogEntry) == (SLICK_LOGGER_ENABLE_THREAD_ID ? 327 : 323),
-              "LogEntry layout changed: every process sharing a segment must be rebuilt, "
-              "and SLICK_LOGGER_ENABLE_THREAD_ID=OFF must still reproduce the 1.3.0 layout");
+static_assert(sizeof(LogEntry) == 327,
+              "LogEntry layout changed: every process sharing a segment must be rebuilt");
 #endif
 
 namespace {
@@ -725,7 +726,7 @@ TEST_F(PatternTest, ThreadIdFlagMatchesTheBuildSetting) {
 #if SLICK_LOGGER_ENABLE_THREAD_ID
     EXPECT_NO_THROW(sink.set_pattern("%t"));
 #else
-    // Compiled out: the flag must say so rather than render nothing.
+    // Capture compiled out: the flag must say so rather than render a flat 0.
     EXPECT_THROW(sink.set_pattern("%t"), std::invalid_argument);
 #endif
 }

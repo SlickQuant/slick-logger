@@ -45,7 +45,7 @@ check_build() {
     if [[ ! -d "$BUILD_DIR" ]]; then
         print_error "Build directory not found. Please run cmake first:"
         echo "  mkdir build && cd build"
-        echo "  cmake -DBUILD_BENCHMARKS=ON .."
+        echo "  cmake -DBUILD_SLICK_LOGGER_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release .."
         echo "  cmake --build . --config Release"
         exit 1
     fi

@@ -1,0 +1,5 @@
+# Handle text files automatically and force them to use LF on checkout
+* text=auto eol=lf
+
+# Explicitly force LF for shell scripts or source files if needed
+*.sh text eol=lf
