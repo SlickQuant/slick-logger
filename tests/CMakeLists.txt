@@ -41,6 +41,16 @@ if(BUILD_SLICK_LOGGER_TESTING)
     target_link_libraries(slick_logger_statistics_tests slick::logger GTest::gtest_main)
     add_test(NAME slick_logger_statistics_tests COMMAND slick_logger_statistics_tests)
 
+    # Compiles the statistics publish against the no-P0718 branch of
+    # detail::atomic_shared_ptr on every platform, not just the ones (libc++)
+    # that select it. Its own executable on purpose: the macro changes the type
+    # of a Logger member, so mixing it with a normally-built TU would be an ODR
+    # violation rather than a test.
+    add_executable(slick_logger_stats_fallback_tests test_stats_atomic_fallback.cpp)
+    target_include_directories(slick_logger_stats_fallback_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(slick_logger_stats_fallback_tests slick::logger GTest::gtest_main)
+    add_test(NAME slick_logger_stats_fallback_tests COMMAND slick_logger_stats_fallback_tests)
+
     # --- Shared-library integration test ---
     # Build a minimal plugin as a real shared library (.dll/.so), then load it
     # at runtime to verify LOG_* calls inside the plugin are routed to the host

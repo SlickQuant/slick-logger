@@ -351,6 +351,88 @@ struct logger_queue_traits : public slick::queue_traits {
     static constexpr bool enable_read_last = false;
 };
 
+// P0718's std::atomic<std::shared_ptr<T>>. Availability has to be tested before
+// the type is ever named: libc++ ships no specialization, and naming it there
+// instantiates the primary std::atomic template, which hard-errors on its
+// is_trivially_copyable mandate rather than degrading into something usable.
+#ifndef SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR
+#  if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+#    define SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR 1
+#  else
+#    define SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR 0
+#  endif
+#endif
+
+// The shared_ptr atomic free functions are deprecated in C++20. Silenced at the
+// one place they are named rather than in the build of every project that
+// includes this header. The pragma wraps the template definition, which is where
+// the diagnostic is anchored even though it fires on instantiation.
+#if !SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR
+#  if defined(__clang__) || defined(__GNUC__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#  elif defined(_MSC_VER)
+#    pragma warning(push)
+#    pragma warning(disable : 4996)
+#  endif
+#endif
+
+/**
+ * @brief Atomic load and store of a std::shared_ptr
+ *
+ * The C++20 std::atomic<std::shared_ptr<T>> where the standard library provides
+ * it, and the pre-C++20 free functions where it does not - libc++ being the case
+ * that matters, which implements neither P0718 nor its feature-test macro.
+ *
+ * Both spellings carry the same guarantee, which is the one the statistics
+ * publish is built on: a reader gets either the old pointer or the new one, never
+ * a torn read, and whichever it gets stays alive for as long as it holds it.
+ * Neither is required to be lock-free - MSVC and libc++ both take an internal
+ * lock - and nothing here sits on the logging hot path, so that costs nothing
+ * that matters.
+ *
+ * The free functions are removed in C++26, which the fallback would care about
+ * only on a libc++ new enough to compile as C++26 while still lacking P0718.
+ */
+template <typename T>
+class atomic_shared_ptr {
+public:
+    atomic_shared_ptr() noexcept = default;
+    atomic_shared_ptr(const atomic_shared_ptr&) = delete;
+    atomic_shared_ptr& operator=(const atomic_shared_ptr&) = delete;
+
+    std::shared_ptr<T> load(std::memory_order order) const noexcept {
+#if SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR
+        return value_.load(order);
+#else
+        return std::atomic_load_explicit(&value_, order);
+#endif
+    }
+
+    void store(std::shared_ptr<T> desired, std::memory_order order) noexcept {
+#if SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR
+        value_.store(std::move(desired), order);
+#else
+        std::atomic_store_explicit(&value_, std::move(desired), order);
+#endif
+    }
+
+private:
+#if SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR
+    std::atomic<std::shared_ptr<T>> value_;
+#else
+    std::shared_ptr<T> value_;
+#endif
+};
+
+#if !SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR
+#  if defined(__clang__) || defined(__GNUC__)
+#    pragma GCC diagnostic pop
+#  elif defined(_MSC_VER)
+#    pragma warning(pop)
+#  endif
+#endif
+
 } // namespace detail
 
 inline constexpr bool has_source_location(const char* file_name, uint32_t line) noexcept {
@@ -1898,11 +1980,11 @@ public:
      * before shutting down if you want them.
      *
      * Never touches the logging hot path. It is not, however, guaranteed
-     * wait-free: the sample is held in a std::atomic<std::shared_ptr>, which is
-     * lock-free only where the implementation says so (MSVC uses an internal lock),
-     * so a caller can briefly contend with the once-per-interval publish. That is
-     * the price of a snapshot that is race-free by the memory model rather than
-     * merely in practice; see publish_stats().
+     * wait-free: the sample is held in a detail::atomic_shared_ptr, which is
+     * lock-free only where the implementation says so (MSVC and libc++ both use
+     * an internal lock), so a caller can briefly contend with the once-per-interval
+     * publish. That is the price of a snapshot that is race-free by the memory
+     * model rather than merely in practice; see publish_stats().
      *
      * Enable the sampling with LogConfig::enable_stats.
      *
@@ -2272,8 +2354,9 @@ private:
     std::thread stats_thread_;
     /// The published sample, immutable once stored. The statistics thread swaps in
     /// a fresh one per report and readers only ever see a completed object, so
-    /// stats_snapshot() involves no data race - see publish_stats().
-    std::atomic<std::shared_ptr<const LogStats>> stats_latest_;
+    /// stats_snapshot() involves no data race - see publish_stats(). Held through
+    /// detail::atomic_shared_ptr because libc++ has no std::atomic<std::shared_ptr>.
+    detail::atomic_shared_ptr<const LogStats> stats_latest_;
     /// Position just past the last string the writer thread has finished with, so
     /// everything from here to the write cursor is still outstanding. Published by
     /// the writer thread because only it holds entries that read() has already
