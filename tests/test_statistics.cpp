@@ -411,14 +411,21 @@ TEST_F(SlickLoggerStatsTest, StringOccupancyFoundFromDynamicArgs) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     LogStats stats{};
     while (std::chrono::steady_clock::now() < deadline) {
+        // No pause between bursts: the report is taken on the statistics thread at
+        // a moment this test does not control, so the ring has to be kept occupied
+        // rather than refilled in bursts the writer can drain in the gaps.
         for (int i = 0; i < 200; ++i) {
             LOG_INFO("dynamic {}", payload);
         }
         stats = Logger::instance().stats_snapshot();
-        if (stats.string_pct_valid) {
+        // Regression (CI flake): breaking on string_pct_valid alone was not waiting
+        // for the state this test is about. A drained ring reports a *valid* zero -
+        // see StringOccupancyIsValidZeroWhenDrained - so the loop would exit on a
+        // report taken between bursts and hand the assertion below the zero it is
+        // asserting against. Wait for the occupancy itself.
+        if (stats.string_pct_valid && stats.string_inflight_bytes > 0) {
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     EXPECT_TRUE(stats.string_pct_valid);
     EXPECT_GT(stats.string_inflight_bytes, 0u);
