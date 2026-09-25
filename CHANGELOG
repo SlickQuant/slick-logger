@@ -1,3 +1,17 @@
+# v2.1.0 - 09-24-2026
+The string ring's memory footprint drops from 272 MB to 20 MB at the default settings, and logging from many threads at once got faster.
+
+- **String ring granularity is configurable.** New `LogConfig::string_items_per_slot`, default `64`, sets the minimum number of bytes one stored string takes in the string ring
+  - slick-queue keeps a 16-byte control slot per reservation unit. The unit used to be one byte, so the default 16 MB `string_buffer_size` carried a 256 MB control array. At 64 bytes per unit that array is 4 MB, and `memory_benchmark`'s peak with a 1,024-entry queue fell from 257 MB to 5 MB
+  - 64 is one cache line, so every string starts on its own line and producer threads no longer false-share the lines they copy into. With 8 producer threads a log call dropped from 2,132 ns to 989 ns, about 1.8x cheaper than at 16 or 32. 128 gained nothing more
+  - The trade-off: a string shorter than 64 bytes still uses 64, so the ring holds at most `string_buffer_size / 64` strings (262K at the default size). Lower the setting or enlarge the ring if you log many short dynamic strings into a small buffer. The README has a sizing table
+  - The value is rounded up to a power of 2, `0` is treated as `1`, and it is capped at `string_buffer_size`, so a bad value never makes `init()` throw. `1` gives the byte-granular layout of earlier releases. The `init(path, ...)` and `init(queue_size, ...)` overloads always use the default
+  - `string_bytes_written`, `string_inflight_bytes` and the string-ring rates now count each string's rounded size, since that is the space it actually occupies
+- **Shared memory.** The process that creates the string segment decides its `string_items_per_slot`, and processes that attach later adopt it, as they already do for the sizes
+  - A 2.1.0 process attaches to a segment created by 2.0.0 without issue. The reverse fails at attach time with "created with unknown layout features" whenever the creator's value is not 1. It fails loudly rather than misreading the ring. To mix 2.0.0 and 2.1.0 processes on one segment, set `string_items_per_slot = 1` in the 2.1.0 ones
+- Update slick-queue to v2.1.0, now the minimum version, for its `items_per_slot` constructor
+- The three `init()` overloads now build the in-process queues through one `create_local_queues()` helper instead of three copies of the same code
+
 # v2.0.0 - 09-23-2026
 Three user-facing additions: log lines you can lay out yourself, runtime statistics for the internal queues, and the producing thread id. Rendering the built-in layout also got 47% faster.
 
