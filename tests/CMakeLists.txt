@@ -51,6 +51,14 @@ if(BUILD_SLICK_LOGGER_TESTING)
     target_link_libraries(slick_logger_stats_fallback_tests slick::logger GTest::gtest_main)
     add_test(NAME slick_logger_stats_fallback_tests COMMAND slick_logger_stats_fallback_tests)
 
+    # Builds the logger with SLICK_LOGGER_ENABLE_LOSS_DETECTION on and
+    # SLICK_LOGGER_ENABLE_CPU_RELAX off. Its own executable for the same reason:
+    # the switches change the type of the queues Logger holds.
+    add_executable(slick_logger_queue_traits_tests test_queue_traits.cpp)
+    target_include_directories(slick_logger_queue_traits_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(slick_logger_queue_traits_tests slick::logger GTest::gtest_main)
+    add_test(NAME slick_logger_queue_traits_tests COMMAND slick_logger_queue_traits_tests)
+
     # --- Shared-library integration test ---
     # Build a minimal plugin as a real shared library (.dll/.so), then load it
     # at runtime to verify LOG_* calls inside the plugin are routed to the host

@@ -10,4 +10,12 @@ if(DEFINED SLICK_LOGGER_ENABLE_SOURCE_LOCATION AND NOT SLICK_LOGGER_ENABLE_SOURC
     target_compile_definitions(slick::logger INTERFACE SLICK_LOGGER_ENABLE_SOURCE_LOCATION=0)
 endif()
 
+if(SLICK_LOGGER_ENABLE_LOSS_DETECTION)
+    target_compile_definitions(slick::logger INTERFACE SLICK_LOGGER_ENABLE_LOSS_DETECTION=1)
+endif()
+
+if(DEFINED SLICK_LOGGER_ENABLE_CPU_RELAX AND NOT SLICK_LOGGER_ENABLE_CPU_RELAX)
+    target_compile_definitions(slick::logger INTERFACE SLICK_LOGGER_ENABLE_CPU_RELAX=0)
+endif()
+
 check_required_components(slick-logger)

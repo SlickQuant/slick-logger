@@ -12,6 +12,10 @@ option(SLICK_LOGGER_ENABLE_SOURCE_LOCATION "Enable LOG_* macro source-location c
 # LogEntry field is reserved either way, so this never changes the layout that
 # shared-memory peers agree on - mixing the two settings across a segment is safe.
 option(SLICK_LOGGER_ENABLE_THREAD_ID "Capture the producing thread id in every entry" ON)
+# Queue tuning. Both change the queue type Logger holds, so every target and shared
+# library sharing one Logger must agree; processes sharing a segment need not.
+option(SLICK_LOGGER_ENABLE_LOSS_DETECTION "Count entries overwritten before the writer read them" OFF)
+option(SLICK_LOGGER_ENABLE_CPU_RELAX "Pause/yield before a producer retries a lost race (failed CAS) to reserve a queue slot" ON)
 # The multi-process collector is a convenience executable;
 # the shared-memory feature itself is header-only and always available.
 option(BUILD_SLICK_LOGGER_COLLECTOR "Build the standalone slick_log_collector executable" OFF)
@@ -75,6 +79,12 @@ if(NOT SLICK_LOGGER_ENABLE_SOURCE_LOCATION)
 endif()
 if(NOT SLICK_LOGGER_ENABLE_THREAD_ID)
     target_compile_definitions(slick-logger INTERFACE SLICK_LOGGER_ENABLE_THREAD_ID=0)
+endif()
+if(SLICK_LOGGER_ENABLE_LOSS_DETECTION)
+    target_compile_definitions(slick-logger INTERFACE SLICK_LOGGER_ENABLE_LOSS_DETECTION=1)
+endif()
+if(NOT SLICK_LOGGER_ENABLE_CPU_RELAX)
+    target_compile_definitions(slick-logger INTERFACE SLICK_LOGGER_ENABLE_CPU_RELAX=0)
 endif()
 target_link_libraries(slick-logger INTERFACE slick::queue)
 

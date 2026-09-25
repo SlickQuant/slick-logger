@@ -696,7 +696,7 @@ The sample interval is also how quickly the thread notices shutdown, so a long r
 
   One window stays invisible: a producer that has reserved string bytes but has not yet taken an entry slot appears in neither ordering, so if it is preempted there its bytes are unaccounted for until it publishes. Closing that would mean having producers announce reservations before publishing, which is not worth what it would cost the logging path.
 - **String ring pressure** - `string_bytes_per_sec`, `string_turnover_pct` and `string_wraps_per_sec` describe how fast the ring is being recycled. Like `string_inflight_bytes` and `string_bytes_written`, they count ring footprint: each string is included rounded up to `string_items_per_slot`, because that is the space it actually occupies. `string_turnover_pct` is a *rate*, not an occupancy: 100 means the ring turned over exactly once during the interval.
-- **Loss** - `entry_loss_count` is entries overwritten before the writer could read them. It reads `0` unless the queues were built with loss-detecting traits, since `slick::queue_traits::enable_loss_detection` defaults to off. `string_loss_count` is structurally always `0`: slick-queue counts losses inside `read()`, and the logger never calls it on the string ring.
+- **Loss** - `entry_loss_count` is entries a producer overwrote before the writer could read them. Counting is opt-in: build with `SLICK_LOGGER_ENABLE_LOSS_DETECTION` (see [Queue Tuning](#queue-tuning)); otherwise it always reads `0`, and `kLossDetectionEnabled` tells the two cases apart. It is counted by the process that reads the queue, so in shared-memory mode the collector has the figure and a producer reads `0`. `string_loss_count` is structurally always `0`: slick-queue counts losses inside `read()`, and the logger never calls it on the string ring.
 
 #### The CSV
 
@@ -856,6 +856,23 @@ cmake -S . -B build -DSLICK_LOGGER_ENABLE_THREAD_ID=OFF
 ```
 
 With the capture off, `set_pattern("%t")` throws and names the option, rather than rendering a flat `0` on every line.
+
+### Queue Tuning
+
+Two switches configure the lock-free queues behind the logger. Each is a CMake option, or a macro defined before including `slick/logger.hpp`:
+
+| Option / macro | Default | Effect | Cost when on |
+| --- | --- | --- | --- |
+| `SLICK_LOGGER_ENABLE_LOSS_DETECTION` | `OFF` / `0` | Counts entries a producer overwrote before the writer read them, reported as `LogStats::entry_loss_count` | Writer thread only: a compare per read and an atomic add per lossy read. Producers pay nothing. |
+| `SLICK_LOGGER_ENABLE_CPU_RELAX` | `ON` / `1` | Producers claim slots with a CAS on one shared counter; when threads log at the same instant, the losers retry. This executes a `pause`/`yield` instruction before each retry | One `pause` per lost race; a single producer thread never pays it. Off retries at once, which can shave latency with few producers per core but hammers the contended cache line with many. |
+
+```bash
+cmake -S . -B build -DSLICK_LOGGER_ENABLE_LOSS_DETECTION=ON -DSLICK_LOGGER_ENABLE_CPU_RELAX=OFF
+```
+
+A project consuming the installed package can set the same variables before `find_package(slick-logger)`.
+
+Both switches change the type of the queues `Logger` holds, so **every translation unit, and every shared library sharing a logger through `Logger::set_instance()`, must be built with the same values** — the same rule as `SLICK_LOGGER_MAX_ARGS`. Separate processes sharing a segment need not agree: neither switch changes the shared-memory layout.
 
 ### Timestamp Formatting
 
@@ -1057,10 +1074,13 @@ instance already wrote.
   and the same architecture.** `sizeof(LogEntry)` is recorded in the shared-memory header, so a
   mismatch throws at attach time rather than corrupting data. A string segment created with
   `string_items_per_slot` other than `1` is also refused by slick-logger builds on slick-queue 2.0
-  or older, which cannot read that layout.
+  or older, which cannot read that layout. `SLICK_LOGGER_ENABLE_THREAD_ID`,
+  `SLICK_LOGGER_ENABLE_LOSS_DETECTION` and `SLICK_LOGGER_ENABLE_CPU_RELAX` do **not** need to
+  match: none of them changes the segment layout.
 - **The ring is lossy with no backpressure.** A collector that cannot keep up loses entries, and
   string data can be overwritten before the entry referencing it is read. Size
-  `string_buffer_size` generously for high-volume logging.
+  `string_buffer_size` generously for high-volume logging, and build the collector with
+  `SLICK_LOGGER_ENABLE_LOSS_DETECTION` to count lost entries.
 - **Pointer arguments** (`ArgType::PTR`) print addresses that are only meaningful inside the
   producing process.
 - **Sink indices** used by `log_to_sink()` and `ISink::log()` are resolved against the

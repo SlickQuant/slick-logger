@@ -1,3 +1,11 @@
+// Recorded before the header supplies its defaults: whether this build left the
+// queue switches alone. The CMake options pass them to every target, so a build
+// configured with them flipped must still compile this file, and only a default
+// build can pin the defaults.
+#if !defined(SLICK_LOGGER_ENABLE_LOSS_DETECTION) && !defined(SLICK_LOGGER_ENABLE_CPU_RELAX)
+#define STATS_TEST_QUEUE_DEFAULTS 1
+#endif
+
 #include <slick/logger.hpp>
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -240,9 +248,14 @@ TEST_F(SlickLoggerStatsTest, LossCountIsReadableAndZeroByDefault) {
     Logger::instance().flush();
 
     const auto stats = wait_for_sample();
-    // logger_queue_traits leaves slick::queue_traits::enable_loss_detection off, so
-    // loss_count() is a compile-time zero. The string ring reads zero regardless:
-    // the logger never calls read() on it.
+    // SLICK_LOGGER_ENABLE_LOSS_DETECTION defaults to off, so loss_count() is a
+    // compile-time zero. The string ring reads zero regardless: the logger never
+    // calls read() on it. test_queue_traits.cpp covers the counting build; a build
+    // that turns counting on still reads zero here, since nothing was overrun.
+#ifdef STATS_TEST_QUEUE_DEFAULTS
+    static_assert(!kLossDetectionEnabled, "loss detection must stay opt-in");
+    static_assert(detail::logger_queue_traits::enable_cpu_relax, "the CAS backoff must stay on by default");
+#endif
     EXPECT_EQ(stats.entry_loss_count, 0u);
     EXPECT_EQ(stats.string_loss_count, 0u);
 }

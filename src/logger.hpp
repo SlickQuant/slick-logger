@@ -76,6 +76,26 @@
 #define SLICK_LOGGER_ENABLE_THREAD_ID 1
 #endif
 
+// Count entries a producer overwrote before the writer thread read them, reported as
+// LogStats::entry_loss_count. Off by default. Costs the writer thread a compare per read
+// and an atomic add per lossy read; producers pay nothing. See the note below.
+#ifndef SLICK_LOGGER_ENABLE_LOSS_DETECTION
+#define SLICK_LOGGER_ENABLE_LOSS_DETECTION 0
+#endif
+
+// Producers claim queue slots with a CAS on one shared reservation counter. When two
+// threads log at the same instant only one CAS succeeds, and the loser retries. On by
+// default, the loser first executes a pause/yield instruction. Off retries immediately,
+// which can shave latency with few producers per core but hammers the contended cache
+// line with many. A single producer thread never loses the race and never pays for it.
+//
+// Both switches change the queue type Logger holds, so every translation unit and every
+// shared library sharing a Logger (Logger::set_instance) must agree on them. Processes
+// sharing a segment need not: neither changes the shared-memory layout.
+#ifndef SLICK_LOGGER_ENABLE_CPU_RELAX
+#define SLICK_LOGGER_ENABLE_CPU_RELAX 1
+#endif
+
 #if SLICK_LOGGER_ENABLE_THREAD_ID
 // The real OS thread id is what a debugger, `top -H` and ETW show, so it is worth
 // a little platform code rather than hashing std::thread::id. GetCurrentThreadId
@@ -530,11 +550,14 @@ inline const second_cache& epoch_fallback_cache() noexcept {
 }
 
 /// Traits of every ring the logger owns. read_last is dead weight for a log
-/// queue, so it stays off. Declared here rather than inside Logger so a test
-/// can name the exact traits when it attaches to a segment, without the type
-/// becoming supported public API.
+/// queue, so it stays off; loss detection and the CAS backoff follow
+/// SLICK_LOGGER_ENABLE_LOSS_DETECTION and SLICK_LOGGER_ENABLE_CPU_RELAX. Declared
+/// here rather than inside Logger so a test can name the exact traits when it
+/// attaches to a segment, without the type becoming supported public API.
 struct logger_queue_traits : public slick::queue_traits {
     static constexpr bool enable_read_last = false;
+    static constexpr bool enable_loss_detection = SLICK_LOGGER_ENABLE_LOSS_DETECTION != 0;
+    static constexpr bool enable_cpu_relax = SLICK_LOGGER_ENABLE_CPU_RELAX != 0;
 };
 
 // P0718's std::atomic<std::shared_ptr<T>>. Availability has to be tested before
@@ -620,6 +643,10 @@ private:
 #endif
 
 } // namespace detail
+
+/// Whether LogStats::entry_loss_count is tracked in this build, so a zero can be
+/// told apart from "not counted". Follows SLICK_LOGGER_ENABLE_LOSS_DETECTION.
+inline constexpr bool kLossDetectionEnabled = detail::logger_queue_traits::enable_loss_detection;
 
 inline constexpr bool has_source_location(const char* file_name, uint32_t line) noexcept {
     return file_name && *file_name != '\0' && line != 0;
@@ -1960,8 +1987,9 @@ struct LogStats {
     // ---- Loss ----
 
     /// Entries a producer overwrote before the writer thread could read them.
-    /// Reads 0 unless the queues were built with loss-detecting traits, since
-    /// slick::queue_traits::enable_loss_detection defaults to false.
+    /// Always 0 unless the build defines SLICK_LOGGER_ENABLE_LOSS_DETECTION=1,
+    /// which kLossDetectionEnabled reports. Counted by the process that reads the
+    /// queue, so a SharedProducer reads 0 here; its collector has the count.
     uint64_t entry_loss_count = 0;
     /// Structurally always 0: slick-queue counts losses inside read(), and the
     /// logger never calls read() on the string ring - strings are reached by
