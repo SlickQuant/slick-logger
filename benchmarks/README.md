@@ -149,31 +149,50 @@ one thread down to 114K at sixteen, a 14× regression under contention.
 
 | Logger | Queue size | Peak MB |
 |--------|-----------:|--------:|
-| SlickLogger | 1,024 | 257 |
-| SlickLogger | 8,192 | 259 |
-| SlickLogger | 65,536 | 285 |
-| SlickLogger | 262,144 | 357 |
+| SlickLogger | 1,024 | 5 |
+| SlickLogger | 8,192 | 8 |
+| SlickLogger | 65,536 | 36 |
+| SlickLogger | 262,144 | 105 |
 | spdlog_async | 1,024 | 0 |
 | spdlog_async | 8,192 | 3 |
 | spdlog_async | 65,536 | 25 |
 | spdlog_async | 262,144 | 102 |
 
-**Read the peak column carefully, and ignore the `Bytes/Msg` and `Efficiency`
-columns the tool prints.** Those divide peak memory by the message count, and
-since SlickLogger's footprint is dominated by a fixed allocation that has
-nothing to do with message count, they say nothing useful.
+**Read the peak column, and ignore the `Bytes/Msg` and `Efficiency` columns the
+tool prints.** Those divide peak memory by the message count, which says little
+about a logger whose rings are allocated once up front.
 
-The ~256 MB floor is real, and it is not the entry queue. `Logger::init()`
-defaults `string_buffer_size` to `1 << 24`, and the string ring is a
-`slick::queue<char>` — one element per *byte*. slick-queue allocates a 16-byte
-control slot per element, so a 16 MB string buffer carries a 256 MB control
-array. That is the number in the table, at every queue size. Size
-`string_buffer_size` deliberately if memory matters; it costs 17× what its name
-suggests.
+The string ring is a `slick::queue<char>`, and slick-queue keeps a 16-byte
+control slot per reservation unit. Before `LogConfig::string_items_per_slot`
+existed the unit was one byte, so the default 16 MB `string_buffer_size`
+carried a 256 MB control array, and SlickLogger peaked at 257 MB even with a
+1,024-entry queue. The default unit is now 64 bytes, which shrinks that array to
+4 MB. The peaks above are mostly the entry queue and the parts of the string
+ring actually written to.
 
 Steady-state behaviour is unremarkable by comparison — the sustained-load test
-logged 300,006 messages at 10,000 msg/sec with a 5 MB peak and 5 MB final, and
+logged 299,905 messages at 10,000 msg/sec with a 16 MB peak and 16 MB final, and
 ten fragmentation cycles produced 0 MB of growth.
+
+### String ring unit size (`string_items_per_slot`)
+
+A separate scratch harness: 16 MB string ring, 65,536-entry queue, a null sink,
+and each producer thread logging `"msg {} {} {}"` with an int, a 12-byte string
+and a 40-byte string. Figures are the median producer-side cost of one log call
+over five rounds of 400,000 calls per thread. Peak is the process working set.
+
+| string_items_per_slot | 1 thread | 4 threads | 8 threads | Peak MB |
+|---------------------:|---------:|----------:|----------:|--------:|
+| 1 | 273 ns | 811 ns | 2,132 ns | 300 |
+| 16 | 164 ns | 666 ns | 1,771 ns | 60 |
+| 32 | 163 ns | 655 ns | 1,769 ns | 52 |
+| **64 (default)** | 166 ns | 575 ns | 989 ns | 48 |
+| 128 | — | — | 1,015 ns | 46 |
+
+Moving from 1 byte to 16 fixes most of the memory cost. The gain from 32 to 64
+is under contention: at 64 every string starts on its own cache line, so
+producers no longer false-share the lines they copy into. Going past 64 gains
+nothing more and only makes short strings more wasteful.
 
 ## Building
 

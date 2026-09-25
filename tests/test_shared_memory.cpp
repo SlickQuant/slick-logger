@@ -297,6 +297,41 @@ TEST_F(SharedMemoryTest, SegmentSurvivesTheProducerThatCreatedIt) {
         << read_all(log_path);
 }
 
+// string_items_per_slot is part of the string segment's layout, so it is the
+// creator's call: a producer configured differently must adopt the collector's
+// value rather than fail to attach or misread the ring.
+TEST_F(SharedMemoryTest, AttacherAdoptsCreatorsStringItemsPerSlot) {
+    const auto log_path = temp_log("test_shm_items_per_slot.log");
+    const auto segment = unique_segment_name("slt_ips_");
+    constexpr uint32_t kCreatorItemsPerSlot = 128;
+
+    LogConfig config;
+    config.mode = QueueMode::SharedCollector;
+    config.shared_memory_name = segment;
+    config.log_queue_size = 1024;
+    config.string_buffer_size = 1 << 16;
+    config.string_items_per_slot = kCreatorItemsPerSlot;
+    config.sinks.push_back(std::make_shared<slick::logger::FileSink>(log_path));
+    Logger::instance().init(config);
+
+    {
+        slick::queue<char, slick::logger::detail::logger_queue_traits> ring((segment + "_str").c_str());
+        EXPECT_EQ(ring.items_per_slot(), kCreatorItemsPerSlot);
+    }
+
+    ASSERT_EQ(run_producer("--name " + segment + " --tag ips --count 5"
+                           " --queue-size 1024 --string-buffer-size 65536 --string-items-per-slot 8"), 0)
+        << "a producer with a different string_items_per_slot failed to attach";
+
+    ASSERT_TRUE(wait_for([&] {
+        return read_all(log_path).find("producer done") != std::string::npos;
+    })) << "collector never saw the producer's final message";
+    Logger::instance().shutdown();
+
+    const auto lines = read_lines(log_path);
+    EXPECT_EQ(count_lines_containing(lines, "dynamic-ips"), 5u);
+}
+
 // A producer killed between reserve() and publish() must not stall the collector
 // forever; after the timeout it abandons the slot and keeps going.
 TEST_F(SharedMemoryTest, SkipsEntryStalledByADeadProducer) {

@@ -17,9 +17,9 @@ option(SLICK_LOGGER_ENABLE_THREAD_ID "Capture the producing thread id in every e
 option(BUILD_SLICK_LOGGER_COLLECTOR "Build the standalone slick_log_collector executable" OFF)
 option(BUILD_SLICK_LOGGER_BENCHMARKS "Build performance benchmarks" OFF)
 
-# 1.5.0 or newer is required: multi-process logging relies on the slick-shm based
-# shared-memory implementation introduced in slick-queue 1.3.0.
-find_package(slick-queue 2.0.0 CONFIG QUIET)
+# 2.1.0 or newer is required: the string ring is built with the items_per_slot
+# constructor introduced in slick-queue 2.1.0.
+find_package(slick-queue 2.1.0 CONFIG QUIET)
 
 if (NOT slick-queue_FOUND)
     message(STATUS "Fetching slick-queue...")
@@ -30,7 +30,7 @@ if (NOT slick-queue_FOUND)
     FetchContent_Declare(
         slick-queue
         GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-        GIT_TAG v2.0.0
+        GIT_TAG v2.1.0
     )
     FetchContent_MakeAvailable(slick-queue)
 else()

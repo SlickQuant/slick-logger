@@ -4,6 +4,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <atomic>
@@ -1136,12 +1138,15 @@ TEST_F(SlickLoggerStatsTest, DrainedEntryFreesNothingWhileEntriesStayQueued) {
     // That is what this pins: three entries published before the writer gets past
     // the first, and draining the first must not shrink the span by its bytes.
     constexpr uint32_t kCapacity = 4096;
-    constexpr size_t kPayload = 120;                  // 121 bytes reserved each
-    constexpr uint64_t kEach = kPayload + 1;
+    constexpr size_t kPayload = 120;                  // 121 bytes asked for each
     auto sink = std::make_shared<StallingSink>();
     sink->set_stall_ms(1000); // pins the writer from its very first write
 
     LogConfig config;
+    // The ring charges whole string_items_per_slot units, so each string's
+    // footprint is its 121 bytes rounded up to one.
+    const uint64_t unit = config.string_items_per_slot;
+    const uint64_t kEach = (kPayload + 1 + unit - 1) / unit * unit;
     config.sinks.push_back(sink);
     config.min_level = LogLevel::L_WARN; // drops the INFO banner: the ring starts empty
     config.log_queue_size = 1024;
@@ -1178,4 +1183,68 @@ TEST_F(SlickLoggerStatsTest, DrainedEntryFreesNothingWhileEntriesStayQueued) {
     // The old rule freed the first entry's bytes the moment it was dispatched.
     EXPECT_EQ(stats.string_inflight_bytes, 3u * kEach)
         << "draining one entry freed bytes while entries behind it were queued";
+}
+
+// ------------------------------------------------------ string_items_per_slot
+
+namespace {
+
+/// Log one 10-byte string (11 bytes with its terminator) into an otherwise empty
+/// string ring and report the footprint the ring charged for it.
+uint64_t footprint_of_one_short_string(uint32_t items_per_slot) {
+    LogConfig config = make_config(20, 2, false);
+    config.min_level = LogLevel::L_WARN; // drops the INFO banner: the ring starts empty
+    config.string_items_per_slot = items_per_slot;
+    Logger::instance().init(config);
+
+    LOG_WARN("{}", std::string(10, 's'));
+    Logger::instance().flush();
+    const LogStats stats = wait_for_sample_after(now_ns());
+    // As TearDown does, so the next call starts from a clean logger.
+    Logger::instance().shutdown();
+    Logger::instance().reset();
+    return stats.string_bytes_written;
+}
+
+} // namespace
+
+TEST_F(SlickLoggerStatsTest, StringFootprintRoundsToItemsPerSlot) {
+    // A string consumes whole units of string_items_per_slot bytes, so a short one
+    // costs a full unit; the default puts every string on its own cache line.
+    EXPECT_EQ(footprint_of_one_short_string(kDefaultStringItemsPerSlot),
+              uint64_t{kDefaultStringItemsPerSlot});
+    EXPECT_EQ(footprint_of_one_short_string(1), 11u) << "1 must keep the byte-exact layout";
+    EXPECT_EQ(footprint_of_one_short_string(16), 16u);
+}
+
+TEST_F(SlickLoggerStatsTest, StringItemsPerSlotIsNormalized) {
+    // slick-queue throws on a value that is not a power of 2 or exceeds the ring,
+    // so init() normalizes instead of failing: 0 reads as 1, anything else rounds
+    // up to a power of 2, and the result is clamped to the (4096-byte) ring.
+    EXPECT_EQ(footprint_of_one_short_string(0), 11u);
+    EXPECT_EQ(footprint_of_one_short_string(48), 64u);
+    EXPECT_EQ(footprint_of_one_short_string(1u << 20), 4096u);
+    // Above 2^31 the round-up would reach 2^32, which is 0 as a uint32_t (and in a
+    // 32-bit size_t); it must still clamp to the ring rather than make init() throw.
+    EXPECT_EQ(footprint_of_one_short_string(std::numeric_limits<uint32_t>::max()), 4096u);
+    EXPECT_EQ(footprint_of_one_short_string((1u << 31) + 1), 4096u);
+}
+
+TEST_F(SlickLoggerStatsTest, StringsLongerThanOneUnitRoundTrip) {
+    // A string spanning several units still occupies one reservation, and the
+    // short strings around it must land on the unit boundaries after it.
+    LogConfig config = make_config(20, 2, false);
+    config.string_items_per_slot = 64;
+    Logger::instance().init(config);
+
+    const std::string before(5, 'b');
+    const std::string big(1000, 'L');
+    const std::string after(70, 'a');
+    LOG_INFO("before={} big={} after={}", before, big, after);
+    Logger::instance().flush();
+    Logger::instance().shutdown();
+
+    std::ifstream in(kLogFile);
+    const std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_NE(contents.find("before=" + before + " big=" + big + " after=" + after), std::string::npos);
 }

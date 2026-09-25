@@ -35,7 +35,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 
 - **C++20 compatible compiler** with `std::format` support (GCC 11+, Clang 14+, MSVC 19.29+)
 - CMake 3.20 or higher (for building examples/tests)
-- slick-queue 2.0.0 or newer (multi-process logging relies on its shared-memory support). The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
+- slick-queue 2.1.0 or newer (the string ring uses its `items_per_slot` constructor, and multi-process logging relies on its shared-memory support). The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
 - Internet connection for downloading the slick-queue header when it is not already installed
 
 ## Installation
@@ -579,12 +579,28 @@ int main() {
 - `min_level`: global minimum level, default `LogLevel::L_TRACE`
 - `log_queue_size`: internal log-entry queue size, rounded up to a power of two
 - `string_buffer_size`: internal string-storage queue size, rounded up to a power of two
+- `string_items_per_slot`: minimum bytes one stored string consumes in the string ring, default `64` (see [Sizing the string ring](#sizing-the-string-ring))
 - `include_source_location`: include file and line for `LOG_*` macro calls, default `true`
 - `enable_stats`: run the statistics thread, default `false` (see [Runtime Statistics](#runtime-statistics))
 - `stats_file`: where the statistics CSV is written; empty runs the thread for `stats_snapshot()` alone
 - `stats_interval_ms`: how often a CSV row is appended and a snapshot published, default `1000`
 - `stats_sample_interval_ms`: how often the queue-fullness gauges are sampled between reports, default `10`
 - `stats_max_file_size`: roll the CSV to `<stem>.1.csv` at this size, default 16 MB; `0` disables rolling
+
+#### Sizing the string ring
+
+Dynamic strings, non-literal format strings and binary payloads are copied into the string ring (in shared-memory mode, so are file names and format strings). slick-queue keeps a 16-byte control slot for each *unit* of that ring, and `string_items_per_slot` sets the unit size: every stored string is rounded up to a whole number of units.
+
+| `string_items_per_slot` | Control array for a 16 MB ring | Ring space used by an 11-byte string | Strings a 16 MB ring can hold |
+|---:|---:|---:|---:|
+| 1 | 256 MB | 11 B | 16.7 M |
+| 16 | 16 MB | 16 B | 1 M |
+| 32 | 8 MB | 32 B | 512 K |
+| **64** (default) | **4 MB** | 64 B | 262 K |
+
+The default of 64 is one cache line, so every string starts on its own line and producer threads never false-share the lines they copy into. With 8 producer threads, that made a log call about 1.8x cheaper than at 16 or 32 (see [benchmarks/README.md](benchmarks/README.md#string-ring-unit-size-string_items_per_slot)). The cost is that a string shorter than 64 bytes still uses 64 bytes, so the ring holds at most `string_buffer_size / 64` strings. If you log many short dynamic strings into a small `string_buffer_size`, lower the value or enlarge the ring. Otherwise a string can be overwritten before the writer thread reads it.
+
+The value is rounded up to a power of two, `0` is treated as `1`, and it is clamped to `string_buffer_size`. `1` gives the byte-granular layout of earlier releases. The `init(path, ...)` and `init(queue_size, ...)` overloads always use the default.
 
 ### Lifecycle and Runtime Controls
 
@@ -679,7 +695,7 @@ The sample interval is also how quickly the thread notices shutdown, so a long r
   Instead the writer snapshots the entry reservation cursor and *then* the string reservation cursor, and promotes the string half only once its own read cursor has passed the entry half. The order is the proof: every slot below the snapshot had already been taken, and a string is always reserved before its slot, so every one of those strings was reserved before the string cursor was read. When the writer has drained past the entry half, the whole ring below the string half is free - whatever order the producers published in. Between promotions the frontier simply stays put, which is the conservative direction: the span grows and the gauge reads fuller, which is exactly what a writer falling behind means. The frontier is an absolute reserve index, not a position within the ring, so a ring filled to exactly its capacity reads as `capacity` / `100%` instead of aliasing back to zero, and a genuine overrun shows as a distance past capacity that is then clamped. It is seeded at `start()` with the ring cursor as it stands, so there is always a floor to measure from: before the first promotion nothing has been confirmed drained, and the whole span since start really is in flight. A collector replaying a backlog is the exception: `collect_backlog` rewinds its entry reader below the point it attached, so the entries it is about to drain own strings reserved before it existed, and the attach cursor would call every one of them free for the whole replay. Its floor is rewound the same way the reader is - to the oldest position the ring can still hold - so the replay is reported as the in-flight backlog it is. `string_pct_valid` covers the whole row, point value and peak alike; with a string ring present a measurement is always available, and a fully drained queue is reported as a valid zero. The cost is two cursor reads per drained batch on the writer thread - it never inspects entry contents for this - and nothing at all on the producing thread.
 
   One window stays invisible: a producer that has reserved string bytes but has not yet taken an entry slot appears in neither ordering, so if it is preempted there its bytes are unaccounted for until it publishes. Closing that would mean having producers announce reservations before publishing, which is not worth what it would cost the logging path.
-- **String ring pressure** - `string_bytes_per_sec`, `string_turnover_pct` and `string_wraps_per_sec` describe how fast the ring is being recycled. `string_turnover_pct` is a *rate*, not an occupancy: 100 means the ring turned over exactly once during the interval.
+- **String ring pressure** - `string_bytes_per_sec`, `string_turnover_pct` and `string_wraps_per_sec` describe how fast the ring is being recycled. Like `string_inflight_bytes` and `string_bytes_written`, they count ring footprint: each string is included rounded up to `string_items_per_slot`, because that is the space it actually occupies. `string_turnover_pct` is a *rate*, not an occupancy: 100 means the ring turned over exactly once during the interval.
 - **Loss** - `entry_loss_count` is entries overwritten before the writer could read them. It reads `0` unless the queues were built with loss-detecting traits, since `slick::queue_traits::enable_loss_detection` defaults to off. `string_loss_count` is structurally always `0`: slick-queue counts losses inside `read()`, and the logger never calls it on the string ring.
 
 #### The CSV
@@ -1025,8 +1041,9 @@ It stops on Ctrl-C (`SIGINT`/`SIGTERM`), draining whatever is still queued befor
 #### Startup order and sizing
 
 Startup order does not matter. Whichever process starts first creates the segments and fixes
-their capacity from its `log_queue_size` / `string_buffer_size`; every later process attaches
-and **inherits** those sizes, so mismatched settings between processes are harmless.
+their capacity from its `log_queue_size` / `string_buffer_size` / `string_items_per_slot`; every
+later process attaches and **inherits** those settings, so mismatched settings between processes
+are harmless.
 
 A collector that attaches to a segment already holding entries replays whatever is still
 resident in the ring, so producers can run before any collector exists. Set
@@ -1037,7 +1054,9 @@ instance already wrote.
 
 - **All processes must use the same slick-logger version, the same `SLICK_LOGGER_MAX_ARGS`,
   and the same architecture.** `sizeof(LogEntry)` is recorded in the shared-memory header, so a
-  mismatch throws at attach time rather than corrupting data.
+  mismatch throws at attach time rather than corrupting data. A string segment created with
+  `string_items_per_slot` other than `1` is also refused by slick-logger builds on slick-queue 2.0
+  or older, which cannot read that layout.
 - **The ring is lossy with no backpressure.** A collector that cannot keep up loses entries, and
   string data can be overwritten before the entry referencing it is read. Size
   `string_buffer_size` generously for high-volume logging.

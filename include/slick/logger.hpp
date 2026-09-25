@@ -760,6 +760,19 @@ enum class ArgType : uint8_t {
 inline constexpr uint32_t kMaxPayloadBytes = 65534;
 
 /**
+ * @brief Default minimum footprint, in bytes, of one string ring reservation
+ *
+ * slick-queue keeps a 16-byte control slot per reservation unit, so a byte ring
+ * with one unit per byte carries 16x its size in control (256 MB for the default
+ * 16 MB ring). 64 cuts that to a quarter of the ring and puts every reservation
+ * on its own cache line, so producers copying strings concurrently never share
+ * one. The cost is that a string shorter than 64 bytes still consumes 64, which
+ * bounds the ring at string_buffer_size / 64 resident strings. See
+ * LogConfig::string_items_per_slot.
+ */
+inline constexpr uint32_t kDefaultStringItemsPerSlot = 64;
+
+/**
  * @brief Non-owning view over raw bytes to be logged verbatim
  *
  * Build one with as_binary(). The bytes are copied into the logger's string ring
@@ -1643,7 +1656,8 @@ struct LogStats {
     /// frontier is the position the writer publishes once it has provably drained
     /// past every string below it - see stats_string_frontier_ for the cursor-pair
     /// rule behind that. Entry contents are never read to derive it. Only
-    /// meaningful when string_pct_valid.
+    /// meaningful when string_pct_valid. Like string_bytes_written, it measures
+    /// ring footprint, including each string's rounding to string_items_per_slot.
     uint64_t string_inflight_bytes = 0;
     /// Peak in-flight span across the reporting interval. Like
     /// entry_queue_depth_max, this is the figure to alert on: a burst that backs
@@ -1665,7 +1679,8 @@ struct LogStats {
 
     // ---- String ring: write-cursor rates ----
 
-    /// Cumulative bytes reserved in the string ring.
+    /// Cumulative bytes reserved in the string ring. Counts ring footprint, so each
+    /// string is included rounded up to LogConfig::string_items_per_slot.
     uint64_t string_bytes_written = 0;
     double string_bytes_per_sec = 0.0;
     /// Bytes written this interval as a percentage of capacity: how much of the
@@ -1695,6 +1710,16 @@ struct LogConfig {
     LogLevel min_level = LogLevel::L_TRACE;
     size_t log_queue_size = 65536;
     size_t string_buffer_size = 1 << 24; // 16MB
+    /// Minimum bytes one string ring reservation consumes; every stored string is
+    /// rounded up to a multiple of it. Larger values shrink the ring's control
+    /// array (16 bytes per unit) and keep concurrent producers off each other's
+    /// cache lines; smaller values fit more short strings into the ring. Rounded
+    /// up to a power of 2, 0 reads as 1, and clamped to string_buffer_size. 1
+    /// restores the one-unit-per-byte layout of earlier releases.
+    ///
+    /// In shared-memory mode the process that creates the segment decides: an
+    /// attaching process adopts the segment's value and ignores its own.
+    uint32_t string_items_per_slot = kDefaultStringItemsPerSlot;
     bool include_source_location = true;
 
     // ---- Multi-process (shared memory) settings; ignored when mode is Local ----
@@ -2250,6 +2275,13 @@ private:
     // Helper function to round up to next power of 2
     static size_t round_up_to_power_of_2(size_t value) noexcept;
 
+    /// LogConfig::string_items_per_slot as slick-queue accepts it: a power of 2,
+    /// at least 1 and no larger than the (already power-of-2) string ring.
+    static uint32_t normalize_items_per_slot(size_t requested, size_t string_buffer_size) noexcept;
+
+    /// Build the in-process entry and string rings. Sizes must be powers of 2.
+    void create_local_queues(size_t log_queue_size, size_t string_buffer_size, size_t string_items_per_slot);
+
     template<typename T>
     void enqueue_argument(LogArgument& arg, T&& value);
 
@@ -2265,7 +2297,8 @@ private:
 
     /// Create the shared-memory backed queues and cache the per-entry stamp
     /// (pid, tag, kEntryOffsets) for the requested role.
-    void setup_shared_queues(const LogConfig& config, uint32_t queue_size, uint32_t string_buffer_size);
+    void setup_shared_queues(const LogConfig& config, uint32_t queue_size, uint32_t string_buffer_size,
+                             uint32_t string_items_per_slot);
 
     /// Validate a segment name and throw a descriptive error when it is unusable.
     static void validate_shared_memory_name(const std::string& name);
@@ -2280,7 +2313,8 @@ private:
     /// This is what makes producer and collector startup order irrelevant, and it
     /// lets a producer inherit the collector's sizing when the collector went first.
     template<typename T>
-    static std::unique_ptr<slick::queue<T, logger_queue_traits>> open_shared_queue(const std::string& name, uint32_t size);
+    static std::unique_ptr<slick::queue<T, logger_queue_traits>> open_shared_queue(const std::string& name, uint32_t size,
+                                                                                   uint32_t items_per_slot = 1);
 
     /// Turn an entry's ring indices back into addresses valid in this process.
     void rebase_entry(LogEntry& entry) const noexcept;
@@ -4486,11 +4520,8 @@ inline void Logger::init(const std::filesystem::path& log_file, size_t log_queue
     add_sink(std::make_shared<FileSink>(log_file));
     
     // Ensure queue_size is power of 2
-    log_queue_size = round_up_to_power_of_2(log_queue_size);
-    string_buffer_size = round_up_to_power_of_2(string_buffer_size);
-
-    log_queue_ = std::make_unique<slick::queue<LogEntry, logger_queue_traits>>(static_cast<uint32_t>(log_queue_size));
-    string_queue_ = std::make_unique<slick::queue<char, logger_queue_traits>>(static_cast<uint32_t>(string_buffer_size));
+    create_local_queues(round_up_to_power_of_2(log_queue_size),
+                        round_up_to_power_of_2(string_buffer_size), kDefaultStringItemsPerSlot);
     log_file_ = log_file;
     start();
 }
@@ -4618,12 +4649,12 @@ inline void Logger::init(const LogConfig& config) {
     size_t string_buffer_size = round_up_to_power_of_2(config.string_buffer_size);
 
     if (config.mode == QueueMode::Local) {
-        log_queue_ = std::make_unique<slick::queue<LogEntry, logger_queue_traits>>(static_cast<uint32_t>(log_queue_size));
-        string_queue_ = std::make_unique<slick::queue<char, logger_queue_traits>>(static_cast<uint32_t>(string_buffer_size));
+        create_local_queues(log_queue_size, string_buffer_size, config.string_items_per_slot);
     }
     else {
         setup_shared_queues(config, static_cast<uint32_t>(log_queue_size),
-                            static_cast<uint32_t>(string_buffer_size));
+                            static_cast<uint32_t>(string_buffer_size),
+                            normalize_items_per_slot(config.string_items_per_slot, string_buffer_size));
     }
     start();
 }
@@ -4666,7 +4697,8 @@ inline size_t Logger::truncated_tag_length(std::string_view tag) noexcept {
 }
 
 template<typename T>
-inline std::unique_ptr<slick::queue<T, Logger::logger_queue_traits>> Logger::open_shared_queue(const std::string& name, uint32_t size) {
+inline std::unique_ptr<slick::queue<T, Logger::logger_queue_traits>> Logger::open_shared_queue(const std::string& name, uint32_t size,
+                                                                                         uint32_t items_per_slot) {
     std::string attach_error;
     try {
         // Attach to a segment somebody else already created. Sizing then comes
@@ -4683,8 +4715,9 @@ inline std::unique_ptr<slick::queue<T, Logger::logger_queue_traits>> Logger::ope
 
     try {
         // Create it. Still create-or-attach, so a process that loses the race to
-        // another creator simply attaches instead.
-        return std::make_unique<slick::queue<T, logger_queue_traits>>(size, name.c_str());
+        // another creator simply attaches instead - and throws if that creator
+        // chose a different items_per_slot.
+        return std::make_unique<slick::queue<T, logger_queue_traits>>(size, items_per_slot, name.c_str());
     }
     catch (const std::exception& e) {
         throw std::runtime_error(std::string(e.what())
@@ -4693,7 +4726,8 @@ inline std::unique_ptr<slick::queue<T, Logger::logger_queue_traits>> Logger::ope
     }
 }
 
-inline void Logger::setup_shared_queues(const LogConfig& config, uint32_t queue_size, uint32_t string_buffer_size) {
+inline void Logger::setup_shared_queues(const LogConfig& config, uint32_t queue_size, uint32_t string_buffer_size,
+                                        uint32_t string_items_per_slot) {
     validate_shared_memory_name(config.shared_memory_name);
 
     shm_name_ = config.shared_memory_name;
@@ -4703,7 +4737,7 @@ inline void Logger::setup_shared_queues(const LogConfig& config, uint32_t queue_
 
     try {
         log_queue_ = open_shared_queue<LogEntry>(shm_name_, queue_size);
-        string_queue_ = open_shared_queue<char>(shm_name_ + "_str", string_buffer_size);
+        string_queue_ = open_shared_queue<char>(shm_name_ + "_str", string_buffer_size, string_items_per_slot);
     }
     catch (const std::exception& e) {
         log_queue_.reset();
@@ -4715,7 +4749,8 @@ inline void Logger::setup_shared_queues(const LogConfig& config, uint32_t queue_
         throw std::runtime_error("Failed to attach shared log queue '" + config.shared_memory_name
                                  + "': " + e.what()
                                  + ". All processes must agree on slick-logger version, "
-                                   "SLICK_LOGGER_MAX_ARGS, log_queue_size and string_buffer_size.");
+                                   "SLICK_LOGGER_MAX_ARGS, log_queue_size, string_buffer_size and "
+                                   "string_items_per_slot.");
     }
 
     // String references become ring indices so the collector can resolve them
@@ -4810,11 +4845,8 @@ inline void Logger::init(size_t queue_size, size_t string_buffer_size) {
 
     // Initialize logger with pre-set sinks - sinks should be added before calling this
     // Ensure queue_size is power of 2
-    queue_size = round_up_to_power_of_2(queue_size);
-    string_buffer_size = round_up_to_power_of_2(string_buffer_size);
-
-    log_queue_ = std::make_unique<slick::queue<LogEntry, logger_queue_traits>>(static_cast<uint32_t>(queue_size));
-    string_queue_ = std::make_unique<slick::queue<char, logger_queue_traits>>(static_cast<uint32_t>(string_buffer_size));
+    create_local_queues(round_up_to_power_of_2(queue_size),
+                        round_up_to_power_of_2(string_buffer_size), kDefaultStringItemsPerSlot);
     start();
 }
 
@@ -5665,6 +5697,25 @@ inline size_t Logger::round_up_to_power_of_2(size_t value) noexcept {
         return temp + 1;
     }
     return value; // Already a power of 2
+}
+
+inline uint32_t Logger::normalize_items_per_slot(size_t requested, size_t string_buffer_size) noexcept {
+    // slick-queue throws on anything but a power of 2 no larger than the ring, and a
+    // configuration mistake is better absorbed here than turned into a failed init.
+    // Capped at 2^31 before rounding: the largest power of 2 a uint32_t holds, and
+    // anything above it would round to 2^32 - which is 0 once cast, or already 0 in
+    // a 32-bit size_t.
+    constexpr size_t kMaxItemsPerSlot = size_t{1} << 31;
+    const size_t clamped = std::clamp<size_t>(requested, 1, kMaxItemsPerSlot);
+    return static_cast<uint32_t>(std::min(round_up_to_power_of_2(clamped), string_buffer_size));
+}
+
+inline void Logger::create_local_queues(size_t log_queue_size, size_t string_buffer_size,
+                                        size_t string_items_per_slot) {
+    log_queue_ = std::make_unique<slick::queue<LogEntry, logger_queue_traits>>(static_cast<uint32_t>(log_queue_size));
+    string_queue_ = std::make_unique<slick::queue<char, logger_queue_traits>>(
+        static_cast<uint32_t>(string_buffer_size),
+        normalize_items_per_slot(string_items_per_slot, string_buffer_size));
 }
 
 } // namespace slick::logger

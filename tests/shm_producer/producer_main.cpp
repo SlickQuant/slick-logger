@@ -19,6 +19,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage: producer --name <shm-name> [--tag <tag>] [--count <n>]\n"
                  "                [--queue-size <n>] [--string-buffer-size <n>]\n"
+                 "                [--string-items-per-slot <n>]\n"
                  "                [--linger-ms <n>] [--ready-file <path>]\n");
     return 2;
 }
@@ -31,6 +32,7 @@ int main(int argc, char** argv) {
     int count = 10;
     size_t queue_size = 1024;
     size_t string_buffer_size = 1 << 16;
+    uint32_t string_items_per_slot = slick::logger::kDefaultStringItemsPerSlot;
     int linger_ms = 0;
     std::string ready_file;
 
@@ -47,6 +49,10 @@ int main(int argc, char** argv) {
             queue_size = static_cast<size_t>(std::atoll(argv[++i]));
         } else if (arg == "--string-buffer-size" && has_value) {
             string_buffer_size = static_cast<size_t>(std::atoll(argv[++i]));
+        } else if (arg == "--string-items-per-slot" && has_value) {
+            // Only honoured when this process creates the segment; an attacher
+            // adopts whatever the creator chose.
+            string_items_per_slot = static_cast<uint32_t>(std::atoll(argv[++i]));
         } else if (arg == "--ready-file" && has_value) {
             // Touched once every entry above is published, so a collector that
             // must attach to a segment that ALREADY holds a backlog can wait on a
@@ -72,6 +78,7 @@ int main(int argc, char** argv) {
         config.process_tag = tag;
         config.log_queue_size = queue_size;
         config.string_buffer_size = string_buffer_size;
+        config.string_items_per_slot = string_items_per_slot;
         slick::logger::Logger::instance().init(config);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "producer init failed: %s\n", e.what());
