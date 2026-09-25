@@ -113,6 +113,16 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void
 #define SLICK_LOGGER_ENABLE_SOURCE_LOCATION 1
 #endif
 
+// For the few functions on the per-line path whose call costs more than their
+// body, and which the optimizer will not inline on its own because they are big.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define SLICK_LOGGER_FORCE_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define SLICK_LOGGER_FORCE_INLINE inline __attribute__((always_inline))
+#else
+#define SLICK_LOGGER_FORCE_INLINE inline
+#endif
+
 #ifndef SLICK_LOGGER_FILE_NAME
 #if defined(__FILE_NAME__)
 #define SLICK_LOGGER_FILE_NAME __FILE_NAME__
@@ -180,46 +190,224 @@ inline void write_9_digits(char* out, uint32_t value) noexcept {
 }
 
 /**
+ * @brief Write the sub-second part of a timestamp to 3, 6 or 9 places
+ * @param subsecond_ns Nanoseconds past the whole second, in [0, 999999999]
+ */
+SLICK_LOGGER_FORCE_INLINE void write_subsecond(char* out, uint32_t subsecond_ns, uint32_t digits) noexcept {
+    switch (digits) {
+        case 3:  write_3_digits(out, subsecond_ns / 1000000u); break;
+        case 6:  write_6_digits(out, subsecond_ns / 1000u); break;
+        default: write_9_digits(out, subsecond_ns); break;
+    }
+}
+
+/// Most digits a uint32_t renders to, for sizing a line before it is written.
+inline constexpr size_t kMaxUint32Digits = 10;
+/// Most digits a uint64_t renders to.
+inline constexpr size_t kMaxUint64Digits = 20;
+
+/**
+ * @brief Write @p value in decimal so that it ends just before @p end
+ * @return Where the digits start. At most kMaxUint64Digits are written.
+ */
+inline char* write_uint_backward(char* end, uint64_t value) noexcept {
+    char* p = end;
+    do {
+        *--p = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    } while (value != 0);
+    return p;
+}
+
+/**
  * @brief Append a value in decimal, without an intermediate std::string
  *
  * std::to_string() would allocate for anything past the small-string buffer and
  * then copy; this writes the digits straight into the caller's buffer.
  */
 inline void append_uint(std::string& out, uint64_t value) {
-    char buf[20];
+    char buf[kMaxUint64Digits];
     char* const end = buf + sizeof(buf);
-    char* p = end;
-    do {
-        *--p = static_cast<char>('0' + (value % 10));
-        value /= 10;
-    } while (value != 0);
-    out.append(p, static_cast<size_t>(end - p));
+    const char* begin = write_uint_backward(end, value);
+    out.append(begin, static_cast<size_t>(end - begin));
 }
+
+/**
+ * @brief Grow a string to @p size without paying to initialize the new bytes
+ *
+ * The caller overwrites what it grew, so zero-filling it first is wasted work.
+ * Where resize_and_overwrite() is missing this falls back to resize(), which
+ * zero-fills: correct, and still one bulk memset rather than a check per piece.
+ */
+inline void grow_uninitialized(std::string& s, size_t size) {
+#if defined(__cpp_lib_string_resize_and_overwrite)
+    s.resize_and_overwrite(size, [](char*, size_t n) noexcept { return n; });
+#else
+    s.resize(size);
+#endif
+}
+
+/**
+ * @brief Writes one log line straight into a std::string's storage
+ *
+ * The string is grown once, to an upper bound on the line, and every piece after
+ * that is a memcpy through a cursor. std::string::append() instead checks the
+ * capacity, moves the size and makes an out-of-line call per piece, and a line
+ * is a dozen small pieces, so that bookkeeping outweighed the copying it
+ * surrounded. finish() trims the string back to what was actually written.
+ *
+ * The bound is the caller's promise: nothing checks a put() against it. A piece
+ * with no bound known up front - a CUSTOM timestamp, which is strftime's to size
+ * - goes through append_unbounded() instead.
+ */
+class line_writer {
+public:
+    line_writer(std::string& out, size_t bound) : out_(out) { reserve_tail(out.size(), bound); }
+    line_writer(const line_writer&) = delete;
+    line_writer& operator=(const line_writer&) = delete;
+
+    // Forced inline: every piece of every line comes through here, and most are
+    // short enough that the call would cost more than the copy.
+    SLICK_LOGGER_FORCE_INLINE void put(const char* data, size_t size) noexcept {
+        assert(size <= static_cast<size_t>(end_ - cursor_));
+        copy_bytes(cursor_, data, size);
+        cursor_ += size;
+    }
+    SLICK_LOGGER_FORCE_INLINE void put(std::string_view text) noexcept { put(text.data(), text.size()); }
+    void put(char c) noexcept {
+        assert(cursor_ < end_);
+        *cursor_++ = c;
+    }
+    void put_uint(uint64_t value) noexcept {
+        char buf[kMaxUint64Digits];
+        char* const end = buf + sizeof(buf);
+        const char* begin = write_uint_backward(end, value);
+        put(begin, static_cast<size_t>(end - begin));
+    }
+
+    /// Where the next byte goes, for code that renders in place and then advance()s.
+    char* cursor() noexcept { return cursor_; }
+    void advance(size_t size) noexcept {
+        assert(size <= static_cast<size_t>(end_ - cursor_));
+        cursor_ += size;
+    }
+
+    /// Position of the cursor within the string. Stays valid across
+    /// append_unbounded(), which a raw pointer does not.
+    size_t offset() const noexcept { return static_cast<size_t>(cursor_ - out_.data()); }
+
+    /**
+     * @brief Pad what was written since @p start out to @p width with spaces
+     *
+     * Never truncates: a field already that wide is left alone. The padding
+     * must be in the budget, which is why a pattern counts every width in it.
+     */
+    void pad_from(size_t start, size_t width, bool left_align) noexcept {
+        const size_t written = offset() - start;
+        if (written >= width) {
+            return;
+        }
+        const size_t pad = width - written;
+        assert(pad <= static_cast<size_t>(end_ - cursor_));
+        if (!left_align) {
+            // The field is already at the tail, so this shifts only its own
+            // bytes, not the line before it.
+            char* field = out_.data() + start;
+            std::memmove(field + pad, field, written);
+            std::memset(field, ' ', pad);
+        } else {
+            std::memset(cursor_, ' ', pad);
+        }
+        cursor_ += pad;
+    }
+
+    /**
+     * @brief Hand the string over for a piece with no upper bound
+     * @param append Called with the string trimmed to what has been written
+     *
+     * Whatever budget was left is reserved again afterwards, so the rest of the
+     * line needs no bound of its own. The piece itself was never counted in it.
+     */
+    template <typename Append>
+    void append_unbounded(Append&& append) {
+        const size_t remaining = static_cast<size_t>(end_ - cursor_);
+        finish();
+        append(out_);
+        reserve_tail(out_.size(), remaining);
+    }
+
+    /// Trim the string to what was written. The writer must not be used after.
+    void finish() { out_.resize(offset()); }
+
+private:
+    /**
+     * @brief memcpy, with the short copies a line is mostly made of kept inline
+     *
+     * A level name, a bracket or a pattern literal is a handful of bytes, and
+     * calling memcpy for one costs more than moving it: the call, then memcpy's
+     * own dispatch on the size. Up to 16 bytes this is two overlapping loads and
+     * stores instead, reading nothing outside [src, src + size).
+     */
+    static SLICK_LOGGER_FORCE_INLINE void copy_bytes(char* dst, const char* src, size_t size) noexcept {
+        if (size > 16) {
+            std::memcpy(dst, src, size);
+        } else if (size >= 8) {
+            uint64_t head, tail;
+            std::memcpy(&head, src, 8);
+            std::memcpy(&tail, src + size - 8, 8);
+            std::memcpy(dst, &head, 8);
+            std::memcpy(dst + size - 8, &tail, 8);
+        } else if (size >= 4) {
+            uint32_t head, tail;
+            std::memcpy(&head, src, 4);
+            std::memcpy(&tail, src + size - 4, 4);
+            std::memcpy(dst, &head, 4);
+            std::memcpy(dst + size - 4, &tail, 4);
+        } else if (size != 0) {
+            // 1 to 3 bytes: first, middle and last cover every case.
+            dst[0] = src[0];
+            dst[size / 2] = src[size / 2];
+            dst[size - 1] = src[size - 1];
+        }
+    }
+
+    void reserve_tail(size_t used, size_t bound) {
+        grow_uninitialized(out_, used + bound);
+        cursor_ = out_.data() + used;
+        end_ = cursor_ + bound;
+    }
+
+    std::string& out_;
+    char* cursor_ = nullptr;
+    char* end_ = nullptr;
+};
 
 // Day and month names for the %a/%A/%b/%B pattern flags. Static ASCII tables
 // rather than strftime: the C locale spellings are the only ones a log file
 // should carry, and a table lookup keeps these flags as cheap as the rest.
-inline const char* weekday_short(int wday) noexcept {
-    static constexpr const char* kNames[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+inline constexpr size_t kMaxDayOrMonthName = 9;  // "Wednesday", "September"
+
+inline std::string_view weekday_short(int wday) noexcept {
+    static constexpr std::string_view kNames[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     return (wday >= 0 && wday < 7) ? kNames[wday] : "???";
 }
 
-inline const char* weekday_long(int wday) noexcept {
-    static constexpr const char* kNames[7] = {"Sunday", "Monday", "Tuesday", "Wednesday",
-                                              "Thursday", "Friday", "Saturday"};
+inline std::string_view weekday_long(int wday) noexcept {
+    static constexpr std::string_view kNames[7] = {"Sunday", "Monday", "Tuesday", "Wednesday",
+                                                   "Thursday", "Friday", "Saturday"};
     return (wday >= 0 && wday < 7) ? kNames[wday] : "???";
 }
 
-inline const char* month_short(int mon) noexcept {
-    static constexpr const char* kNames[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+inline std::string_view month_short(int mon) noexcept {
+    static constexpr std::string_view kNames[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     return (mon >= 0 && mon < 12) ? kNames[mon] : "???";
 }
 
-inline const char* month_long(int mon) noexcept {
-    static constexpr const char* kNames[12] = {"January", "February", "March", "April",
-                                               "May", "June", "July", "August",
-                                               "September", "October", "November", "December"};
+inline std::string_view month_long(int mon) noexcept {
+    static constexpr std::string_view kNames[12] = {"January", "February", "March", "April",
+                                                    "May", "June", "July", "August",
+                                                    "September", "October", "November", "December"};
     return (mon >= 0 && mon < 12) ? kNames[mon] : "???";
 }
 
@@ -512,72 +700,35 @@ public:
     /**
      * @brief Append the timestamp to @p out
      *
-     * The form every log line goes through: a sink renders into a buffer it
-     * reuses across entries, so appending here is what keeps a steady-state line
-     * free of allocations. format_timestamp() is this plus a string to put the
-     * result in.
+     * Appending into a buffer the caller reuses is what keeps a steady-state
+     * call free of allocations. format_timestamp() is this plus a string to put
+     * the result in; a sink rendering a whole line goes through write() instead.
      */
     void append_timestamp(std::string& out, uint64_t timestamp_ns) const {
-        using namespace detail;
-
-        // Whole seconds select the cached "YYYY-MM-DD HH:MM:SS" prefix; only the
-        // sub-second digits have to be written per call.
-        const int64_t seconds = static_cast<int64_t>(timestamp_ns / 1000000000ULL);
-        const uint32_t us = static_cast<uint32_t>((timestamp_ns / 1000ULL) % 1000000ULL);
-
-        const second_cache* cache = cached_second(seconds);
-        if (!cache) [[unlikely]] {
-            out += "1970-01-01 00:00:00.000000"; // fallback timestamp
+        if (is_unbounded()) {
+            append_unbounded(out, timestamp_ns);
             return;
         }
-
-        // Longest output is ISO8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ" (27 chars).
-        char buf[32];
-        switch (format_) {
-        case Format::DEFAULT:
-            out.append(cache->date_time, kDateTimeLen);
-            return;
-
-        case Format::WITH_MICROSECONDS:
-            std::memcpy(buf, cache->date_time, kDateTimeLen);
-            buf[19] = '.';
-            write_6_digits(buf + 20, us);
-            out.append(buf, 26);
-            return;
-
-        case Format::WITH_MILLISECONDS:
-            std::memcpy(buf, cache->date_time, kDateTimeLen);
-            buf[19] = '.';
-            write_2_digits(buf + 20, us / 10000);
-            buf[22] = static_cast<char>('0' + (us / 1000) % 10);
-            out.append(buf, 23);
-            return;
-
-        case Format::ISO8601:
-            std::memcpy(buf, cache->date_time, kDateTimeLen);
-            buf[10] = 'T';
-            buf[19] = '.';
-            write_6_digits(buf + 20, us);
-            buf[26] = 'Z';
-            out.append(buf, 27);
-            return;
-
-        case Format::TIME_ONLY:
-            std::memcpy(buf, cache->date_time + kTimeOffset, kTimeLen);
-            buf[8] = '.';
-            write_6_digits(buf + 9, us);
-            out.append(buf, 15);
-            return;
-
-        case Format::CUSTOM:
-            if (!custom_segments_.empty()) {
-                append_custom(out, cache->tm, us);
-                return;
-            }
-            out.append(cache->date_time, kDateTimeLen);
-            return;
-        }
+        char buf[kMaxBoundedLength];
+        out.append(buf, write_bounded(buf, timestamp_ns));
     }
+
+    /**
+     * @brief Write the timestamp as one piece of a line being rendered
+     *
+     * Counts for write_bound() bytes of the writer's budget - none for a CUSTOM
+     * format, which strftime sizes and which therefore goes around the budget.
+     */
+    void write(detail::line_writer& out, uint64_t timestamp_ns) const {
+        if (is_unbounded()) {
+            out.append_unbounded([&](std::string& s) { append_unbounded(s, timestamp_ns); });
+            return;
+        }
+        out.advance(write_bounded(out.cursor(), timestamp_ns));
+    }
+
+    /// What write() takes out of a line_writer's budget.
+    size_t write_bound() const noexcept { return is_unbounded() ? 0 : kMaxBoundedLength; }
 
     /// The allocating form, for a caller that wants a string of its own.
     std::string format_timestamp(uint64_t timestamp_ns) const {
@@ -594,10 +745,82 @@ public:
      * rather than a bound; reserve() takes a hint, not a promise.
      */
     size_t max_length() const noexcept {
-        return format_ == Format::CUSTOM ? custom_format_.size() + 32 : 27;
+        return format_ == Format::CUSTOM ? custom_format_.size() + 32 : kMaxBoundedLength;
     }
 
 private:
+    /// Longest built-in rendering: ISO8601, "YYYY-MM-DDTHH:MM:SS.ffffffZ".
+    static constexpr size_t kMaxBoundedLength = 27;
+    static constexpr std::string_view kFallback = "1970-01-01 00:00:00.000000";
+
+    /// A CUSTOM format with segments to expand, whose length only strftime knows.
+    bool is_unbounded() const noexcept { return !custom_segments_.empty(); }
+
+    /**
+     * @brief Render any format but an unbounded CUSTOM one into @p out
+     * @param out Room for at least kMaxBoundedLength characters
+     * @return The number of characters written
+     */
+    size_t write_bounded(char* out, uint64_t timestamp_ns) const noexcept {
+        using namespace detail;
+
+        // Whole seconds select the cached "YYYY-MM-DD HH:MM:SS" prefix; only the
+        // sub-second digits have to be written per call.
+        const int64_t seconds = static_cast<int64_t>(timestamp_ns / 1000000000ULL);
+        const uint32_t us = static_cast<uint32_t>((timestamp_ns / 1000ULL) % 1000000ULL);
+
+        const second_cache* cache = cached_second(seconds);
+        if (!cache) [[unlikely]] {
+            std::memcpy(out, kFallback.data(), kFallback.size());
+            return kFallback.size();
+        }
+
+        switch (format_) {
+        case Format::WITH_MICROSECONDS:
+            std::memcpy(out, cache->date_time, kDateTimeLen);
+            out[19] = '.';
+            write_6_digits(out + 20, us);
+            return 26;
+
+        case Format::WITH_MILLISECONDS:
+            std::memcpy(out, cache->date_time, kDateTimeLen);
+            out[19] = '.';
+            write_2_digits(out + 20, us / 10000);
+            out[22] = static_cast<char>('0' + (us / 1000) % 10);
+            return 23;
+
+        case Format::ISO8601:
+            std::memcpy(out, cache->date_time, kDateTimeLen);
+            out[10] = 'T';
+            out[19] = '.';
+            write_6_digits(out + 20, us);
+            out[26] = 'Z';
+            return 27;
+
+        case Format::TIME_ONLY:
+            std::memcpy(out, cache->date_time + kTimeOffset, kTimeLen);
+            out[8] = '.';
+            write_6_digits(out + 9, us);
+            return 15;
+
+        case Format::DEFAULT:
+        case Format::CUSTOM:  // only an empty one gets here
+            break;
+        }
+        std::memcpy(out, cache->date_time, kDateTimeLen);
+        return kDateTimeLen;
+    }
+
+    void append_unbounded(std::string& out, uint64_t timestamp_ns) const {
+        const detail::second_cache* cache =
+            detail::cached_second(static_cast<int64_t>(timestamp_ns / 1000000000ULL));
+        if (!cache) [[unlikely]] {
+            out += kFallback;
+            return;
+        }
+        append_custom(out, cache->tm, static_cast<uint32_t>((timestamp_ns / 1000ULL) % 1000000ULL));
+    }
+
     /**
      * @brief Render a CUSTOM format: one strftime per segment, %f between them
      *
@@ -1057,7 +1280,7 @@ private:
         // A run of date/time flags and their separators that turned out to be one
         // contiguous slice of the cached "YYYY-MM-DD HH:MM:SS" text, fused by
         // compile() into a single memcpy. literal_off/literal_len index that text
-        // rather than literals_.
+        // rather than literals_. May carry a fraction; see Op::frac_digits.
         kCachedSlice,
         kLiteral, kMessage, kLevel, kLevelShort, kThreadId, kProcessId, kTag, kSinkName,
         kSourceFile, kSourceLine, kSourceLoc,
@@ -1071,8 +1294,17 @@ private:
         Flag flag = Flag::kLiteral;
         bool left_align = false;
         uint8_t width = 0;         // 0 means "natural width"
+        // For a kCachedSlice: a one-character separator and 3, 6 or 9 sub-second
+        // digits written after the slice, fused from "%S.%e"/"%S.%f"/"%S.%F".
+        // frac_digits is 0 when there is no fraction.
+        char frac_sep = 0;
+        uint8_t frac_digits = 0;
         uint32_t literal_off = 0;  // offset into literals_, for kLiteral
         uint32_t literal_len = 0;
+        // The literal run in front of this op, in literals_, written before it
+        // (and outside its width) so that it costs no dispatch of its own.
+        uint32_t prefix_off = 0;
+        uint32_t prefix_len = 0;
     };
 
     void compile(std::string_view pattern);
@@ -1083,7 +1315,7 @@ private:
      * @brief True if @p flag renders a calendar field, and so reads the cache
      *
      * The one list of the flags that need a broken-down time: compile() asks it
-     * what to set needs_cache_ to, and format() hands append_op() a cache only
+     * what to set needs_cache_ to, and format() hands write_op() a cache only
      * when it says so. %e, %f, %F and %E are the time flags that answer false -
      * they slice or divide the entry's own timestamp and never look at a tm.
      */
@@ -1096,9 +1328,18 @@ private:
      * for character, the nineteen bytes cached_second() already holds. Detecting
      * that at compile time turns the commonest timestamp patterns into one
      * memcpy, which is what keeps a spelled-out pattern as cheap as the built-in
-     * layout instead of paying a dispatch per field.
+     * layout instead of paying a dispatch per field. A slice followed by a
+     * one-character literal and %e, %f or %F takes those in as its fraction.
      */
     void fuse_cached_slices();
+    /**
+     * @brief Fold every literal run into the op after it, as that op's prefix
+     *
+     * Dispatching an op costs several times the copy a short literal needs, so
+     * "[%l] %v" renders as two ops rather than four. A literal that ends the
+     * pattern has nothing to fold into and stays an op of its own.
+     */
+    void fuse_literal_prefixes();
     /// The slice of "YYYY-MM-DD HH:MM:SS" a flag reproduces, if it is exactly one.
     static bool cached_slice_for(Flag flag, size_t& offset, size_t& length) noexcept;
     /// The separator at an index of "YYYY-MM-DD HH:MM:SS", or '\0' at a digit.
@@ -1112,14 +1353,42 @@ private:
     }
     /// True if @p literal is exactly the cached text starting at @p offset.
     static bool literal_matches_cached(std::string_view literal, size_t offset) noexcept;
-    /// Append one op's text. Width padding is applied by the caller.
-    void append_op(std::string& out, const Op& op, const LogEntry& entry,
-                   const Context& ctx, const detail::second_cache* cache,
-                   uint32_t subsecond_ns) const;
+
+    /**
+     * @brief Most an op can write that is fixed by the op itself
+     *
+     * A flag rendering a string the line supplies - the message, the level, the
+     * sink name, a source file, a color escape, %+ and %q - counts nothing here;
+     * compile() tallies those instead, and line_bound() adds them per line.
+     */
+    static size_t fixed_length(const Op& op) noexcept;
+    /// 3, 6 or 9 for %e, %f and %F; 0 for any other flag.
+    static constexpr uint32_t subsecond_digits(Flag flag) noexcept {
+        return flag == Flag::kMillis ? 3 : flag == Flag::kMicros ? 6 : flag == Flag::kNanos ? 9 : 0;
+    }
+    /// An upper bound on one rendered line, which format() sizes the output to.
+    size_t line_bound(const LogEntry& entry, const Context& ctx) const noexcept;
+    /// Write one op's text. Width padding is applied by the caller.
+    void write_op(detail::line_writer& out, const Op& op, const LogEntry& entry,
+                  const Context& ctx, const detail::second_cache* cache,
+                  uint32_t subsecond_ns) const;
 
     std::vector<Op> ops_;
     std::string literals_;   // every literal run, concatenated once at compile time
     std::string pattern_;    // kept verbatim for pattern() and diagnostics
+    // What line_bound() starts from: the fixed_length() of every op plus every
+    // width, which is the most padding a field can take.
+    size_t fixed_bound_ = 0;
+    // How many ops render each string the line supplies, so line_bound() is a
+    // handful of multiply-adds rather than a walk of the ops.
+    uint32_t message_count_ = 0;        // %v
+    uint32_t level_name_count_ = 0;     // %l
+    uint32_t sink_name_count_ = 0;      // %n
+    uint32_t source_file_count_ = 0;    // %s %@
+    uint32_t color_begin_count_ = 0;    // %^
+    uint32_t color_end_count_ = 0;      // %$
+    uint32_t timestamp_count_ = 0;      // %q
+    uint32_t default_layout_count_ = 0; // %+
     bool has_color_range_ = false;
     // Kept apart because they cost different things. A calendar field needs the
     // per-second localtime() behind cached_second(); %e/%f/%F need one division
@@ -3050,85 +3319,90 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
     }
 }
 
-inline void append_source_location(std::string& result, const LogEntry& entry) {
+inline void write_source_location(detail::line_writer& out, const LogEntry& entry) noexcept {
     if (!has_source_location(entry)) {
         return;
     }
-    result += " [";
-    result += view_string_ref(entry.file);
-    result += ':';
-    result += std::to_string(entry.line);
-    result += ']';
+    out.put(" [", 2);
+    out.put(view_string_ref(entry.file));
+    out.put(':');
+    out.put_uint(entry.line);
+    out.put(']');
 }
 
-inline size_t decimal_digits(uint32_t value) noexcept {
-    size_t digits = 1;
-    for (uint32_t v = value; v >= 10; v /= 10) {
-        ++digits;
-    }
-    return digits;
-}
-
-inline size_t source_location_size(const LogEntry& entry) {
-    if (!has_source_location(entry)) {
-        return 0;
-    }
-
-    return view_string_ref(entry.file).size() + decimal_digits(entry.line) + 4; // " [", ':', ']'
+/// Most write_source_location() writes, given the length of the file name.
+inline constexpr size_t source_location_bound(size_t file_length) noexcept {
+    return file_length + detail::kMaxUint32Digits + 4;  // " [", ':', ']'
 }
 
 /**
- * @brief Append the producing process id (and tag, when set) to a formatted line
+ * @brief Write the producing process id (and tag, when set) into a formatted line
  *
  * Only multi-process entries carry a pid, so single-process output is unaffected.
  */
-inline void append_process_id(std::string& result, const LogEntry& entry) {
+inline void write_process_id(detail::line_writer& out, const LogEntry& entry) noexcept {
     if (entry.pid == 0) {
         return;
     }
-    result += " [";
-    result += std::to_string(entry.pid);
+    out.put(" [", 2);
+    out.put_uint(entry.pid);
     if (entry.tag[0] != '\0') {
-        result += ':';
-        result.append(entry.tag, strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE));
+        out.put(':');
+        out.put(entry.tag, strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE));
     }
-    result += ']';
+    out.put(']');
 }
 
-inline size_t process_id_size(const LogEntry& entry) {
-    if (entry.pid == 0) {
-        return 0;
-    }
-    size_t size = decimal_digits(entry.pid) + 3; // " [", ']'
-    const size_t tag_length = strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE);
-    if (tag_length) {
-        size += tag_length + 1; // ':'
-    }
-    return size;
+/// Most write_process_id() writes. A bound rather than an exact size, so sizing
+/// a line costs neither a digit count nor a strnlen() of the tag.
+inline constexpr size_t kProcessIdBound = detail::kMaxUint32Digits + SLICK_LOGGER_TAG_SIZE + 4;
+
+/**
+ * @brief Most write_default_layout() takes out of a line_writer's budget
+ * @param file_length Length of the entry's source file name, 0 if it has none
+ */
+inline size_t default_layout_bound(const LogEntry& entry, const TimestampFormatter& timestamp_formatter,
+                                   std::string_view level_name, std::string_view message,
+                                   size_t file_length) noexcept {
+    return timestamp_formatter.write_bound() + level_name.size() + message.size() + 4  // " [", "] "
+           + (entry.pid ? kProcessIdBound : 0)
+           + (has_source_location(entry) ? source_location_bound(file_length) : 0);
+}
+
+/// Length of the entry's source file name, or 0 when it carries no location.
+inline size_t source_file_length(const LogEntry& entry) noexcept {
+    return has_source_location(entry) ? view_string_ref(entry.file).size() : 0;
 }
 
 /**
- * @brief Append the built-in log line: "<time> [LEVEL][ [pid[:tag]]][ [file:line]] <message>"
+ * @brief Write the built-in log line: "<time> [LEVEL][ [pid[:tag]]][ [file:line]] <message>"
  *
- * The one definition of the default layout. Both the no-pattern path and the %+
- * flag call it, so the two cannot drift apart. The timestamp is whatever the
- * sink is configured for, microseconds unless the caller changed it.
+ * The one definition of the default layout. The no-pattern path and the %+ flag
+ * both come here, so the two cannot drift apart. The timestamp is whatever the
+ * sink is configured for, microseconds unless the caller changed it. The writer
+ * must have default_layout_bound() left in its budget.
  */
+inline void write_default_layout(detail::line_writer& out, const LogEntry& entry,
+                                 const TimestampFormatter& timestamp_formatter,
+                                 std::string_view level_name, std::string_view message) {
+    timestamp_formatter.write(out, entry.timestamp);
+    out.put(" [", 2);
+    out.put(level_name);
+    out.put(']');
+    write_process_id(out, entry);
+    write_source_location(out, entry);
+    out.put(' ');
+    out.put(message);
+}
+
+/// write_default_layout() for a caller holding a string rather than a writer.
 inline void append_default_layout(std::string& out, const LogEntry& entry,
                                   const TimestampFormatter& timestamp_formatter,
                                   std::string_view level_name, std::string_view message) {
-    // Reserved before the timestamp is rendered rather than after, so the line
-    // takes at most one growth and the timestamp needs no string of its own.
-    out.reserve(out.size() + timestamp_formatter.max_length() + level_name.size()
-                + process_id_size(entry) + source_location_size(entry) + message.size() + 4);
-    timestamp_formatter.append_timestamp(out, entry.timestamp);
-    out += " [";
-    out += level_name;
-    out += ']';
-    append_process_id(out, entry);
-    append_source_location(out, entry);
-    out += ' ';
-    out += message;
+    detail::line_writer writer(out, default_layout_bound(entry, timestamp_formatter, level_name,
+                                                         message, source_file_length(entry)));
+    write_default_layout(writer, entry, timestamp_formatter, level_name, message);
+    writer.finish();
 }
 
 inline PatternFormatter::Flag PatternFormatter::flag_for(char c, std::string_view pattern) {
@@ -3290,6 +3564,85 @@ inline void PatternFormatter::compile(std::string_view pattern) {
     }
 
     fuse_cached_slices();
+    fuse_literal_prefixes();
+
+    // Tallied from the fused ops, whose slices are what actually gets written.
+    fixed_bound_ = 0;
+    message_count_ = level_name_count_ = sink_name_count_ = source_file_count_ = 0;
+    color_begin_count_ = color_end_count_ = timestamp_count_ = default_layout_count_ = 0;
+    for (const Op& op : ops_) {
+        fixed_bound_ += op.prefix_len + fixed_length(op) + op.width;
+        switch (op.flag) {
+            case Flag::kMessage:             ++message_count_; break;
+            case Flag::kLevel:               ++level_name_count_; break;
+            case Flag::kSinkName:            ++sink_name_count_; break;
+            case Flag::kSourceFile:
+            case Flag::kSourceLoc:           ++source_file_count_; break;
+            case Flag::kColorBegin:          ++color_begin_count_; break;
+            case Flag::kColorEnd:            ++color_end_count_; break;
+            case Flag::kConfiguredTimestamp: ++timestamp_count_; break;
+            case Flag::kDefaultHeader:       ++default_layout_count_; break;
+            default: break;
+        }
+    }
+}
+
+inline size_t PatternFormatter::fixed_length(const Op& op) noexcept {
+    using namespace detail;
+    switch (op.flag) {
+        case Flag::kCachedSlice:    return op.literal_len + (op.frac_digits ? 1 + op.frac_digits : 0);
+        case Flag::kLiteral:        return op.literal_len;
+        case Flag::kLevelShort:     return 1;
+        case Flag::kThreadId:
+        case Flag::kProcessId:
+        case Flag::kSourceLine:     return kMaxUint32Digits;
+        case Flag::kSourceLoc:      return kMaxUint32Digits + 1;  // the file is counted per line
+        case Flag::kTag:            return SLICK_LOGGER_TAG_SIZE;
+        case Flag::kYear4:          return 4;
+        case Flag::kYear2: case Flag::kMonth: case Flag::kDay:
+        case Flag::kHour24: case Flag::kHour12: case Flag::kAmPm:
+        case Flag::kMinute: case Flag::kSecond: return 2;
+        case Flag::kMillis:
+        case Flag::kMicros:
+        case Flag::kNanos:          return subsecond_digits(op.flag);
+        case Flag::kTimeHMS:        return kTimeLen;
+        case Flag::kDateMDY:        return 8;
+        case Flag::kDateTimeFull:   return 24;
+        case Flag::kEpochSeconds:   return kMaxUint64Digits;
+        case Flag::kWeekdayShort:
+        case Flag::kMonthShort:     return 3;
+        case Flag::kWeekdayLong:
+        case Flag::kMonthLong:      return kMaxDayOrMonthName;
+        // Supplied by the line; see line_bound().
+        case Flag::kMessage: case Flag::kLevel: case Flag::kSinkName: case Flag::kSourceFile:
+        case Flag::kColorBegin: case Flag::kColorEnd:
+        case Flag::kDefaultHeader: case Flag::kConfiguredTimestamp:
+            return 0;
+    }
+    return 0;
+}
+
+SLICK_LOGGER_FORCE_INLINE size_t PatternFormatter::line_bound(const LogEntry& entry,
+                                                              const Context& ctx) const noexcept {
+    size_t bound = fixed_bound_ + message_count_ * ctx.message.size()
+                   + level_name_count_ * ctx.level_name.size()
+                   + sink_name_count_ * ctx.sink_name.size()
+                   // One more of each for the escapes format() wraps a line in
+                   // itself, or closes a range left open with.
+                   + (color_begin_count_ + 1) * ctx.color_start.size()
+                   + (color_end_count_ + 1) * ctx.color_end.size();
+    const size_t file_length =
+        (source_file_count_ || default_layout_count_) ? source_file_length(entry) : 0;
+    bound += source_file_count_ * file_length;
+    if (ctx.timestamp) {
+        bound += timestamp_count_ * ctx.timestamp->write_bound();
+        if (default_layout_count_) {
+            bound += default_layout_count_ * default_layout_bound(entry, *ctx.timestamp,
+                                                                  ctx.level_name, ctx.message,
+                                                                  file_length);
+        }
+    }
+    return bound;
 }
 
 inline bool PatternFormatter::flag_needs_cache(Flag flag) noexcept {
@@ -3348,9 +3701,25 @@ inline void PatternFormatter::fuse_cached_slices() {
         size_t offset = 0;
         size_t length = 0;
 
+        // "<slice>.%f": the separator is the literal just fused past the slice.
+        // Checked before anything else touches fused.back(), which is that literal.
+        const uint32_t frac_digits = subsecond_digits(op.flag);
+        if (frac_digits && op.width == 0 && fused.size() >= 2 &&
+            fused.back().flag == Flag::kLiteral && fused.back().literal_len == 1 &&
+            fused[fused.size() - 2].flag == Flag::kCachedSlice &&
+            fused[fused.size() - 2].frac_digits == 0) {
+            const char separator = literals_[fused.back().literal_off];
+            fused.pop_back();
+            fused.back().frac_sep = separator;
+            fused.back().frac_digits = static_cast<uint8_t>(frac_digits);
+            continue;
+        }
+
         // A padded field has to stay its own op: the padding is measured against
-        // that field alone, not against whatever it would be fused with.
-        if (op.width == 0 && !fused.empty() && fused.back().flag == Flag::kCachedSlice) {
+        // that field alone, not against whatever it would be fused with. Nor can
+        // a slice grow once it has a fraction, which it writes last.
+        if (op.width == 0 && !fused.empty() && fused.back().flag == Flag::kCachedSlice &&
+            fused.back().frac_digits == 0) {
             Op& run = fused.back();
             const size_t run_end = run.literal_off + run.literal_len;
 
@@ -3381,11 +3750,32 @@ inline void PatternFormatter::fuse_cached_slices() {
     ops_ = std::move(fused);
 }
 
-inline void PatternFormatter::append_op(std::string& out, const Op& op, const LogEntry& entry,
-                                        const Context& ctx, const detail::second_cache* cache,
-                                        uint32_t subsecond_ns) const {
+inline void PatternFormatter::fuse_literal_prefixes() {
+    std::vector<Op> fused;
+    fused.reserve(ops_.size());
+
+    for (size_t i = 0; i < ops_.size(); ++i) {
+        const Op& op = ops_[i];
+        if (op.flag == Flag::kLiteral && i + 1 < ops_.size() && ops_[i + 1].flag != Flag::kLiteral) {
+            Op next = ops_[++i];
+            next.prefix_off = op.literal_off;
+            next.prefix_len = op.literal_len;
+            fused.push_back(next);
+            continue;
+        }
+        fused.push_back(op);
+    }
+
+    ops_ = std::move(fused);
+}
+
+// Forced inline: this is the body of format()'s loop, and a call per op cost
+// more than most ops' own work.
+SLICK_LOGGER_FORCE_INLINE void PatternFormatter::write_op(detail::line_writer& out, const Op& op,
+                                                          const LogEntry& entry, const Context& ctx,
+                                                          const detail::second_cache* cache,
+                                                          uint32_t subsecond_ns) const {
     using namespace detail;
-    char buf[32];
 
     // Every date and time flag slices the "YYYY-MM-DD HH:MM:SS" text that
     // cached_second() renders once per whole second, so none of them convert a
@@ -3395,126 +3785,127 @@ inline void PatternFormatter::append_op(std::string& out, const Op& op, const Lo
     // rather than a null this should quietly render around.
     assert(!flag_needs_cache(op.flag) || cache != nullptr);
 
-    const auto append_cached = [&](size_t offset, size_t length) {
-        out.append(cache->date_time + offset, length);
-    };
-
     switch (op.flag) {
         case Flag::kCachedSlice:
-            out.append(cache->date_time + op.literal_off, op.literal_len);
+            out.put(cache->date_time + op.literal_off, op.literal_len);
+            if (op.frac_digits) {
+                out.put(op.frac_sep);
+                write_subsecond(out.cursor(), subsecond_ns, op.frac_digits);
+                out.advance(op.frac_digits);
+            }
             break;
         case Flag::kLiteral:
-            out.append(literals_, op.literal_off, op.literal_len);
+            out.put(literals_.data() + op.literal_off, op.literal_len);
             break;
         case Flag::kMessage:
-            out += ctx.message;
+            out.put(ctx.message);
             break;
         case Flag::kLevel:
-            out += ctx.level_name;
+            out.put(ctx.level_name);
             break;
         case Flag::kLevelShort:
-            out += to_short_string(ctx.level);
+            out.put(to_short_string(ctx.level)[0]);
             break;
         case Flag::kThreadId:
-            append_uint(out, entry.thread_id);
+            out.put_uint(entry.thread_id);
             break;
         case Flag::kProcessId:
             // A Local-mode entry carries no pid, but it was produced right here,
             // so print this process rather than a bare zero.
-            append_uint(out, entry.pid ? entry.pid : current_process_id());
+            out.put_uint(entry.pid ? entry.pid : current_process_id());
             break;
         case Flag::kTag:
-            out.append(entry.tag, strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE));
+            out.put(entry.tag, strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE));
             break;
         case Flag::kSinkName:
-            out += ctx.sink_name;
+            out.put(ctx.sink_name);
             break;
         case Flag::kSourceFile:
             if (has_source_location(entry)) {
-                out += view_string_ref(entry.file);
+                out.put(view_string_ref(entry.file));
             }
             break;
         case Flag::kSourceLine:
             if (has_source_location(entry)) {
-                append_uint(out, entry.line);
+                out.put_uint(entry.line);
             }
             break;
         case Flag::kSourceLoc:
             if (has_source_location(entry)) {
-                out += view_string_ref(entry.file);
-                out += ':';
-                append_uint(out, entry.line);
+                out.put(view_string_ref(entry.file));
+                out.put(':');
+                out.put_uint(entry.line);
             }
             break;
-        case Flag::kYear4:   append_cached(0, 4); break;
-        case Flag::kYear2:   append_cached(2, 2); break;
-        case Flag::kMonth:   append_cached(5, 2); break;
-        case Flag::kDay:     append_cached(8, 2); break;
-        case Flag::kHour24:  append_cached(11, 2); break;
-        case Flag::kMinute:  append_cached(14, 2); break;
-        case Flag::kSecond:  append_cached(17, 2); break;
-        case Flag::kTimeHMS: append_cached(kTimeOffset, kTimeLen); break;
+        case Flag::kYear4:   out.put(cache->date_time, 4); break;
+        case Flag::kYear2:   out.put(cache->date_time + 2, 2); break;
+        case Flag::kMonth:   out.put(cache->date_time + 5, 2); break;
+        case Flag::kDay:     out.put(cache->date_time + 8, 2); break;
+        case Flag::kHour24:  out.put(cache->date_time + 11, 2); break;
+        case Flag::kMinute:  out.put(cache->date_time + 14, 2); break;
+        case Flag::kSecond:  out.put(cache->date_time + 17, 2); break;
+        case Flag::kTimeHMS: out.put(cache->date_time + kTimeOffset, kTimeLen); break;
         case Flag::kHour12: {
             int hour = cache->tm.tm_hour % 12;
             if (hour == 0) {
                 hour = 12;
             }
-            write_2_digits(buf, static_cast<uint32_t>(hour));
-            out.append(buf, 2);
+            write_2_digits(out.cursor(), static_cast<uint32_t>(hour));
+            out.advance(2);
             break;
         }
         case Flag::kAmPm:
-            out += (cache->tm.tm_hour < 12) ? "AM" : "PM";
+            out.put((cache->tm.tm_hour < 12) ? "AM" : "PM", 2);
             break;
+        // Fixed-width digits are rendered in place: the writer's budget already
+        // holds fixed_length() for them.
         case Flag::kMillis:
-            write_3_digits(buf, subsecond_ns / 1000000u);
-            out.append(buf, 3);
-            break;
         case Flag::kMicros:
-            write_6_digits(buf, subsecond_ns / 1000u);
-            out.append(buf, 6);
+        case Flag::kNanos: {
+            const uint32_t digits = subsecond_digits(op.flag);
+            write_subsecond(out.cursor(), subsecond_ns, digits);
+            out.advance(digits);
             break;
-        case Flag::kNanos:
-            write_9_digits(buf, subsecond_ns);
-            out.append(buf, 9);
+        }
+        case Flag::kDateMDY: {
+            char* p = out.cursor();
+            std::memcpy(p, cache->date_time + 5, 2);      // MM
+            p[2] = '/';
+            std::memcpy(p + 3, cache->date_time + 8, 2);  // DD
+            p[5] = '/';
+            std::memcpy(p + 6, cache->date_time + 2, 2);  // YY
+            out.advance(8);
             break;
-        case Flag::kDateMDY:
-            std::memcpy(buf, cache->date_time + 5, 2);      // MM
-            buf[2] = '/';
-            std::memcpy(buf + 3, cache->date_time + 8, 2);  // DD
-            buf[5] = '/';
-            std::memcpy(buf + 6, cache->date_time + 2, 2);  // YY
-            out.append(buf, 8);
-            break;
+        }
         case Flag::kDateTimeFull:
             // "Www Mmm DD HH:MM:SS YYYY", the shape std::asctime produces.
-            out += weekday_short(cache->tm.tm_wday);
-            out += ' ';
-            out += month_short(cache->tm.tm_mon);
-            out += ' ';
-            out.append(cache->date_time + 8, 2);
-            out += ' ';
-            out.append(cache->date_time + kTimeOffset, kTimeLen);
-            out += ' ';
-            out.append(cache->date_time, 4);
+            out.put(weekday_short(cache->tm.tm_wday));
+            out.put(' ');
+            out.put(month_short(cache->tm.tm_mon));
+            out.put(' ');
+            out.put(cache->date_time + 8, 2);
+            out.put(' ');
+            out.put(cache->date_time + kTimeOffset, kTimeLen);
+            out.put(' ');
+            out.put(cache->date_time, 4);
             break;
         case Flag::kEpochSeconds:
-            append_uint(out, entry.timestamp / 1000000000ULL);
+            out.put_uint(entry.timestamp / 1000000000ULL);
             break;
-        case Flag::kWeekdayShort: out += weekday_short(cache->tm.tm_wday); break;
-        case Flag::kWeekdayLong:  out += weekday_long(cache->tm.tm_wday); break;
-        case Flag::kMonthShort:   out += month_short(cache->tm.tm_mon); break;
-        case Flag::kMonthLong:    out += month_long(cache->tm.tm_mon); break;
-        case Flag::kColorBegin:   out += ctx.color_start; break;
-        case Flag::kColorEnd:     out += ctx.color_end; break;
+        case Flag::kWeekdayShort: out.put(weekday_short(cache->tm.tm_wday)); break;
+        case Flag::kWeekdayLong:  out.put(weekday_long(cache->tm.tm_wday)); break;
+        case Flag::kMonthShort:   out.put(month_short(cache->tm.tm_mon)); break;
+        case Flag::kMonthLong:    out.put(month_long(cache->tm.tm_mon)); break;
+        case Flag::kColorBegin:   out.put(ctx.color_start); break;
+        case Flag::kColorEnd:     out.put(ctx.color_end); break;
         case Flag::kDefaultHeader:
             if (ctx.timestamp) {
-                append_default_layout(out, entry, *ctx.timestamp, ctx.level_name, ctx.message);
+                write_default_layout(out, entry, *ctx.timestamp, ctx.level_name, ctx.message);
             }
             break;
         case Flag::kConfiguredTimestamp:
             if (ctx.timestamp) {
-                ctx.timestamp->append_timestamp(out, entry.timestamp);
+                ctx.timestamp->write(out, entry.timestamp);
             }
             break;
     }
@@ -3539,42 +3930,36 @@ inline void PatternFormatter::format(std::string& out, const LogEntry& entry,
         subsecond_ns = static_cast<uint32_t>(entry.timestamp % 1000000000ULL);
     }
 
+    // Sized once for the whole line, so no op below checks capacity or grows.
+    detail::line_writer writer(out, line_bound(entry, ctx));
+
     // A pattern that does not mark its own range colors the whole line, which is
     // what the built-in layout does.
     const bool wrap_color = !ctx.color_start.empty() && !has_color_range_;
     if (wrap_color) {
-        out += ctx.color_start;
+        writer.put(ctx.color_start);
     }
 
+    // write_op() is forced inline, so it appears here exactly once: a second
+    // copy for padded fields would double the loop and crowd the inliner out of
+    // everything the op bodies call.
     for (const Op& op : ops_) {
-        const size_t start = out.size();
-        append_op(out, op, entry, ctx, cache, subsecond_ns);
-        if (op.width == 0) {
-            continue;
-        }
-        const size_t written = out.size() - start;
-        if (written >= op.width) {
-            continue;  // never truncate a field to fit its width
-        }
-        const size_t pad = op.width - written;
-        if (op.left_align) {
-            out.append(pad, ' ');
-        } else {
-            // The field is already at the tail, so this shifts only its own bytes
-            // - at most kMaxFieldWidth of them - not the line before it. Sliding
-            // them by hand instead, with memmove or a byte loop, measured no
-            // faster than letting the string do it.
-            out.insert(start, pad, ' ');
+        writer.put(literals_.data() + op.prefix_off, op.prefix_len);
+        const size_t start = writer.offset();
+        write_op(writer, op, entry, ctx, cache, subsecond_ns);
+        if (op.width != 0) {
+            writer.pad_from(start, op.width, op.left_align);
         }
     }
 
     if (wrap_color) {
-        out += ctx.color_end;
+        writer.put(ctx.color_end);
     } else if (color_left_open_) {
         // "%^" with no "%$" means "color from here to the end of the line", not
         // "leave the terminal tinted for everything printed afterwards".
-        out += ctx.color_end;
+        writer.put(ctx.color_end);
     }
+    writer.finish();
 }
 
 inline void ISink::publish_active_pattern() noexcept {
@@ -3646,9 +4031,14 @@ inline std::string_view ISink::format_log_entry(const LogEntry& entry,
         ctx.color_end = color_end;
         active->format(format_buffer_, entry, ctx);
     } else {
-        format_buffer_ += color_start;
-        append_default_layout(format_buffer_, entry, timestamp_formatter_, level_name, message);
-        format_buffer_ += color_end;
+        detail::line_writer writer(format_buffer_,
+                                   color_start.size() + color_end.size()
+                                   + default_layout_bound(entry, timestamp_formatter_, level_name,
+                                                          message, source_file_length(entry)));
+        writer.put(color_start);
+        write_default_layout(writer, entry, timestamp_formatter_, level_name, message);
+        writer.put(color_end);
+        writer.finish();
     }
     return format_buffer_;
 }

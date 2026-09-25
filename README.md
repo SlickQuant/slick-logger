@@ -817,28 +817,29 @@ A `%^` with no matching `%$` colors through to the end of the line and is closed
 
 #### Performance
 
-A pattern is parsed exactly once, inside `set_pattern()`, into a flat list of ops. Rendering walks that list on the writer thread and appends into a buffer the sink reuses, so a line costs no parsing and no allocation beyond the message itself. Date and time flags slice the broken-down time that is computed once per whole second and cached, and the weekday/month names come from static tables — there is no `strftime`, no `put_time` and no locale anywhere on this path. Runs of adjacent date/time flags are fused at compile time, so `%Y-%m-%d %H:%M:%S` becomes a single `memcpy` rather than twelve appends.
+A pattern is parsed exactly once, inside `set_pattern()`, into a flat list of ops. Rendering walks that list on the writer thread and appends into a buffer the sink reuses, so a line costs no parsing and no allocation beyond the message itself. Date and time flags slice the broken-down time that is computed once per whole second and cached, and the weekday/month names come from static tables — there is no `strftime`, no `put_time` and no locale anywhere on this path. Runs of adjacent date/time flags are fused at compile time, so `%Y-%m-%d %H:%M:%S` becomes a single `memcpy` rather than twelve appends, and a `.%e`, `.%f` or `.%F` right after one joins it. Every literal run is folded into the op that follows it, so `[%l] %v` renders as two ops, not four.
 
-Measured on Windows/MSVC `/O2`, minimum of many runs, rendering one line (no I/O):
+The line is then sized once, to an upper bound computed from the pattern and the entry, and every op copies its text straight through a cursor into that space — no capacity check, no `std::string::append` call and no out-of-line dispatch per piece. The built-in layout is written through the same code, which is also why it no longer formats numbers through `std::to_string`.
 
-| Line layout | ns/line | vs 1.3.0 |
-| --- | --- | --- |
-| Built-in layout, 1.3.0 | 291 | — |
-| Built-in layout, now | 155 | **-47%** |
-| `%+` | 161 | -45% |
-| `%q\|%v` | 101 | -65% |
-| `%Y-%m-%d %H:%M:%S.%f [%l] [%s:%#] %v` | 243 | -16% |
-| `%T.%e %^%-5l%$ %-20@ %v` | 262 | -10% |
-| `[%l] %v` | 106 | -63% |
+Measured on Windows/MSVC `/O2` (Ryzen 9 5900HX), minimum of 21 interleaved rounds, rendering one line through `ISink::format_log_entry()` — an entry with a source location and a message without arguments, no I/O:
 
-The built-in layout got faster because the shared renderer builds the line in place: the timestamp and the level no longer become strings of their own, and the line is assembled straight into the sink's reusable buffer instead of a fresh `std::string` returned by value. A spelled-out pattern costs more than the built-in path — the per-op dispatch and, for aligned fields, the padding — but every layout above renders well ahead of what 1.3.0 shipped. On the producing thread the `LOG_*` call itself measured 96.6 → 97.8 ns, the cost of stamping the thread id.
+| Line layout | 2.1.0 ns/line | now ns/line | change |
+| --- | --- | --- | --- |
+| Built-in layout | 253 | 207 | **-18%** |
+| `%+` | 253 | 227 | -10% |
+| `%q\|%v` | 178 | 181 | ~0% |
+| `%Y-%m-%d %H:%M:%S.%f [%l] [%s:%#] %v` | 332 | 240 | **-28%** |
+| `%T.%e %^%-5l%$ %-20@ %v` | 346 | 264 | -24% |
+| `[%l] %v` | 181 | 166 | -8% |
+
+A spelled-out pattern now renders within about 15% of the built-in layout, where 2.1.0 was about 30% slower. The rest of each row is the message itself, which costs the same whatever the layout: timing only the layout step, with the message already formatted, `%Y-%m-%d %H:%M:%S.%f [%l] [%@] %v` takes 91 ns against 90 ns for the built-in layout (2.1.0: 197 ns against 114 ns). On an entry with arguments, `std::format` dominates the line, and the layout accounts for only a few percent of it. On the producing thread the `LOG_*` call itself measured 96.6 → 97.8 ns, the cost of stamping the thread id.
 
 A pattern also pays only for the fields it actually renders:
 
 - **The message.** A pattern that renders neither the message nor a level skips the `std::format` pass altogether, which is the dominant cost of a line with arguments. On an entry with two arguments, `%T|%@` renders in **94 ns** against **705 ns** for `%T|%@|%l` — adding a level flag brings the message pass back, because a message that fails to format is reported at `ERROR` and that is only known by attempting it.
 - **The broken-down time.** Only a calendar field (`%Y`, `%H`, `%T`, `%c`, `%a` …) needs one. `%e`, `%f`, `%F` and `%E` are arithmetic on the entry's own timestamp, so a pattern built from those alone never consults the per-second cache at all.
 
-Width costs something either way, but right alignment costs more: `%-8l` appends its padding after a field that is already at the end of the line, while `%8l` has to put the padding in front of it. Measured at roughly 20ns per right-aligned field. Prefer left alignment where the column order allows it.
+Width costs something either way, but right alignment costs more: `%-8l` appends its padding after a field that is already at the end of the line, while `%8l` has to put the padding in front of it. Measured at roughly 10ns per right-aligned field. Prefer left alignment where the column order allows it.
 
 `%q` delegates to the sink's `TimestampFormatter`, which appends its predefined formats straight into the same buffer — the row above shows what that costs. The exception is `Format::CUSTOM`, which carries the `strftime` cost described below; spell the date out with pattern flags instead of using a custom format string on a hot path.
 

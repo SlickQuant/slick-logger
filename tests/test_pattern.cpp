@@ -1271,3 +1271,126 @@ TEST_F(PatternTest, SinkPatternCanChangeWhileTheSinkRenders) {
     EXPECT_EQ(sink.owned_pattern_count(), static_cast<size_t>(kPatternCount));
     EXPECT_EQ(sink.render(entry), render_with(patterns.back(), entry));
 }
+
+// ---------------------------------------------------------------------------
+// 12. Fused ops and the pre-sized line render exactly what the parts would
+// ---------------------------------------------------------------------------
+
+TEST_F(PatternTest, FractionFusedOntoATimeSliceRendersAsTheSeparateFlags) {
+    const LogEntry entry = make_entry();
+    const std::string as_default =
+        TimestampFormatter(TimestampFormatter::Format::DEFAULT).format_timestamp(kTimestamp);
+    const std::string time = as_default.substr(11, 8);
+    const std::string year = as_default.substr(0, 4);
+
+    EXPECT_EQ(render_with("%T.%e", entry), time + ".123");
+    EXPECT_EQ(render_with("%H:%M:%S,%F", entry), time + ",123456789");
+    // Any single character separates, including an escaped percent.
+    EXPECT_EQ(render_with("%Y%%%f", entry), year + "%123456");
+    // Calendar text after a fraction must not be folded into the slice before it.
+    EXPECT_EQ(render_with("%S.%f%Y", entry), as_default.substr(17, 2) + ".123456" + year);
+    // A padded fraction keeps its own width rather than fusing.
+    EXPECT_EQ(render_with("%S.%9f|", entry), as_default.substr(17, 2) + ".   123456|");
+    // A separator longer than one character is left as a literal.
+    EXPECT_EQ(render_with("%S::%e", entry), as_default.substr(17, 2) + "::123");
+    // Zero padding survives the fused path too.
+    EXPECT_EQ(render_with("%T.%f", make_entry(kPaddedTimestamp)),
+              TimestampFormatter(TimestampFormatter::Format::DEFAULT)
+                  .format_timestamp(kPaddedTimestamp).substr(11, 8) + ".000123");
+}
+
+TEST_F(PatternTest, LiteralPrefixesStayOutsideTheirFieldWidth) {
+    const LogEntry entry = make_entry();
+    EXPECT_EQ(render_with("a%5Lb%-3Lc", entry), "a    IbI  c");
+    EXPECT_EQ(render_with("<<%6l>>%v!", entry), "<<  INFO>>hello world!");
+    EXPECT_EQ(render_with("%v%v", entry), "hello worldhello world");
+    EXPECT_EQ(render_with("-%%-", entry), "-%-");
+}
+
+TEST_F(PatternTest, CustomTimestampRendersInsideAPaddedPatternField) {
+    // A CUSTOM format is sized by strftime, so it is appended outside the line's
+    // pre-computed budget; the padding and the text after it must still land.
+    const LogEntry entry = make_entry();
+    const std::string custom_format = "%Y/%m/%d %H-%M-%S.%f";
+    const std::string stamp = TimestampFormatter(custom_format).format_timestamp(kTimestamp);
+    ASSERT_LT(stamp.size(), 40u);
+
+    CapturingSink sink;
+    sink.set_timestamp_format(custom_format);
+    sink.set_pattern("[%40q] %-6l|%v");
+    EXPECT_EQ(sink.render(entry),
+              "[" + std::string(40 - stamp.size(), ' ') + stamp + "] INFO  |hello world");
+
+    sink.set_pattern("%q|%+");
+    EXPECT_EQ(sink.render(entry), stamp + "|" + stamp + " [INFO] hello world");
+
+    // Past the 256-byte stack buffer strftime is tried with first.
+    std::string long_format;
+    for (int i = 0; i < 80; ++i) {
+        long_format += "%Y";
+    }
+    const std::string long_stamp = TimestampFormatter(long_format).format_timestamp(kTimestamp);
+    ASSERT_EQ(long_stamp.size(), 320u);
+    sink.set_timestamp_format(long_format);
+    sink.set_pattern("%q %-8l|");
+    EXPECT_EQ(sink.render(entry), long_stamp + " INFO    |");
+
+    CapturingSink built_in;
+    built_in.set_timestamp_format(long_format);
+    EXPECT_EQ(built_in.render(entry), long_stamp + " [INFO] hello world");
+}
+
+TEST_F(PatternTest, LinesFarLongerThanTheBufferRenderWhole) {
+    const std::string big(20000, 'x');
+    LogEntry entry = make_entry();
+    entry.format = {big.c_str(), static_cast<uint32_t>(big.size())};
+    add_source_location(entry, "a_rather_long_source_file_name_for_the_bound.cpp", 4294967295u);
+    const std::string location = "a_rather_long_source_file_name_for_the_bound.cpp:4294967295";
+
+    EXPECT_EQ(render_with("%v|%v", entry), big + "|" + big);
+    EXPECT_EQ(render_with("%-64@|%v", entry),
+              location + std::string(PatternFormatter::kMaxFieldWidth - location.size(), ' ') + "|" + big);
+
+    CapturingSink built_in;
+    const std::string line = built_in.render(entry);
+    const std::string tail = " [INFO] [" + location + "] " + big;
+    ASSERT_EQ(line.size(), 26 + tail.size()) << line.substr(0, 120);
+    EXPECT_EQ(line.substr(26), tail);
+}
+
+TEST_F(PatternTest, WidestPidTagAndLineFitTheBuiltInLayout) {
+    // The layout is sized from bounds rather than exact lengths, so the widest
+    // value of every field is what has to fit.
+    LogEntry entry = make_entry();
+    add_source_location(entry, "main.cpp", 4294967295u);
+    entry.pid = 4294967295u;
+    std::memset(entry.tag, 'T', sizeof(entry.tag));  // fills the tag with no NUL
+
+    const std::string tag(SLICK_LOGGER_TAG_SIZE, 'T');
+    const std::string tail =
+        " [INFO] [4294967295:" + tag + "] [main.cpp:4294967295] hello world";
+
+    CapturingSink built_in;
+    const std::string line = built_in.render(entry);
+    ASSERT_GE(line.size(), tail.size());
+    EXPECT_EQ(line.substr(line.size() - tail.size()), tail);
+    EXPECT_EQ(render_with("%+", entry), line);
+    EXPECT_EQ(render_with("%P:%k:%#", entry), "4294967295:" + tag + ":4294967295");
+}
+
+TEST_F(PatternTest, FormatAppendsAfterWhatTheBufferAlreadyHolds) {
+    const PatternFormatter pattern("[%-5l] %v");
+    PatternFormatter::Context ctx;
+    ctx.message = "body";
+    ctx.level = LogLevel::L_WARN;
+    ctx.level_name = "WARN";
+
+    std::string out = "prefix:";
+    pattern.format(out, make_entry(), ctx);
+    EXPECT_EQ(out, "prefix:[WARN ] body");
+
+    const TimestampFormatter timestamp;
+    std::string with_default = "x";
+    append_default_layout(with_default, make_entry(), timestamp, "INFO", "m");
+    EXPECT_EQ(with_default, "x" + timestamp.format_timestamp(kTimestamp) + " [INFO] m");
+}
