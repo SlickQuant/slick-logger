@@ -1285,7 +1285,7 @@ For optimal performance, the logger defers string formatting to the background t
 
 1. **Caller Thread**: Captures the format pointer, source location, thread id, and owned copies of any dynamic string data
 2. **Lock-Free Queue**: Stores a compact `LogEntry` in the ring buffer with minimal caller-side work
-3. **Writer Thread**: Formats the message *and the line layout*, then writes to all matching sinks
+3. **Writer Thread**: Formats the message *and the line layout*, then writes to all matching sinks. The message is formatted at most once per entry, however many sinks render it, and only if one of them needs it
 
 This approach moves potentially expensive formatting and I/O operations off the critical path, making logging calls extremely fast and suitable for high-frequency logging scenarios.
 
@@ -1329,7 +1329,7 @@ public:
     void write(const slick::logger::LogEntry& entry) override {
         // Format as JSON - see examples/multi_sink_example.cpp for full implementation
         const char* level_str = /* convert level to string */;
-        auto [message, _] = format_log_message(entry);
+        auto [message, _] = formatted_message(entry);  // std::string_view
         
         if (!first_entry_) file_ << ",\n";
         first_entry_ = false;
@@ -1350,9 +1350,11 @@ Logger::instance().add_sink(std::make_shared<JsonSink>("app.json"));
 
 A sink that writes to a file can inherit `FileSinkBase` instead, which supplies the stream, its buffer, directory creation, and `flush()`. That is what `FileSink` and `BinarySink` are built on.
 
+`formatted_message()` returns the message body and whether it formatted cleanly (`false` means it is the `[FORMAT_ERROR: ...]` text). While the logger dispatches an entry, the message is formatted **once** and shared by every sink that asks for it — the first sink to ask pays for `std::format`, the rest reuse the result, and a sink that never asks costs nothing. The returned `std::string_view` is valid until the next call on that sink or the next entry; `format_log_message()` returns the same thing as an owned `std::string` if you need to keep it.
+
 ### Rendering a whole line from a custom sink
 
-`format_log_message()` gives you just the message body. If you want the full line — timestamp, level, source location, and whatever pattern the user configured — call the protected `format_log_entry()` instead. It is the same code `ConsoleSink` and `FileSink` use, so a custom sink honors `set_pattern()` for free:
+`formatted_message()` gives you just the message body. If you want the full line — timestamp, level, source location, and whatever pattern the user configured — call the protected `format_log_entry()` instead. It is the same code `ConsoleSink` and `FileSink` use, so a custom sink honors `set_pattern()` for free:
 
 ```cpp
 class SyslogSink : public slick::logger::ISink {

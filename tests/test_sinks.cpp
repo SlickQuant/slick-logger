@@ -1196,6 +1196,213 @@ TEST_F(SinkTest, TextSinkTruncatesLongBinaryPreview) {
     EXPECT_NE(content.find("capped=" + hex_ab(2) + "...(100 bytes)"), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// The message is formatted once per entry, however many sinks render it
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * @brief Records, per entry, what it saw of the logger's shared message
+ *
+ * Asks for the message itself unless it only renders a pattern, and notes
+ * beforehand whether an earlier sink had already formatted it.
+ */
+class MessageProbeSink : public slick::logger::ISink {
+public:
+    struct Seen {
+        std::string message;
+        bool good = true;
+        const char* data = nullptr;       ///< where the message lived: shared or not
+        bool already_formatted = false;   ///< formatted before this sink asked
+    };
+
+    explicit MessageProbeSink(bool asks_for_message = true) : asks_for_message_(asks_for_message) {}
+
+    void write(const slick::logger::LogEntry& entry) override {
+        const auto* current = slick::logger::detail::current_dispatch();
+        Seen seen;
+        seen.already_formatted = current && current->entry == &entry && current->formatted;
+        if (asks_for_message_) {
+            const auto [message, good] = formatted_message(entry);
+            seen.message.assign(message);
+            seen.good = good;
+            seen.data = message.data();
+        }
+        lines_.emplace_back(format_log_entry(entry));
+        seen_.push_back(std::move(seen));
+    }
+    void flush() override {}
+
+    const std::vector<Seen>& seen() const noexcept { return seen_; }
+    const std::vector<std::string>& lines() const noexcept { return lines_; }
+
+    /// Index of the first line containing @p text, or -1.
+    int find_line(std::string_view text) const {
+        for (size_t i = 0; i < lines_.size(); ++i) {
+            if (lines_[i].find(text) != std::string::npos) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+private:
+    bool asks_for_message_;
+    std::vector<Seen> seen_;          // writer thread only; read after reset()
+    std::vector<std::string> lines_;
+};
+
+slick::logger::LogEntry make_message_entry(const char* format) {
+    slick::logger::LogEntry entry{};
+    entry.level = slick::logger::LogLevel::L_INFO;
+    entry.timestamp = 1693038674123456789ULL;
+    entry.format = {format};
+    return entry;
+}
+
+/// "value: {:d}" against a string: std::format rejects it, so the entry fails.
+slick::logger::LogEntry make_failing_entry() {
+    slick::logger::LogEntry entry = make_message_entry("value: {:d}");
+    entry.arg_count = 1;
+    entry.args[0].type = slick::logger::ArgType::STRING_LITERAL;
+    entry.args[0].value.literal_ptr = "not a number";
+    return entry;
+}
+
+} // namespace
+
+TEST_F(SinkTest, MessageIsFormattedOnceForEverySink) {
+    auto first = std::make_shared<MessageProbeSink>();
+    auto second = std::make_shared<MessageProbeSink>();
+    auto third = std::make_shared<MessageProbeSink>();
+    slick::logger::LogConfig config;
+    config.sinks = {first, second, third};
+    slick::logger::Logger::instance().init(config);
+
+    LOG_INFO("value {} and {}", 42, "text");
+    slick::logger::Logger::instance().reset();
+
+    const int at = first->find_line("value 42 and text");
+    ASSERT_GE(at, 0) << "the entry never reached the first sink";
+    ASSERT_EQ(second->find_line("value 42 and text"), at);
+    ASSERT_EQ(third->find_line("value 42 and text"), at);
+
+    const auto& a = first->seen()[at];
+    const auto& b = second->seen()[at];
+    const auto& c = third->seen()[at];
+    EXPECT_FALSE(a.already_formatted) << "nothing had formatted it before the first sink";
+    EXPECT_TRUE(b.already_formatted) << "the second sink formatted it again";
+    EXPECT_TRUE(c.already_formatted) << "the third sink formatted it again";
+    EXPECT_EQ(a.data, b.data) << "every sink reads the one shared message";
+    EXPECT_EQ(a.data, c.data);
+    EXPECT_EQ(a.message, "value 42 and text");
+    EXPECT_EQ(b.message, a.message);
+    EXPECT_EQ(c.message, a.message);
+}
+
+TEST_F(SinkTest, SinkThatNeedsNoMessageLeavesItUnformatted) {
+    // Registered first, and its pattern renders neither %v nor a level.
+    auto time_only = std::make_shared<MessageProbeSink>(false);
+    time_only->set_pattern("%T");
+    auto text = std::make_shared<MessageProbeSink>();
+    slick::logger::LogConfig config;
+    config.sinks = {time_only, text};
+    slick::logger::Logger::instance().init(config);
+
+    LOG_INFO("lazy {}", 1);
+    slick::logger::Logger::instance().reset();
+
+    const int at = text->find_line("lazy 1");
+    ASSERT_GE(at, 0);
+    EXPECT_FALSE(text->seen()[at].already_formatted)
+        << "a sink that renders no message formatted it anyway";
+    EXPECT_EQ(time_only->lines()[at].size(), 8u) << time_only->lines()[at];  // just HH:MM:SS
+}
+
+TEST_F(SinkTest, FormatErrorReachesEverySinkAsError) {
+    MessageProbeSink first;
+    MessageProbeSink second;
+    const slick::logger::LogEntry entry = make_failing_entry();
+
+    slick::logger::detail::dispatch_message shared;
+    {
+        const slick::logger::detail::dispatch_scope scope(shared, entry);
+        first.write(entry);
+        second.write(entry);
+    }
+
+    ASSERT_EQ(first.lines().size(), 1u);
+    ASSERT_EQ(second.lines().size(), 1u);
+    EXPECT_TRUE(second.seen()[0].already_formatted);
+    for (const MessageProbeSink* sink : {&first, &second}) {
+        EXPECT_FALSE(sink->seen()[0].good);
+        EXPECT_NE(sink->lines()[0].find("[ERROR]"), std::string::npos) << sink->lines()[0];
+        EXPECT_NE(sink->lines()[0].find("[FORMAT_ERROR: "), std::string::npos) << sink->lines()[0];
+    }
+}
+
+TEST_F(SinkTest, EntriesSharingAnAddressEachGetTheirOwnMessage) {
+    // What the collector does with shared-memory entries: every one is rebased
+    // into the same scratch LogEntry, so consecutive entries share an address.
+    MessageProbeSink first;
+    MessageProbeSink second;
+    slick::logger::LogEntry scratch = make_message_entry("");
+    slick::logger::detail::dispatch_message shared;
+
+    for (const char* text : {"alpha", "beta", "gamma"}) {
+        scratch.format = {text};
+        const slick::logger::detail::dispatch_scope scope(shared, scratch);
+        first.write(scratch);
+        second.write(scratch);
+    }
+
+    for (const MessageProbeSink* sink : {&first, &second}) {
+        ASSERT_EQ(sink->seen().size(), 3u);
+        EXPECT_EQ(sink->seen()[0].message, "alpha");
+        EXPECT_EQ(sink->seen()[1].message, "beta");
+        EXPECT_EQ(sink->seen()[2].message, "gamma");
+    }
+    EXPECT_FALSE(first.seen()[1].already_formatted) << "a stale message was reused";
+    EXPECT_EQ(slick::logger::detail::current_dispatch(), nullptr) << "the scope was not restored";
+}
+
+TEST_F(SinkTest, SinkWrittenDirectlyFormatsForItself) {
+    // No logger dispatch is in progress, so there is nothing to share.
+    ASSERT_EQ(slick::logger::detail::current_dispatch(), nullptr);
+    MessageProbeSink sink;
+    sink.write(make_message_entry("first"));
+    sink.write(make_message_entry("second"));
+
+    ASSERT_EQ(sink.seen().size(), 2u);
+    EXPECT_EQ(sink.seen()[0].message, "first");
+    EXPECT_EQ(sink.seen()[1].message, "second");
+    EXPECT_FALSE(sink.seen()[1].already_formatted);
+    EXPECT_NE(sink.lines()[1].find("second"), std::string::npos);
+}
+
+TEST_F(SinkTest, FailedFormatReplacesAPartialMessage) {
+    // The first argument formats, then the second fails: what was already
+    // appended must not survive in front of the error text.
+    slick::logger::LogEntry entry = make_message_entry("ok {} then {:d}");
+    entry.arg_count = 2;
+    entry.args[0].type = slick::logger::ArgType::INT32_T;
+    entry.args[0].value.i32 = 5;
+    entry.args[1].type = slick::logger::ArgType::STRING_LITERAL;
+    entry.args[1].value.literal_ptr = "x";
+
+    std::string out = "prefix:";
+    EXPECT_FALSE(slick::logger::append_formatted_message(out, entry));
+    EXPECT_EQ(out.rfind("prefix:[FORMAT_ERROR: ", 0), 0u) << out;
+    EXPECT_EQ(out.find("ok 5"), std::string::npos) << out;
+    EXPECT_EQ(out.back(), ']') << out;
+
+    // And a clean entry appends after what the buffer already held.
+    out = "prefix:";
+    EXPECT_TRUE(slick::logger::append_formatted_message(out, make_message_entry("plain")));
+    EXPECT_EQ(out, "prefix:plain");
+}
+
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

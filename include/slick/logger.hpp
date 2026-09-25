@@ -55,6 +55,7 @@
 #include <string_view>
 #include <type_traits>
 #include <system_error>
+#include <tuple>
 #include <slick/queue.hpp>
 
 // For time functions on some platforms
@@ -1204,6 +1205,57 @@ inline constexpr bool has_source_location(const LogEntry& entry) noexcept {
     return (entry.flags & kEntryHasSourceLocation) != 0;
 }
 
+namespace detail {
+
+/**
+ * @brief The message of the entry being dispatched, formatted at most once
+ *
+ * An entry's message, and whether it formatted cleanly, depend on the entry
+ * alone, yet every text sink needs them. The logger keeps one of these for the
+ * entry it is handing to its sinks: the first sink that needs the message
+ * formats it here, and every later sink reuses it. A sink that never needs the
+ * message - a binary sink, or a pattern that renders neither %v nor a level -
+ * never causes it to be formatted at all.
+ */
+struct dispatch_message {
+    const LogEntry* entry = nullptr;  ///< the entry being dispatched
+    std::string text;                 ///< its message, once formatted; reused across entries
+    bool formatted = false;           ///< whether text holds entry's message yet
+    bool good = true;                 ///< false if the message could not be formatted
+};
+
+/// The dispatch_message of the entry this thread is dispatching, or null when
+/// it is not dispatching one - a sink written to directly, say.
+inline dispatch_message*& current_dispatch() noexcept {
+    thread_local dispatch_message* current = nullptr;
+    return current;
+}
+
+/**
+ * @brief Makes @p message the current dispatch for one entry, for its scope
+ *
+ * Reset per entry rather than recognized by address alone: entries from shared
+ * memory are all rebased into the same scratch LogEntry, so consecutive entries
+ * share an address and only this reset tells them apart.
+ */
+class dispatch_scope {
+public:
+    dispatch_scope(dispatch_message& message, const LogEntry& entry) noexcept
+        : previous_(current_dispatch()) {
+        message.entry = &entry;
+        message.formatted = false;
+        current_dispatch() = &message;
+    }
+    ~dispatch_scope() { current_dispatch() = previous_; }
+    dispatch_scope(const dispatch_scope&) = delete;
+    dispatch_scope& operator=(const dispatch_scope&) = delete;
+
+private:
+    dispatch_message* previous_;
+};
+
+} // namespace detail
+
 /**
  * @brief A log line layout, compiled once from an spdlog-style pattern string
  *
@@ -1584,6 +1636,19 @@ public:
     void set_timestamp_format(const std::string& custom_format);
 
 protected:
+    /**
+     * @brief The entry's formatted message, and false if it could not be formatted
+     * @return A view valid until the next call on this sink or the next entry;
+     *         copy it to keep it
+     *
+     * While the logger dispatches an entry, its message is formatted once and
+     * shared by every sink that asks for it, so N text sinks cost one format,
+     * not N. Called outside a dispatch - a sink written to directly - it formats
+     * into a buffer this sink reuses. Writer thread only.
+     */
+    std::pair<std::string_view, bool> formatted_message(const LogEntry& entry);
+
+    /// formatted_message() as an owned string, for a caller that keeps it.
     std::pair<std::string, bool> format_log_message(const LogEntry& entry);
 
     /// Maps a level to the escape sequence that opens its color. Null for a sink
@@ -1647,6 +1712,9 @@ protected:
     // Writer thread only; reused across entries so a steady-state line allocates
     // nothing at all.
     std::string format_buffer_;
+    // Where formatted_message() formats when no dispatch is sharing one. Writer
+    // thread only, reused like format_buffer_.
+    std::string message_buffer_;
     // This sink's own patterns, from set_pattern(). Grow-only, so a pointer the
     // writer thread already loaded stays valid even as set_pattern() publishes a
     // replacement.
@@ -2755,6 +2823,9 @@ private:
     // Scratch used by the writer thread to rebase shared-memory entries. Owned by
     // that thread alone, so no synchronization is needed.
     LogEntry rebase_scratch_{};
+    // The dispatched entry's message, formatted once for all sinks. Writer thread
+    // only; its buffer is reused across entries. See detail::dispatch_message.
+    detail::dispatch_message dispatch_message_;
     // When the writer thread first noticed an unpublished slot blocking progress.
     // Writer-thread-only, like rebase_scratch_.
     std::chrono::steady_clock::time_point stalled_since_{};
@@ -2883,9 +2954,8 @@ inline void append_binary_arg(std::string& out, std::string_view format_spec, St
     }
 
     const size_t shown = std::min(preview, bytes.size());
-    // Written straight into the caller's buffer. Every text sink formats the
-    // entry independently, so a temporary string here would be an allocation and
-    // a copy of a few hundred bytes per sink per binary argument.
+    // Written straight into the caller's buffer: a temporary string here would be
+    // an allocation and a copy of a few hundred bytes per binary argument.
     out.reserve(out.size() + shown * 2 + 24);
     for (size_t i = 0; i < shown; ++i) {
         const auto byte = static_cast<unsigned char>(bytes[i]);
@@ -2987,7 +3057,7 @@ inline uint64_t checked_spec_value(T value) {
  *
  * @note The union member is read by value. These members are packed and may be
  *       misaligned, so a reference must never be bound to one - see
- *       format_one_arg.
+ *       append_one_arg.
  * @throws std::format_error if the argument cannot serve as a width/precision
  */
 inline uint64_t dynamic_spec_value(const LogArgument& arg) {
@@ -3006,7 +3076,7 @@ inline uint64_t dynamic_spec_value(const LogArgument& arg) {
 }
 
 /**
- * @brief Format a single log argument against one "{...}" spec
+ * @brief Append a single log argument, formatted against one "{...}" spec
  * @note The value is taken BY VALUE on purpose. LogEntry and LogArgument are
  *       "#pragma pack(1)", so their members can sit at misaligned addresses,
  *       and std::make_format_args binds a reference to whatever it is handed.
@@ -3016,49 +3086,62 @@ inline uint64_t dynamic_spec_value(const LogArgument& arg) {
  *       the parameter itself is always suitably aligned.
  */
 template<typename T>
-inline std::string format_one_arg(std::string_view format_spec, T value) {
-    return std::vformat(format_spec, std::make_format_args(value));
+inline void append_one_arg(std::string& out, std::string_view format_spec, T value) {
+    std::vformat_to(std::back_inserter(out), format_spec, std::make_format_args(value));
 }
 
-inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& entry) {
+/**
+ * @brief Append @p entry's formatted message to @p out
+ * @return false if the message could not be formatted. What was appended is then
+ *         the "[FORMAT_ERROR: ...]" text, never a partial message.
+ *
+ * The format string is only ever viewed, never copied, and every argument is
+ * formatted straight into @p out, so a caller that reuses @p out formats a line
+ * without allocating once the buffer has grown to fit.
+ */
+inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
+    const std::string_view fmt = view_string_ref(entry.format);
     if (entry.arg_count == 0) {
-        return std::make_pair(std::string{view_string_ref(entry.format)}, true);
+        out += fmt;
+        return true;
     }
+
+    // Everything appended past here is rolled back if formatting fails, so the
+    // error text replaces the partial message instead of trailing it.
+    const size_t base = out.size();
 
     // Since std::make_format_args doesn't work with custom types in MSVC,
     // we'll use a manual implementation that preserves std::format functionality
     // by manually parsing format specifiers and applying them to each argument
     try {
-        std::string format_str{view_string_ref(entry.format)};
-        std::string result;
-        result.reserve(format_str.length() + 256); // Reserve some space for formatting
+        out.reserve(base + fmt.size() + 256); // Reserve some space for formatting
 
         size_t pos = 0;
         uint8_t arg_index = 0;
 
-        while (pos < format_str.length()) {
-            size_t brace_start = format_str.find_first_of("{}", pos);
-            if (brace_start == std::string::npos) {
+        while (pos < fmt.length()) {
+            size_t brace_start = fmt.find_first_of("{}", pos);
+            if (brace_start == std::string_view::npos) {
                 // No more format specifiers, copy rest of string
-                result += format_str.substr(pos);
+                out += fmt.substr(pos);
                 break;
             }
 
             // Copy everything before the brace
-            result += format_str.substr(pos, brace_start - pos);
+            out += fmt.substr(pos, brace_start - pos);
 
-            if (format_str[brace_start] == '{' &&
-                brace_start + 1 < format_str.length() &&
-                format_str[brace_start + 1] == '{') {
-                result += '{';
+            if (fmt[brace_start] == '{' &&
+                brace_start + 1 < fmt.length() &&
+                fmt[brace_start + 1] == '{') {
+                out += '{';
                 pos = brace_start + 2;
                 continue;
             }
 
-            if (format_str[brace_start] == '}') {
-                if (brace_start + 1 < format_str.length() &&
-                    format_str[brace_start + 1] == '}') {
-                    result += '}';
+            if (fmt[brace_start] == '}') {
+                if (brace_start + 1 < fmt.length() &&
+                    fmt[brace_start + 1] == '}') {
+                    out += '}';
                     pos = brace_start + 2;
                 } else {
                     throw std::format_error("unmatched '}' in format string");
@@ -3079,12 +3162,12 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
             // "{unclosed and {}" means, and it is not a nested field anyway.
             size_t brace_end = brace_start + 1;
             bool in_spec = false;
-            while (brace_end < format_str.length() && format_str[brace_end] != '}') {
-                if (format_str[brace_end] == ':') {
+            while (brace_end < fmt.length() && fmt[brace_end] != '}') {
+                if (fmt[brace_end] == ':') {
                     in_spec = true;
-                } else if (in_spec && format_str[brace_end] == '{') {
-                    const size_t nested_end = format_str.find('}', brace_end + 1);
-                    if (nested_end == std::string::npos) {
+                } else if (in_spec && fmt[brace_end] == '{') {
+                    const size_t nested_end = fmt.find('}', brace_end + 1);
+                    if (nested_end == std::string_view::npos) {
                         break;
                     }
                     brace_end = nested_end + 1;
@@ -3092,9 +3175,9 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                 }
                 ++brace_end;
             }
-            if (brace_end >= format_str.length() || format_str[brace_end] != '}') {
+            if (brace_end >= fmt.length() || fmt[brace_end] != '}') {
                 // Malformed format string
-                result += format_str.substr(brace_start);
+                out += fmt.substr(brace_start);
                 break;
             }
 
@@ -3110,11 +3193,11 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
             uint8_t resolved_index = 0;
             size_t spec_prefix_len = 0; // leading digits consumed from the placeholder
             if (brace_start + 1 < brace_end &&
-                format_str[brace_start + 1] >= '0' && format_str[brace_start + 1] <= '9') {
+                fmt[brace_start + 1] >= '0' && fmt[brace_start + 1] <= '9') {
                 uint32_t id = 0;
                 while (brace_start + 1 + spec_prefix_len < brace_end &&
-                       format_str[brace_start + 1 + spec_prefix_len] >= '0' &&
-                       format_str[brace_start + 1 + spec_prefix_len] <= '9') {
+                       fmt[brace_start + 1 + spec_prefix_len] >= '0' &&
+                       fmt[brace_start + 1 + spec_prefix_len] <= '9') {
                     if (id < entry.arg_count) {
                         // Once id reaches arg_count it is already out of range,
                         // and further digits can only push it further out, so
@@ -3122,13 +3205,13 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                         // digit run would overflow uint32_t and could wrap a
                         // huge index back onto a valid argument - "{4294967296}"
                         // would otherwise select argument 0.
-                        id = id * 10 + static_cast<uint32_t>(format_str[brace_start + 1 + spec_prefix_len] - '0');
+                        id = id * 10 + static_cast<uint32_t>(fmt[brace_start + 1 + spec_prefix_len] - '0');
                     }
                     ++spec_prefix_len;
                 }
                 if (id >= entry.arg_count) {
                     // Not enough arguments
-                    result += "<MISSING_ARG>";
+                    out += "<MISSING_ARG>";
                     pos = brace_end + 1;
                     continue; // manual index: the automatic counter stays untouched
                 }
@@ -3136,7 +3219,7 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
             } else {
                 if (arg_index >= entry.arg_count) {
                     // Not enough arguments
-                    result += "<MISSING_ARG>";
+                    out += "<MISSING_ARG>";
                     pos = brace_end + 1;
                     continue;
                 }
@@ -3160,7 +3243,7 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
             bool nested_arg_missing = false;
             bool spec_started = false; // same rule the scan above applied
             for (size_t i = brace_start + 1 + spec_prefix_len; i < brace_end; ) {
-                const char ch = format_str[i];
+                const char ch = fmt[i];
                 if (ch != '{' || !spec_started) {
                     spec_started = spec_started || ch == ':';
                     format_spec += ch;
@@ -3171,14 +3254,14 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                 ++i; // step past the nested field's '{'
                 uint32_t nested_id = 0;
                 bool nested_explicit = false;
-                while (i < brace_end && format_str[i] >= '0' && format_str[i] <= '9') {
+                while (i < brace_end && fmt[i] >= '0' && fmt[i] <= '9') {
                     if (nested_id < entry.arg_count) {
-                        nested_id = nested_id * 10 + static_cast<uint32_t>(format_str[i] - '0');
+                        nested_id = nested_id * 10 + static_cast<uint32_t>(fmt[i] - '0');
                     }
                     nested_explicit = true;
                     ++i;
                 }
-                if (i < brace_end && format_str[i] == '}') {
+                if (i < brace_end && fmt[i] == '}') {
                     ++i; // step past the nested field's '}'
                 }
 
@@ -3202,7 +3285,7 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                 // already in the spec by the time we get here.
                 const uint64_t nested_value = dynamic_spec_value(entry.args[nested_id]);
                 if (nested_value != 0 || format_spec.back() == '.') {
-                    format_spec += std::to_string(nested_value);
+                    detail::append_uint(format_spec, nested_value);
                 }
             }
 
@@ -3211,7 +3294,7 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                 // passed, so there is no spec to format against. Reported as a
                 // missing argument like any other, rather than as a format
                 // error, which would cost the whole line.
-                result += "<MISSING_ARG>";
+                out += "<MISSING_ARG>";
                 pos = brace_end + 1;
                 continue;
             }
@@ -3219,25 +3302,23 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
 
             // Format the argument using std::format with the specific format spec
             const auto& arg = entry.args[resolved_index];
-            std::string formatted_arg;
-
-            // Every case passes the union member by value through format_one_arg:
+            // Every case passes the union member by value through append_one_arg:
             // these members are packed and may be misaligned, so a reference must
-            // never be bound directly to one. See format_one_arg.
+            // never be bound directly to one. See append_one_arg.
             switch (arg.type) {
                 case ArgType::BOOL:
-                    formatted_arg = format_one_arg(format_spec, arg.value.b);
+                    append_one_arg(out, format_spec, arg.value.b);
                     break;
                 case ArgType::CHAR:
-                    formatted_arg = format_one_arg(format_spec, arg.value.c);
+                    append_one_arg(out, format_spec, arg.value.c);
                     break;
                 case ArgType::U_CHAR:
-                    formatted_arg = format_one_arg(format_spec, arg.value.uc);
+                    append_one_arg(out, format_spec, arg.value.uc);
                     break;
                 case ArgType::WCHAR: {
                     // std::format has no wchar_t formatter in a narrow (char)
                     // context on any supported standard library, so a wchar_t
-                    // cannot go through format_one_arg directly. Reproduce what
+                    // cannot go through append_one_arg directly. Reproduce what
                     // std::format does for char instead: render it as text by
                     // default and as a number under a b/B/d/o/x/X presentation
                     // type. Dispatching on the spec rather than on the value
@@ -3273,78 +3354,100 @@ inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& en
                     char utf8[4];
                     const size_t utf8_len = as_number ? 0 : encode_utf8(code_point, utf8);
                     if (utf8_len > 0) {
-                        formatted_arg = format_one_arg(spec, std::string_view{utf8, utf8_len});
+                        append_one_arg(out, spec, std::string_view{utf8, utf8_len});
                     } else {
                         // Either the spec asked for a number, or the value is
                         // not a Unicode scalar value and has no character to
                         // print - fall back to the numeric code point.
-                        formatted_arg = format_one_arg(spec, code_point);
+                        append_one_arg(out, spec, code_point);
                     }
                     break;
                 }
                 case ArgType::INT8_T:
-                    formatted_arg = format_one_arg(format_spec, arg.value.i8);
+                    append_one_arg(out, format_spec, arg.value.i8);
                     break;
                 case ArgType::UINT8_T:
-                    formatted_arg = format_one_arg(format_spec, arg.value.u8);
+                    append_one_arg(out, format_spec, arg.value.u8);
                     break;
                 case ArgType::INT16_T:
-                    formatted_arg = format_one_arg(format_spec, arg.value.i16);
+                    append_one_arg(out, format_spec, arg.value.i16);
                     break;
                 case ArgType::UINT16_T:
-                    formatted_arg = format_one_arg(format_spec, arg.value.u16);
+                    append_one_arg(out, format_spec, arg.value.u16);
                     break;
                 case ArgType::INT32_T:
-                    formatted_arg = format_one_arg(format_spec, arg.value.i32);
+                    append_one_arg(out, format_spec, arg.value.i32);
                     break;
                 case ArgType::UINT32_T:
-                    formatted_arg = format_one_arg(format_spec, arg.value.u32);
+                    append_one_arg(out, format_spec, arg.value.u32);
                     break;
                 case ArgType::INT64_T:
-                    formatted_arg = format_one_arg(format_spec, arg.value.i64);
+                    append_one_arg(out, format_spec, arg.value.i64);
                     break;
                 case ArgType::UINT64_T:
-                    formatted_arg = format_one_arg(format_spec, arg.value.u64);
+                    append_one_arg(out, format_spec, arg.value.u64);
                     break;
                 case ArgType::FLOAT:
-                    formatted_arg = format_one_arg(format_spec, arg.value.f);
+                    append_one_arg(out, format_spec, arg.value.f);
                     break;
                 case ArgType::DOUBLE:
-                    formatted_arg = format_one_arg(format_spec, arg.value.d);
+                    append_one_arg(out, format_spec, arg.value.d);
                     break;
                 case ArgType::PTR:
-                    formatted_arg = format_one_arg(format_spec, arg.value.ptr);
+                    append_one_arg(out, format_spec, arg.value.ptr);
                     break;
                 case ArgType::STRING_LITERAL:
-                    formatted_arg = format_one_arg(format_spec, arg.value.literal_ptr);
+                    append_one_arg(out, format_spec, arg.value.literal_ptr);
                     break;
                 case ArgType::STRING_DYNAMIC:
-                    formatted_arg = format_one_arg(format_spec, view_string_ref(arg.value.dynamic_str));
+                    append_one_arg(out, format_spec, view_string_ref(arg.value.dynamic_str));
                     break;
                 case ArgType::BLOB:
-                    // Rendered here rather than through format_one_arg: std::format
+                    // Rendered here rather than through append_one_arg: std::format
                     // has no formatter for raw bytes, and the spec flags a payload
-                    // accepts are its own. Appended directly to the result, leaving
-                    // formatted_arg empty, so the hex text is built once instead of
-                    // being materialized and then copied.
-                    append_binary_arg(result, format_spec, arg.value.dynamic_str);
+                    // accepts are its own.
+                    append_binary_arg(out, format_spec, arg.value.dynamic_str);
                     break;
                 default:
-                    formatted_arg = "<UNKNOWN>";
+                    out += "<UNKNOWN>";
                     break;
             }
 
-            result += formatted_arg;
             pos = brace_end + 1;
         }
 
-        return std::make_pair(result, true);
+        return true;
     } catch (const std::format_error& e) {
-        // Return error message if formatting fails
-        return std::make_pair(std::string("[FORMAT_ERROR: ") + e.what() +"]", false);
+        out.resize(base);
+        out += "[FORMAT_ERROR: ";
+        out += e.what();
+        out += ']';
+        return false;
     } catch (...) {
-        return std::make_pair("[FORMAT_ERROR: Unknown format error]", false);
+        out.resize(base);
+        out += "[FORMAT_ERROR: Unknown format error]";
+        return false;
     }
+}
+
+inline std::pair<std::string_view, bool> ISink::formatted_message(const LogEntry& entry) {
+    detail::dispatch_message* const current = detail::current_dispatch();
+    if (current && current->entry == &entry) {
+        if (!current->formatted) {
+            current->text.clear();
+            current->good = append_formatted_message(current->text, entry);
+            current->formatted = true;
+        }
+        return {current->text, current->good};
+    }
+    message_buffer_.clear();
+    const bool good = append_formatted_message(message_buffer_, entry);
+    return {message_buffer_, good};
+}
+
+inline std::pair<std::string, bool> ISink::format_log_message(const LogEntry& entry) {
+    const auto [message, good] = formatted_message(entry);
+    return {std::string(message), good};
 }
 
 inline void write_source_location(detail::line_writer& out, const LogEntry& entry) noexcept {
@@ -4032,13 +4135,12 @@ inline std::string_view ISink::format_log_entry(const LogEntry& entry,
     // The message comes first because a format error overrides the level that
     // gets printed, so neither the level nor its color can be resolved until the
     // message has been built. A pattern that renders neither skips the whole
-    // std::format pass; needs_message() is what says so.
-    std::string message;
+    // std::format pass; needs_message() is what says so. When it is needed, the
+    // logger formats it once per entry however many sinks render it.
+    std::string_view message;
     bool good = true;
     if (!active || active->needs_message()) {
-        auto formatted = format_log_message(entry);
-        message = std::move(formatted.first);
-        good = formatted.second;
+        std::tie(message, good) = formatted_message(entry);
     }
     // A message that could not be formatted is reported at ERROR whatever it was
     // logged at. Derived once here so every level-rendering flag, and the color,
@@ -6077,6 +6179,9 @@ inline void Logger::park_writer() {
 }
 
 inline void Logger::dispatch_entry(const LogEntry& entry) {
+    // Lets the sinks share one formatting of this entry's message: the first to
+    // need it formats it, the rest reuse it, and none pays if none needs it.
+    const detail::dispatch_scope scope(dispatch_message_, entry);
     if (entry.sink_index >= 0 && static_cast<size_t>(entry.sink_index) < sinks_.size()) {
         // Write to specific sink
         auto& sink = sinks_[entry.sink_index];
