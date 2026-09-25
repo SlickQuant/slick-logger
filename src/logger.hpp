@@ -27,6 +27,8 @@
 #pragma once
 
 #include <string>
+#include <charconv>
+#include <cmath>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
@@ -1130,6 +1132,10 @@ inline constexpr uint8_t kEntryOffsets = 0x01;
 // The entry carries a valid source file/line. Needed as an explicit flag because
 // ring index 0 is a legitimate string reference and cannot double as a null sentinel.
 inline constexpr uint8_t kEntryHasSourceLocation = 0x02;
+// The format is a string literal referenced in place: fixed text at a fixed
+// address, so a parse of it holds for every entry that carries it. Never set
+// alongside kEntryOffsets - a format copied into a ring has no fixed address.
+inline constexpr uint8_t kEntryStaticFormat = 0x04;
 
 #pragma pack(push, 1)
 /**
@@ -1187,7 +1193,7 @@ struct LogEntry {
     uint32_t line = 0; // Source line captured by LOG_* macros
     int sink_index = -1; // Optional sink index, logged by that sink only
     LogLevel level;
-    uint8_t flags = 0; // kEntryOffsets / kEntryHasSourceLocation
+    uint8_t flags = 0; // kEntryOffsets / kEntryHasSourceLocation / kEntryStaticFormat
     uint8_t arg_count = 0; // Number of arguments
     char tag[SLICK_LOGGER_TAG_SIZE] = {}; // NUL-padded producer tag; empty in Local mode
     LogArgument args[SLICK_LOGGER_MAX_ARGS];
@@ -3089,49 +3095,462 @@ inline void append_one_arg(std::string& out, std::string_view format_spec, T val
 }
 
 /**
- * @brief Append @p entry's formatted message to @p out
- * @return false if the message could not be formatted. What was appended is then
- *         the "[FORMAT_ERROR: ...]" text, never a partial message.
- *
- * The format string is only ever viewed, never copied, and every argument is
- * formatted straight into @p out, so a caller that reuses @p out formats a line
- * without allocating once the buffer has grown to fit.
+ * @brief Append one log argument, formatted against a single-argument "{...}" spec
+ * @throws std::format_error if the spec does not suit the argument
  */
-inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
-    const std::string_view fmt = view_string_ref(entry.format);
-    if (entry.arg_count == 0) {
-        out += fmt;
+inline void append_log_argument(std::string& out, std::string_view format_spec, const LogArgument& arg) {
+    // Every case passes the union member by value through append_one_arg:
+    // these members are packed and may be misaligned, so a reference must
+    // never be bound directly to one. See append_one_arg.
+    switch (arg.type) {
+        case ArgType::BOOL:
+            append_one_arg(out, format_spec, arg.value.b);
+            break;
+        case ArgType::CHAR:
+            append_one_arg(out, format_spec, arg.value.c);
+            break;
+        case ArgType::U_CHAR:
+            append_one_arg(out, format_spec, arg.value.uc);
+            break;
+        case ArgType::WCHAR: {
+            // std::format has no wchar_t formatter in a narrow (char)
+            // context on any supported standard library, so a wchar_t
+            // cannot go through append_one_arg directly. Reproduce what
+            // std::format does for char instead: render it as text by
+            // default and as a number under a b/B/d/o/x/X presentation
+            // type. Dispatching on the spec rather than on the value
+            // keeps "{}" and "{:5}" producing the same kind of output -
+            // and the same default alignment - for every code point,
+            // instead of silently switching to a number above U+007F.
+            //
+            // wchar_t is signed on Linux and macOS, so go through the
+            // unsigned type first: a negative value is a code unit, not
+            // a number to sign-extend into a huge unsigned one.
+            const auto code_point = static_cast<uint32_t>(
+                static_cast<std::make_unsigned_t<wchar_t>>(arg.value.wc));
+
+            std::string_view spec{format_spec};
+            std::string char_spec;
+            bool as_number = false;
+            switch (spec_presentation_type(format_spec)) {
+                case 'b': case 'B': case 'd': case 'o': case 'x': case 'X':
+                    as_number = true;
+                    break;
+                case 'c':
+                    // "render as a character" - already the default
+                    // here, and std::format's string formatter would
+                    // reject the 'c', so drop it.
+                    char_spec.assign(format_spec, 0, format_spec.size() - 2);
+                    char_spec += '}';
+                    spec = char_spec;
+                    break;
+                default:
+                    break;
+            }
+
+            char utf8[4];
+            const size_t utf8_len = as_number ? 0 : encode_utf8(code_point, utf8);
+            if (utf8_len > 0) {
+                append_one_arg(out, spec, std::string_view{utf8, utf8_len});
+            } else {
+                // Either the spec asked for a number, or the value is
+                // not a Unicode scalar value and has no character to
+                // print - fall back to the numeric code point.
+                append_one_arg(out, spec, code_point);
+            }
+            break;
+        }
+        case ArgType::INT8_T:
+            append_one_arg(out, format_spec, arg.value.i8);
+            break;
+        case ArgType::UINT8_T:
+            append_one_arg(out, format_spec, arg.value.u8);
+            break;
+        case ArgType::INT16_T:
+            append_one_arg(out, format_spec, arg.value.i16);
+            break;
+        case ArgType::UINT16_T:
+            append_one_arg(out, format_spec, arg.value.u16);
+            break;
+        case ArgType::INT32_T:
+            append_one_arg(out, format_spec, arg.value.i32);
+            break;
+        case ArgType::UINT32_T:
+            append_one_arg(out, format_spec, arg.value.u32);
+            break;
+        case ArgType::INT64_T:
+            append_one_arg(out, format_spec, arg.value.i64);
+            break;
+        case ArgType::UINT64_T:
+            append_one_arg(out, format_spec, arg.value.u64);
+            break;
+        case ArgType::FLOAT:
+            append_one_arg(out, format_spec, arg.value.f);
+            break;
+        case ArgType::DOUBLE:
+            append_one_arg(out, format_spec, arg.value.d);
+            break;
+        case ArgType::PTR:
+            append_one_arg(out, format_spec, arg.value.ptr);
+            break;
+        case ArgType::STRING_LITERAL:
+            append_one_arg(out, format_spec, arg.value.literal_ptr);
+            break;
+        case ArgType::STRING_DYNAMIC:
+            append_one_arg(out, format_spec, view_string_ref(arg.value.dynamic_str));
+            break;
+        case ArgType::BLOB:
+            // Rendered here rather than through append_one_arg: std::format
+            // has no formatter for raw bytes, and the spec flags a payload
+            // accepts are its own.
+            append_binary_arg(out, format_spec, arg.value.dynamic_str);
+            break;
+        default:
+            out += "<UNKNOWN>";
+            break;
+    }
+}
+
+/**
+ * @brief Append one log argument as a bare "{}" field renders it
+ *
+ * The same text std::format produces for "{}", written directly: integers in
+ * decimal, floating point as the shortest round-trip std::to_chars form (which
+ * is how std::format defines "{}"), pointers as 0x-prefixed lowercase hex,
+ * text appended as it is. std::format has to parse a spec and dispatch through
+ * type-erased arguments to reach the same result, and "{}" is by far the most
+ * common field, so skipping it is most of what a line spends on its arguments.
+ *
+ * Anything whose rendering is not a plain conversion - an infinity or NaN, a
+ * null string, a binary payload - goes through append_log_argument instead, so
+ * the output never depends on which path was taken.
+ */
+inline void append_plain_argument(std::string& out, const LogArgument& arg) {
+    char buf[32];  // a double's shortest form is at most 24 characters
+    auto append_int = [&](auto value) {
+        const std::to_chars_result result = std::to_chars(buf, buf + sizeof(buf), value);
+        out.append(buf, result.ptr);
+    };
+    auto append_float = [&](auto value) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+        append_int(value);
         return true;
+    };
+    // Every union member is read by value: they are packed and may be
+    // misaligned. See append_one_arg.
+    switch (arg.type) {
+        case ArgType::BOOL:
+            out += arg.value.b ? std::string_view{"true"} : std::string_view{"false"};
+            return;
+        case ArgType::CHAR:
+            out += arg.value.c;
+            return;
+        // unsigned char and int8_t are integer types to std::format, not characters.
+        case ArgType::U_CHAR:   append_int(arg.value.uc); return;
+        case ArgType::INT8_T:   append_int(arg.value.i8); return;
+        case ArgType::UINT8_T:  append_int(arg.value.u8); return;
+        case ArgType::INT16_T:  append_int(arg.value.i16); return;
+        case ArgType::UINT16_T: append_int(arg.value.u16); return;
+        case ArgType::INT32_T:  append_int(arg.value.i32); return;
+        case ArgType::UINT32_T: append_int(arg.value.u32); return;
+        case ArgType::INT64_T:  append_int(arg.value.i64); return;
+        case ArgType::UINT64_T: append_int(arg.value.u64); return;
+        case ArgType::FLOAT:
+            if (append_float(arg.value.f)) {
+                return;
+            }
+            break;
+        case ArgType::DOUBLE:
+            if (append_float(arg.value.d)) {
+                return;
+            }
+            break;
+        case ArgType::PTR: {
+            const std::to_chars_result result = std::to_chars(
+                buf, buf + sizeof(buf), reinterpret_cast<uintptr_t>(arg.value.ptr), 16);
+            out += "0x";
+            out.append(buf, result.ptr);
+            return;
+        }
+        case ArgType::WCHAR: {
+            // As append_log_argument renders it under "{}": the character,
+            // UTF-8 encoded, or the code point if it is not a scalar value.
+            const auto code_point = static_cast<uint32_t>(
+                static_cast<std::make_unsigned_t<wchar_t>>(arg.value.wc));
+            char utf8[4];
+            const size_t utf8_len = encode_utf8(code_point, utf8);
+            if (utf8_len > 0) {
+                out.append(utf8, utf8_len);
+            } else {
+                append_int(code_point);
+            }
+            return;
+        }
+        case ArgType::STRING_LITERAL: {
+            const char* const text = arg.value.literal_ptr;
+            if (text) {
+                out += text;
+                return;
+            }
+            break;
+        }
+        case ArgType::STRING_DYNAMIC:
+            out += view_string_ref(arg.value.dynamic_str);
+            return;
+        default:
+            break;
+    }
+    append_log_argument(out, "{}", arg);
+}
+
+namespace detail {
+
+/**
+ * @brief One step of a parsed message format; see message_formats
+ *
+ * What a step's off/len address depends on its kind: the format text for a
+ * literal, message_formats' spec text for an arg, and its spec pieces for a
+ * nested one.
+ */
+struct format_op {
+    enum class kind : uint8_t {
+        literal,         ///< format text [off, off + len), braces already unescaped
+        missing,         ///< the field names no argument: "<MISSING_ARG>"
+        plain,           ///< args[index] under a bare "{}"; see append_plain_argument
+        arg,             ///< args[index] against the ready-made spec [off, off + len)
+        nested,          ///< args[index] against a spec built from pieces [off, off + len)
+        nested_missing,  ///< a nested field names no argument: the pieces before it
+                         ///< are still evaluated, as they may throw, then "<MISSING_ARG>"
+        unmatched,       ///< a lone '}': the whole message is a format error
+    };
+    kind type;
+    uint8_t index;  ///< the argument an arg/nested step formats
+    uint32_t off;
+    uint32_t len;
+};
+
+/// Part of a spec with nested fields: its text, then the value of argument
+/// `nested` (kNoNested for the last piece, which closes the spec).
+struct spec_piece {
+    static constexpr uint8_t kNoNested = 0xFF;  // arg_count is a uint8_t, so no index reaches it
+    uint32_t off;
+    uint32_t len;
+    uint8_t nested;
+};
+
+/**
+ * @brief Message format strings, parsed once and replayed for every later line
+ *
+ * The format a LOG_* macro passes is a string literal: fixed text at a fixed
+ * address, so its fields come out the same on every line. It is parsed the first
+ * time it is seen, into ops ready to replay, and every later line goes straight
+ * to formatting its arguments - no brace scan, no spec rebuilt per field.
+ *
+ * Keyed by (address, length, argument count). The count is part of the key
+ * because what the fields resolve to depends on it - which report <MISSING_ARG>,
+ * and so how far the automatic index advances - and a literal the compiler
+ * pools can arrive from two calls passing different counts.
+ *
+ * Only entries flagged kEntryStaticFormat are cached. Any other format lives in
+ * the string ring, whose slots are reused, so its address says nothing about its
+ * text; it is parsed into scratch space that is rewound once the line is done.
+ *
+ * A hit is still checked against a copy of the text. A literal's address is
+ * fixed only while its module stays loaded: a plugin unloaded and a rebuilt one
+ * loaded in its place can put different text at the same address. The compare
+ * is a few dozen bytes against a line that costs hundreds of nanoseconds, and a
+ * mismatch just parses the new text into the same slot.
+ *
+ * One per thread, so it needs no lock. In practice that is the writer thread; a
+ * sink written to directly formats on the caller's thread, with that thread's
+ * own cache.
+ */
+class message_formats {
+public:
+    static message_formats& local() {
+        thread_local message_formats formats;
+        return formats;
     }
 
-    // Everything appended past here is rolled back if formatting fails, so the
-    // error text replaces the partial message instead of trailing it.
-    const size_t base = out.size();
+    /**
+     * @brief Append @p entry's message, formatted from @p fmt, to @p out
+     * @throws std::format_error where std::format would; @p out may then hold
+     *         part of the message, which the caller discards
+     */
+    void append(std::string& out, std::string_view fmt, const LogEntry& entry) {
+        if ((entry.flags & kEntryStaticFormat) && fmt.data()) {
+            render(out, fmt, entry, find(fmt, entry.arg_count));
+            return;
+        }
+        const mark scratch = mark_now();
+        try {
+            render(out, fmt, entry, parse(fmt, entry.arg_count));
+        } catch (...) {
+            rewind(scratch);
+            throw;
+        }
+        rewind(scratch);
+    }
 
-    // Since std::make_format_args doesn't work with custom types in MSVC,
-    // we'll use a manual implementation that preserves std::format functionality
-    // by manually parsing format specifiers and applying them to each argument
-    try {
-        out.reserve(base + fmt.size() + 256); // Reserve some space for formatting
+private:
+    struct op_range {
+        uint32_t begin;
+        uint32_t end;
+    };
+
+    struct slot {
+        const char* ptr = nullptr;  // null marks an empty slot
+        uint32_t len = 0;
+        uint8_t arg_count = 0;
+        op_range ops{};
+        size_t text = 0;            // offset of the text's copy in texts_
+    };
+
+    /// Sizes of the parse output, to roll a parse back to.
+    struct mark {
+        size_t ops;
+        size_t pieces;
+        size_t specs;
+    };
+
+    static constexpr size_t kInitialSlots = 256;  // power of two
+
+    static size_t hash(const char* ptr) noexcept {
+        // Fibonacci hashing: literals sit at small, aligned strides, which a
+        // plain mask of the address would pile into a few slots.
+        return static_cast<size_t>(
+            (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)) * 0x9E3779B97F4A7C15ull) >> 32);
+    }
+
+    SLICK_LOGGER_FORCE_INLINE op_range find(std::string_view fmt, uint8_t arg_count) {
+        if (!slots_.empty()) {
+            const size_t mask = slots_.size() - 1;
+            for (size_t i = hash(fmt.data()) & mask;; i = (i + 1) & mask) {
+                slot& s = slots_[i];
+                if (s.ptr == fmt.data() && s.len == fmt.size() && s.arg_count == arg_count) {
+                    if (std::memcmp(texts_.data() + s.text, fmt.data(), fmt.size()) == 0) [[likely]] {
+                        return s.ops;
+                    }
+                    return reparse(s, fmt);
+                }
+                if (!s.ptr) {
+                    break;
+                }
+            }
+        }
+        return insert(fmt, arg_count);
+    }
+
+    op_range insert(std::string_view fmt, uint8_t arg_count) {
+        const mark before = mark_now();
+        const size_t text = texts_.size();
+        try {
+            const op_range ops = parse(fmt, arg_count);
+            texts_.append(fmt);
+            // Kept at most half full, so a probe stays short.
+            if ((used_ + 1) * 2 > slots_.size()) {
+                grow();
+            }
+            place(slot{fmt.data(), static_cast<uint32_t>(fmt.size()), arg_count, ops, text});
+            ++used_;
+            return ops;
+        } catch (...) {
+            rewind(before);
+            texts_.resize(text);
+            throw;
+        }
+    }
+
+    /// New text at a cached address. The old parse is left where it is, unused:
+    /// this only happens when a module is swapped, so there is little to reclaim.
+    op_range reparse(slot& s, std::string_view fmt) {
+        const mark before = mark_now();
+        try {
+            s.ops = parse(fmt, s.arg_count);
+        } catch (...) {
+            rewind(before);
+            throw;
+        }
+        std::memcpy(texts_.data() + s.text, fmt.data(), fmt.size());
+        return s.ops;
+    }
+
+    void grow() {
+        std::vector<slot> old(slots_.empty() ? kInitialSlots : slots_.size() * 2);
+        old.swap(slots_);
+        for (const slot& s : old) {
+            if (s.ptr) {
+                place(s);
+            }
+        }
+    }
+
+    void place(const slot& s) noexcept {
+        const size_t mask = slots_.size() - 1;
+        size_t i = hash(s.ptr) & mask;
+        while (slots_[i].ptr) {
+            i = (i + 1) & mask;
+        }
+        slots_[i] = s;
+    }
+
+    mark mark_now() const noexcept { return {ops_.size(), pieces_.size(), specs_.size()}; }
+
+    void rewind(const mark& m) noexcept {
+        ops_.resize(m.ops);
+        pieces_.resize(m.pieces);
+        specs_.resize(m.specs);
+    }
+
+    void emit(format_op::kind type, size_t index, size_t off, size_t len) {
+        ops_.push_back(format_op{type, static_cast<uint8_t>(index),
+                                 static_cast<uint32_t>(off), static_cast<uint32_t>(len)});
+    }
+
+    /**
+     * @brief Parse @p fmt into ops appended to ops_, as fields over @p arg_count arguments
+     *
+     * Resolves everything the text and the argument count settle, which is all
+     * of it but the values of nested width/precision fields. Never throws a
+     * format error itself: a lone '}' becomes an op that throws when replayed,
+     * so a line fails the same way, and at the same point, whether its format
+     * was cached or not.
+     */
+    op_range parse(std::string_view fmt, uint8_t arg_count) {
+        const size_t begin = ops_.size();
+
+        // Text runs that turn out adjacent - "a{{b" is "a{" then "b" - become
+        // one op, so an escaped brace costs no extra append.
+        auto literal = [&](size_t off, size_t len) {
+            if (len == 0) {
+                return;
+            }
+            if (ops_.size() > begin) {
+                format_op& last = ops_.back();
+                if (last.type == format_op::kind::literal && last.off + last.len == off) {
+                    last.len += static_cast<uint32_t>(len);
+                    return;
+                }
+            }
+            emit(format_op::kind::literal, 0, off, len);
+        };
 
         size_t pos = 0;
         uint8_t arg_index = 0;
 
         while (pos < fmt.length()) {
-            size_t brace_start = fmt.find_first_of("{}", pos);
+            const size_t brace_start = fmt.find_first_of("{}", pos);
             if (brace_start == std::string_view::npos) {
-                // No more format specifiers, copy rest of string
-                out += fmt.substr(pos);
+                literal(pos, fmt.length() - pos);
                 break;
             }
-
-            // Copy everything before the brace
-            out += fmt.substr(pos, brace_start - pos);
 
             if (fmt[brace_start] == '{' &&
                 brace_start + 1 < fmt.length() &&
                 fmt[brace_start + 1] == '{') {
-                out += '{';
+                literal(pos, brace_start + 1 - pos);  // keeps one of the two
                 pos = brace_start + 2;
                 continue;
             }
@@ -3139,13 +3558,17 @@ inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
             if (fmt[brace_start] == '}') {
                 if (brace_start + 1 < fmt.length() &&
                     fmt[brace_start + 1] == '}') {
-                    out += '}';
+                    literal(pos, brace_start + 1 - pos);
                     pos = brace_start + 2;
-                } else {
-                    throw std::format_error("unmatched '}' in format string");
+                    continue;
                 }
-                continue;
+                // Nothing past this point can reach the output.
+                literal(pos, brace_start - pos);
+                emit(format_op::kind::unmatched, 0, 0, 0);
+                break;
             }
+
+            literal(pos, brace_start - pos);
 
             // Find this field's closing brace. The spec may itself contain
             // replacement fields, for a dynamic width or precision
@@ -3174,15 +3597,16 @@ inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
                 ++brace_end;
             }
             if (brace_end >= fmt.length() || fmt[brace_end] != '}') {
-                // Malformed format string
-                out += fmt.substr(brace_start);
+                // Malformed format string: the rest goes out as it is.
+                literal(brace_start, fmt.length() - brace_start);
                 break;
             }
+            pos = brace_end + 1;
 
             // A placeholder may carry an explicit argument index ({0}, {1}, ...)
-            // in front of the optional ':' format spec, so the manual parser
-            // here has to resolve the index itself: each argument is formatted
-            // against its own single-argument spec.
+            // in front of the optional ':' format spec, so the parser has to
+            // resolve the index itself: each argument is formatted against its
+            // own single-argument spec.
             //
             // std::format rejects a format string that mixes explicit indices
             // with bare {} automatic placeholders. This parser tolerates the
@@ -3196,7 +3620,7 @@ inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
                 while (brace_start + 1 + spec_prefix_len < brace_end &&
                        fmt[brace_start + 1 + spec_prefix_len] >= '0' &&
                        fmt[brace_start + 1 + spec_prefix_len] <= '9') {
-                    if (id < entry.arg_count) {
+                    if (id < arg_count) {
                         // Once id reaches arg_count it is already out of range,
                         // and further digits can only push it further out, so
                         // stop accumulating there. Multiplying through a long
@@ -3207,18 +3631,17 @@ inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
                     }
                     ++spec_prefix_len;
                 }
-                if (id >= entry.arg_count) {
-                    // Not enough arguments
-                    out += "<MISSING_ARG>";
-                    pos = brace_end + 1;
-                    continue; // manual index: the automatic counter stays untouched
+                if (id >= arg_count) {
+                    // Not enough arguments. A manual index: the automatic
+                    // counter stays untouched.
+                    emit(format_op::kind::missing, 0, 0, 0);
+                    continue;
                 }
                 resolved_index = static_cast<uint8_t>(id);
             } else {
-                if (arg_index >= entry.arg_count) {
+                if (arg_index >= arg_count) {
                     // Not enough arguments
-                    out += "<MISSING_ARG>";
-                    pos = brace_end + 1;
+                    emit(format_op::kind::missing, 0, 0, 0);
                     continue;
                 }
                 // Claimed here rather than at the end of the iteration: a nested
@@ -3230,21 +3653,23 @@ inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
 
             // Rebuild the spec as a single-argument one. The explicit index is
             // dropped ({1:>8} -> {:>8}, {1} -> {}), and a nested width or
-            // precision field is replaced by the decimal value of the argument
-            // it names ({0:{1}} over (x, 8) -> {:8}). Substituting the value
-            // rather than forwarding the nested field is what keeps every
-            // argument formatting against a one-argument spec, which is what
-            // lets each ArgType hand std::format its own union member.
-            std::string format_spec;
-            format_spec.reserve(brace_end - brace_start + 1);
-            format_spec += '{';
+            // precision field is cut out, to be replaced on each line by the
+            // decimal value of the argument it names ({0:{1}} over (x, 8) ->
+            // {:8}). Substituting the value rather than forwarding the nested
+            // field is what keeps every argument formatting against a
+            // one-argument spec, which is what lets each ArgType hand
+            // std::format its own union member.
+            const size_t spec_off = specs_.size();
+            const size_t pieces_begin = pieces_.size();
+            size_t piece_off = spec_off;
+            specs_ += '{';
             bool nested_arg_missing = false;
             bool spec_started = false; // same rule the scan above applied
             for (size_t i = brace_start + 1 + spec_prefix_len; i < brace_end; ) {
                 const char ch = fmt[i];
                 if (ch != '{' || !spec_started) {
                     spec_started = spec_started || ch == ':';
-                    format_spec += ch;
+                    specs_ += ch;
                     ++i;
                     continue;
                 }
@@ -3253,7 +3678,7 @@ inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
                 uint32_t nested_id = 0;
                 bool nested_explicit = false;
                 while (i < brace_end && fmt[i] >= '0' && fmt[i] <= '9') {
-                    if (nested_id < entry.arg_count) {
+                    if (nested_id < arg_count) {
                         nested_id = nested_id * 10 + static_cast<uint32_t>(fmt[i] - '0');
                     }
                     nested_explicit = true;
@@ -3265,155 +3690,149 @@ inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
 
                 if (!nested_explicit) {
                     nested_id = arg_index;
-                    if (arg_index < entry.arg_count) {
+                    if (arg_index < arg_count) {
                         ++arg_index; // as above, never past the end
                     }
                 }
-                if (nested_id >= entry.arg_count) {
+                if (nested_id >= arg_count) {
                     nested_arg_missing = true;
                     break;
                 }
-                // A zero width is dropped rather than written out. A literal 0
-                // in the width position is the zero-padding flag and not a
-                // width at all - "{:0}" pads a number, and is rejected outright
-                // for a text argument - whereas a width of zero just means no
-                // minimum width, which is exactly what leaving it out says.
-                // Zero is a meaningful precision ("{:.0f}"), so only the width
-                // case is dropped; the '.' that introduces a precision is
-                // already in the spec by the time we get here.
-                const uint64_t nested_value = dynamic_spec_value(entry.args[nested_id]);
-                if (nested_value != 0 || format_spec.back() == '.') {
-                    detail::append_uint(format_spec, nested_value);
-                }
+                pieces_.push_back(spec_piece{static_cast<uint32_t>(piece_off),
+                                             static_cast<uint32_t>(specs_.size() - piece_off),
+                                             static_cast<uint8_t>(nested_id)});
+                piece_off = specs_.size();
             }
 
+            const size_t piece_count = pieces_.size() - pieces_begin;
             if (nested_arg_missing) {
                 // The width or precision names an argument that was never
                 // passed, so there is no spec to format against. Reported as a
                 // missing argument like any other, rather than as a format
-                // error, which would cost the whole line.
-                out += "<MISSING_ARG>";
-                pos = brace_end + 1;
+                // error, which would cost the whole line. The fields before it
+                // are still evaluated on each line, as they were read before
+                // the missing one was found and may themselves be in error.
+                if (piece_count == 0) {
+                    specs_.resize(spec_off);
+                    emit(format_op::kind::missing, 0, 0, 0);
+                } else {
+                    emit(format_op::kind::nested_missing, 0, pieces_begin, piece_count);
+                }
                 continue;
             }
-            format_spec += '}';
+            specs_ += '}';
 
-            // Format the argument using std::format with the specific format spec
-            const auto& arg = entry.args[resolved_index];
-            // Every case passes the union member by value through append_one_arg:
-            // these members are packed and may be misaligned, so a reference must
-            // never be bound directly to one. See append_one_arg.
-            switch (arg.type) {
-                case ArgType::BOOL:
-                    append_one_arg(out, format_spec, arg.value.b);
-                    break;
-                case ArgType::CHAR:
-                    append_one_arg(out, format_spec, arg.value.c);
-                    break;
-                case ArgType::U_CHAR:
-                    append_one_arg(out, format_spec, arg.value.uc);
-                    break;
-                case ArgType::WCHAR: {
-                    // std::format has no wchar_t formatter in a narrow (char)
-                    // context on any supported standard library, so a wchar_t
-                    // cannot go through append_one_arg directly. Reproduce what
-                    // std::format does for char instead: render it as text by
-                    // default and as a number under a b/B/d/o/x/X presentation
-                    // type. Dispatching on the spec rather than on the value
-                    // keeps "{}" and "{:5}" producing the same kind of output -
-                    // and the same default alignment - for every code point,
-                    // instead of silently switching to a number above U+007F.
-                    //
-                    // wchar_t is signed on Linux and macOS, so go through the
-                    // unsigned type first: a negative value is a code unit, not
-                    // a number to sign-extend into a huge unsigned one.
-                    const auto code_point = static_cast<uint32_t>(
-                        static_cast<std::make_unsigned_t<wchar_t>>(arg.value.wc));
-
-                    std::string_view spec{format_spec};
-                    std::string char_spec;
-                    bool as_number = false;
-                    switch (spec_presentation_type(format_spec)) {
-                        case 'b': case 'B': case 'd': case 'o': case 'x': case 'X':
-                            as_number = true;
-                            break;
-                        case 'c':
-                            // "render as a character" - already the default
-                            // here, and std::format's string formatter would
-                            // reject the 'c', so drop it.
-                            char_spec.assign(format_spec, 0, format_spec.size() - 2);
-                            char_spec += '}';
-                            spec = char_spec;
-                            break;
-                        default:
-                            break;
-                    }
-
-                    char utf8[4];
-                    const size_t utf8_len = as_number ? 0 : encode_utf8(code_point, utf8);
-                    if (utf8_len > 0) {
-                        append_one_arg(out, spec, std::string_view{utf8, utf8_len});
-                    } else {
-                        // Either the spec asked for a number, or the value is
-                        // not a Unicode scalar value and has no character to
-                        // print - fall back to the numeric code point.
-                        append_one_arg(out, spec, code_point);
-                    }
-                    break;
-                }
-                case ArgType::INT8_T:
-                    append_one_arg(out, format_spec, arg.value.i8);
-                    break;
-                case ArgType::UINT8_T:
-                    append_one_arg(out, format_spec, arg.value.u8);
-                    break;
-                case ArgType::INT16_T:
-                    append_one_arg(out, format_spec, arg.value.i16);
-                    break;
-                case ArgType::UINT16_T:
-                    append_one_arg(out, format_spec, arg.value.u16);
-                    break;
-                case ArgType::INT32_T:
-                    append_one_arg(out, format_spec, arg.value.i32);
-                    break;
-                case ArgType::UINT32_T:
-                    append_one_arg(out, format_spec, arg.value.u32);
-                    break;
-                case ArgType::INT64_T:
-                    append_one_arg(out, format_spec, arg.value.i64);
-                    break;
-                case ArgType::UINT64_T:
-                    append_one_arg(out, format_spec, arg.value.u64);
-                    break;
-                case ArgType::FLOAT:
-                    append_one_arg(out, format_spec, arg.value.f);
-                    break;
-                case ArgType::DOUBLE:
-                    append_one_arg(out, format_spec, arg.value.d);
-                    break;
-                case ArgType::PTR:
-                    append_one_arg(out, format_spec, arg.value.ptr);
-                    break;
-                case ArgType::STRING_LITERAL:
-                    append_one_arg(out, format_spec, arg.value.literal_ptr);
-                    break;
-                case ArgType::STRING_DYNAMIC:
-                    append_one_arg(out, format_spec, view_string_ref(arg.value.dynamic_str));
-                    break;
-                case ArgType::BLOB:
-                    // Rendered here rather than through append_one_arg: std::format
-                    // has no formatter for raw bytes, and the spec flags a payload
-                    // accepts are its own.
-                    append_binary_arg(out, format_spec, arg.value.dynamic_str);
-                    break;
-                default:
-                    out += "<UNKNOWN>";
-                    break;
+            if (piece_count == 0 && specs_.size() - spec_off == 2) {
+                // "{}", or "{1}" once its index is dropped: no spec to hand on.
+                specs_.resize(spec_off);
+                emit(format_op::kind::plain, resolved_index, 0, 0);
+            } else if (piece_count == 0) {
+                emit(format_op::kind::arg, resolved_index, spec_off, specs_.size() - spec_off);
+            } else {
+                pieces_.push_back(spec_piece{static_cast<uint32_t>(piece_off),
+                                             static_cast<uint32_t>(specs_.size() - piece_off),
+                                             spec_piece::kNoNested});
+                emit(format_op::kind::nested, resolved_index, pieces_begin, piece_count + 1);
             }
-
-            pos = brace_end + 1;
         }
 
+        return {static_cast<uint32_t>(begin), static_cast<uint32_t>(ops_.size())};
+    }
+
+    /// Build a nested op's spec into nested_spec_, substituting each nested
+    /// field's argument value.
+    void build_nested_spec(const LogEntry& entry, const format_op& op) {
+        nested_spec_.clear();
+        for (uint32_t p = op.off; p < op.off + op.len; ++p) {
+            const spec_piece& piece = pieces_[p];
+            nested_spec_.append(specs_.data() + piece.off, piece.len);
+            if (piece.nested == spec_piece::kNoNested) {
+                continue;
+            }
+            // A zero width is dropped rather than written out. A literal 0
+            // in the width position is the zero-padding flag and not a
+            // width at all - "{:0}" pads a number, and is rejected outright
+            // for a text argument - whereas a width of zero just means no
+            // minimum width, which is exactly what leaving it out says.
+            // Zero is a meaningful precision ("{:.0f}"), so only the width
+            // case is dropped; the '.' that introduces a precision is
+            // already in the spec by the time we get here.
+            const uint64_t value = dynamic_spec_value(entry.args[piece.nested]);
+            if (value != 0 || nested_spec_.back() == '.') {
+                append_uint(nested_spec_, value);
+            }
+        }
+    }
+
+    void render(std::string& out, std::string_view fmt, const LogEntry& entry, op_range ops) {
+        for (uint32_t i = ops.begin; i < ops.end; ++i) {
+            const format_op& op = ops_[i];
+            switch (op.type) {
+                case format_op::kind::literal:
+                    out.append(fmt.data() + op.off, op.len);
+                    break;
+                case format_op::kind::missing:
+                    out += "<MISSING_ARG>";
+                    break;
+                case format_op::kind::plain:
+                    append_plain_argument(out, entry.args[op.index]);
+                    break;
+                case format_op::kind::arg:
+                    append_log_argument(out, std::string_view{specs_.data() + op.off, op.len},
+                                        entry.args[op.index]);
+                    break;
+                case format_op::kind::nested:
+                    build_nested_spec(entry, op);
+                    append_log_argument(out, nested_spec_, entry.args[op.index]);
+                    break;
+                case format_op::kind::nested_missing:
+                    build_nested_spec(entry, op);
+                    out += "<MISSING_ARG>";
+                    break;
+                case format_op::kind::unmatched:
+                    throw std::format_error("unmatched '}' in format string");
+            }
+        }
+    }
+
+    std::vector<slot> slots_;          // open addressing, power-of-two sized
+    size_t used_ = 0;
+    std::vector<format_op> ops_;       // every cached format's ops, back to back
+    std::vector<spec_piece> pieces_;   // nested specs' pieces
+    std::string specs_;                // spec text the ops and pieces point into
+    std::string texts_;                // a copy of each cached format's text
+    std::string nested_spec_;          // a nested spec, rebuilt per field
+};
+
+} // namespace detail
+
+/**
+ * @brief Append @p entry's formatted message to @p out
+ * @return false if the message could not be formatted. What was appended is then
+ *         the "[FORMAT_ERROR: ...]" text, never a partial message.
+ *
+ * The format string is only ever viewed, never copied, and every argument is
+ * formatted straight into @p out, so a caller that reuses @p out formats a line
+ * without allocating once the buffer has grown to fit. A literal format is
+ * parsed only the first time it is seen; see detail::message_formats.
+ */
+inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
+    const std::string_view fmt = view_string_ref(entry.format);
+    if (entry.arg_count == 0) {
+        out += fmt;
+        return true;
+    }
+
+    // Everything appended past here is rolled back if formatting fails, so the
+    // error text replaces the partial message instead of trailing it.
+    const size_t base = out.size();
+
+    // Since std::make_format_args doesn't work with custom types in MSVC,
+    // we'll use a manual implementation that preserves std::format functionality
+    // by manually parsing format specifiers and applying them to each argument
+    try {
+        out.reserve(base + fmt.size() + 256); // Reserve some space for formatting
+        detail::message_formats::local().append(out, fmt, entry);
         return true;
     } catch (const std::format_error& e) {
         out.resize(base);
@@ -5510,9 +5929,12 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
     entry.sink_index = sink_index;
     if constexpr (IS_STRING_LITERAL(format)) {
         constexpr uint32_t format_length = static_cast<uint32_t>(sizeof(format) - 1);
-        entry.format = use_offsets
-            ? store_string_in_queue(std::string_view{format, format_length})
-            : StringRef{format, format_length};  // String literal - safe to store pointer
+        if (use_offsets) {
+            entry.format = store_string_in_queue(std::string_view{format, format_length});
+        } else {
+            entry.format = StringRef{format, format_length};  // String literal - safe to store pointer
+            entry.flags |= kEntryStaticFormat;
+        }
     }
     else {
         // Non-literal format strings are copied into the string queue so their
@@ -6100,7 +6522,8 @@ inline void Logger::rebase_entry(LogEntry& entry) const noexcept {
             arg.value.dynamic_str.ptr = (*string_queue_)[arg.value.dynamic_str.offset];
         }
     }
-    entry.flags &= static_cast<uint8_t>(~kEntryOffsets);
+    // The format now sits in this process's ring, whatever the producer claimed.
+    entry.flags &= static_cast<uint8_t>(~(kEntryOffsets | kEntryStaticFormat));
 }
 
 inline void Logger::write_log_entry(const LogEntry* entry_ptr, uint32_t count) {

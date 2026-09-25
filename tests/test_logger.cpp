@@ -2,7 +2,11 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
+#include <bit>
+#include <cmath>
 #include <cstring>
+#include <limits>
+#include <random>
 #include <thread>
 #include <filesystem>
 #include <fstream>
@@ -1624,4 +1628,368 @@ TEST_F(SlickLoggerTest, DirectSinkLogRespectsSinkMinLevel) {
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
+}
+
+namespace {
+
+using slick::logger::ArgType;
+using slick::logger::LogEntry;
+
+LogEntry message_entry(const char* format, uint8_t flags = 0) {
+    LogEntry entry;
+    entry.level = slick::logger::LogLevel::L_INFO;
+    entry.timestamp = 0;
+    entry.format = {format};
+    entry.flags = flags;
+    return entry;
+}
+
+void add_int_arg(LogEntry& entry, int32_t value) {
+    auto& arg = entry.args[entry.arg_count++];
+    arg.type = ArgType::INT32_T;
+    arg.value.i32 = value;
+}
+
+void add_text_arg(LogEntry& entry, const char* value) {
+    auto& arg = entry.args[entry.arg_count++];
+    arg.type = ArgType::STRING_LITERAL;
+    arg.value.literal_ptr = value;
+}
+
+void add_double_arg(LogEntry& entry, double value) {
+    auto& arg = entry.args[entry.arg_count++];
+    arg.type = ArgType::DOUBLE;
+    arg.value.d = value;
+}
+
+std::string format_message(const LogEntry& entry) {
+    std::string out;
+    slick::logger::append_formatted_message(out, entry);
+    return out;
+}
+
+/// Records each entry's flags and message, so a test can see what the logger
+/// handed its sinks.
+class MessageSink : public slick::logger::ISink {
+public:
+    MessageSink() : ISink("messages") {}
+    void write(const LogEntry& entry) override {
+        flags_.push_back(entry.flags);
+        messages_.emplace_back(formatted_message(entry).first);
+    }
+    void flush() override {}
+    std::vector<uint8_t> flags_;
+    std::vector<std::string> messages_;
+};
+
+} // namespace
+
+TEST(MessageFormatCache, CachedParseRendersExactlyAsAFreshOne) {
+    // A static format is parsed once and replayed from the cache; anything else
+    // is parsed per line. The two must never disagree, including on the corner
+    // cases of the field grammar, so each case is rendered uncached, then
+    // cached twice - the first parses and stores, the second replays.
+    struct Case {
+        const char* format;
+        void (*add_args)(LogEntry&);
+    };
+    const Case cases[] = {
+        {"a {} b {} c", [](LogEntry& e) { add_int_arg(e, 1); add_text_arg(e, "x"); }},
+        {"{{}} {} }}{{", [](LogEntry& e) { add_int_arg(e, 5); }},
+        {"{1} {0} {1:>4}", [](LogEntry& e) { add_int_arg(e, 1); add_int_arg(e, 2); }},
+        {"[{:>{}}] [{:.{}f}]", [](LogEntry& e) {
+            add_text_arg(e, "ab"); add_int_arg(e, 6); add_double_arg(e, 3.14159); add_int_arg(e, 2); }},
+        {"[{:{}}] [{:.{}f}]", [](LogEntry& e) {
+            add_int_arg(e, 7); add_int_arg(e, 0); add_double_arg(e, 2.5); add_int_arg(e, 0); }},
+        {"[{0:{1}}] [{0:{2}}]", [](LogEntry& e) { add_int_arg(e, 3); add_int_arg(e, 4); add_int_arg(e, 5); }},
+        {"{5:{}} {}", [](LogEntry& e) { add_int_arg(e, 7); }},
+        {"{:{5}.{}f} {}", [](LogEntry& e) { add_double_arg(e, 1.5); add_int_arg(e, 2); }},
+        {"{:{}.{9}f}", [](LogEntry& e) { add_double_arg(e, 1.5); add_text_arg(e, "w"); }},
+        {"{} {} {}", [](LogEntry& e) { add_int_arg(e, 1); }},
+        {"{} } {}", [](LogEntry& e) { add_int_arg(e, 1); add_int_arg(e, 2); }},
+        {"{:d} {}", [](LogEntry& e) { add_text_arg(e, "nan"); add_int_arg(e, 2); }},
+        {"{} {unclosed", [](LogEntry& e) { add_int_arg(e, 1); }},
+        {"{4294967296} {}", [](LogEntry& e) { add_int_arg(e, 9); }},
+    };
+
+    for (const Case& c : cases) {
+        LogEntry fresh = message_entry(c.format);
+        c.add_args(fresh);
+        LogEntry cached = fresh;
+        cached.flags |= slick::logger::kEntryStaticFormat;
+
+        const std::string expected = format_message(fresh);
+        EXPECT_EQ(format_message(cached), expected) << "first sight of " << c.format;
+        EXPECT_EQ(format_message(cached), expected) << "replay of " << c.format;
+        EXPECT_EQ(format_message(fresh), expected) << "uncached again: " << c.format;
+    }
+
+    // Spot checks that the shared answer is the right one.
+    LogEntry nested = message_entry("[{:>{}}] [{:.{}f}]", slick::logger::kEntryStaticFormat);
+    add_text_arg(nested, "ab"); add_int_arg(nested, 6); add_double_arg(nested, 3.14159); add_int_arg(nested, 2);
+    EXPECT_EQ(format_message(nested), "[    ab] [3.14]");
+
+    LogEntry escaped = message_entry("{{}} {} }}{{", slick::logger::kEntryStaticFormat);
+    add_int_arg(escaped, 5);
+    EXPECT_EQ(format_message(escaped), "{} 5 }{");
+
+    LogEntry unmatched = message_entry("{} } {}", slick::logger::kEntryStaticFormat);
+    add_int_arg(unmatched, 1); add_int_arg(unmatched, 2);
+    EXPECT_EQ(format_message(unmatched), "[FORMAT_ERROR: unmatched '}' in format string]");
+}
+
+TEST(MessageFormatCache, SameLiteralWithDifferentArgumentCountsIsParsedPerCount) {
+    // Which fields go missing depends on how many arguments came with the
+    // format, and a pooled literal can reach the cache from calls passing
+    // different counts, so the count is part of the key.
+    static const char kFormat[] = "{} {}";
+    LogEntry one = message_entry(kFormat, slick::logger::kEntryStaticFormat);
+    add_int_arg(one, 1);
+    LogEntry two = message_entry(kFormat, slick::logger::kEntryStaticFormat);
+    add_int_arg(two, 1);
+    add_int_arg(two, 2);
+
+    EXPECT_EQ(format_message(one), "1 <MISSING_ARG>");
+    EXPECT_EQ(format_message(two), "1 2");
+    EXPECT_EQ(format_message(one), "1 <MISSING_ARG>");
+}
+
+TEST(MessageFormatCache, FormatWithoutStaticFlagIsNeverServedFromCache) {
+    // A runtime format lives in the string ring, whose slots are reused: the
+    // same address, length and argument count can carry different text on the
+    // next line. Such a format must be parsed from what it says now.
+    char format[] = "x={} y";
+    LogEntry entry = message_entry(format);
+    add_int_arg(entry, 4);
+    EXPECT_EQ(format_message(entry), "x=4 y");
+
+    std::memcpy(format, "{}==xy", sizeof(format));
+    EXPECT_EQ(format_message(entry), "4==xy");
+}
+
+TEST_F(SlickLoggerTest, OnlyLiteralFormatsAreMarkedStatic) {
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    auto sink = std::make_shared<MessageSink>();
+    logger.add_sink(sink);
+    logger.init(4096);
+
+    const std::string runtime_format = "runtime {}";
+    for (int i = 0; i < 3; ++i) {
+        LOG_INFO("literal {}", i);
+        logger.log(slick::logger::LogLevel::L_INFO, runtime_format, i);
+    }
+    logger.flush();
+    logger.shutdown();
+
+    // The logger may add lines of its own, so only this test's are checked.
+    int literals = 0;
+    int runtimes = 0;
+    for (size_t i = 0; i < sink->messages_.size(); ++i) {
+        const std::string& message = sink->messages_[i];
+        const bool is_static = (sink->flags_[i] & slick::logger::kEntryStaticFormat) != 0;
+        if (message.starts_with("literal ")) {
+            EXPECT_EQ(message, "literal " + std::to_string(literals++));
+            EXPECT_TRUE(is_static);
+        } else if (message.starts_with("runtime ")) {
+            EXPECT_EQ(message, "runtime " + std::to_string(runtimes++));
+            EXPECT_FALSE(is_static);
+        }
+    }
+    EXPECT_EQ(literals, 3);
+    EXPECT_EQ(runtimes, 3);
+}
+
+TEST(MessageFormatCache, NewTextAtACachedAddressIsParsedAgain) {
+    // A literal's address is fixed only while its module stays loaded: a plugin
+    // unloaded and a rebuilt one loaded in its place can put different text at
+    // the same address, with the same length and argument count.
+    static char format[] = "x={} y";
+    LogEntry entry = message_entry(format, slick::logger::kEntryStaticFormat);
+    add_int_arg(entry, 4);
+    EXPECT_EQ(format_message(entry), "x=4 y");
+    EXPECT_EQ(format_message(entry), "x=4 y");
+
+    std::memcpy(format, "{}==xy", sizeof(format));
+    EXPECT_EQ(format_message(entry), "4==xy");
+    EXPECT_EQ(format_message(entry), "4==xy");
+}
+
+namespace {
+
+using slick::logger::LogArgument;
+
+/// What a bare "{}" renders through the fast path, and through std::format.
+struct PlainPair {
+    std::string fast;
+    std::string general;
+};
+
+PlainPair render_plain(const LogArgument& arg) {
+    PlainPair p;
+    slick::logger::append_plain_argument(p.fast, arg);
+    slick::logger::append_log_argument(p.general, "{}", arg);
+    return p;
+}
+
+template<typename T>
+LogArgument make_arg(ArgType type, T value) {
+    LogArgument arg{};
+    arg.type = type;
+    std::memcpy(&arg.value, &value, sizeof(T));  // members are packed: no references
+    return arg;
+}
+
+template<typename T>
+void expect_plain_matches(ArgType type, T value) {
+    const PlainPair p = render_plain(make_arg(type, value));
+    EXPECT_EQ(p.fast, p.general) << "type " << static_cast<int>(type);
+}
+
+template<typename T>
+void expect_integer_edges(ArgType type) {
+    using L = std::numeric_limits<T>;
+    for (T v : {T(0), T(1), T(9), T(10), L::max(), T(L::max() - 1), L::min(), T(L::min() + 1)}) {
+        expect_plain_matches(type, v);
+    }
+    if constexpr (std::is_signed_v<T>) {
+        expect_plain_matches(type, T(-1));
+        expect_plain_matches(type, T(-10));
+    }
+}
+
+template<typename T>
+void expect_floating_edges(ArgType type) {
+    using L = std::numeric_limits<T>;
+    const T values[] = {
+        T(0), -T(0), T(1), T(-1), T(0.1), T(0.5), T(1) / T(3), T(2) / T(3), T(100), T(1e7),
+        T(1e15), T(1e16), T(1e17), T(123456789.125), T(-2.5e-5), T(1e-5), T(1e-4),
+        L::min(), L::max(), L::lowest(), L::denorm_min(), -L::denorm_min(), L::epsilon(),
+        L::infinity(), -L::infinity(), L::quiet_NaN(), -L::quiet_NaN(),
+        L::signaling_NaN(), T(0) * L::infinity(),
+    };
+    for (T v : values) {
+        expect_plain_matches(type, v);
+    }
+}
+
+} // namespace
+
+TEST(PlainArgument, MatchesStdFormatAtTheEdgesOfEveryType) {
+    expect_plain_matches(ArgType::BOOL, true);
+    expect_plain_matches(ArgType::BOOL, false);
+    for (int c = std::numeric_limits<char>::min(); c <= std::numeric_limits<char>::max(); ++c) {
+        expect_plain_matches(ArgType::CHAR, static_cast<char>(c));
+    }
+    expect_integer_edges<unsigned char>(ArgType::U_CHAR);
+    expect_integer_edges<int8_t>(ArgType::INT8_T);
+    expect_integer_edges<uint8_t>(ArgType::UINT8_T);
+    expect_integer_edges<int16_t>(ArgType::INT16_T);
+    expect_integer_edges<uint16_t>(ArgType::UINT16_T);
+    expect_integer_edges<int32_t>(ArgType::INT32_T);
+    expect_integer_edges<uint32_t>(ArgType::UINT32_T);
+    expect_integer_edges<int64_t>(ArgType::INT64_T);
+    expect_integer_edges<uint64_t>(ArgType::UINT64_T);
+    expect_floating_edges<float>(ArgType::FLOAT);
+    expect_floating_edges<double>(ArgType::DOUBLE);
+
+    int local = 0;
+    for (const void* p : {static_cast<const void*>(nullptr), static_cast<const void*>(&local),
+                          reinterpret_cast<const void*>(uintptr_t{0xABCDEF}),
+                          reinterpret_cast<const void*>(~uintptr_t{0})}) {
+        expect_plain_matches(ArgType::PTR, p);
+    }
+
+    for (const char* text : {"", "text", "with {braces} and %percent", "\xc3\xa9t\xc3\xa9"}) {
+        expect_plain_matches(ArgType::STRING_LITERAL, text);
+    }
+
+    const char dynamic[] = "dynamic text";
+    LogArgument dyn{};
+    dyn.type = ArgType::STRING_DYNAMIC;
+    dyn.value.dynamic_str = {dynamic, static_cast<uint32_t>(sizeof(dynamic) - 1)};
+    const PlainPair d = render_plain(dyn);
+    EXPECT_EQ(d.fast, d.general);
+    EXPECT_EQ(d.fast, "dynamic text");
+
+    const unsigned char payload[] = {0x00, 0x7F, 0xFF};
+    LogArgument blob{};
+    blob.type = ArgType::BLOB;
+    blob.value.dynamic_str = {reinterpret_cast<const char*>(payload), sizeof(payload)};
+    const PlainPair b = render_plain(blob);
+    EXPECT_EQ(b.fast, b.general);
+}
+
+TEST(PlainArgument, MatchesStdFormatForEveryWideCharacter) {
+    // Every UTF-16 code unit, surrogates included, and on platforms with a
+    // 32-bit wchar_t the edges past the BMP and past U+10FFFF.
+    for (uint32_t cp = 0; cp <= 0xFFFF; ++cp) {
+        expect_plain_matches(ArgType::WCHAR, static_cast<wchar_t>(cp));
+    }
+    if constexpr (sizeof(wchar_t) == 4) {
+        for (uint32_t cp : {0x10000u, 0x1F600u, 0x10FFFFu, 0x110000u, 0x7FFFFFFFu, 0xFFFFFFFFu}) {
+            expect_plain_matches(ArgType::WCHAR, static_cast<wchar_t>(cp));
+        }
+    }
+}
+
+TEST(PlainArgument, MatchesStdFormatForRandomBitPatterns) {
+    // Shortest round-trip floating point is where a hand-written "{}" is most
+    // likely to part ways with std::format, so every exponent and mantissa
+    // shape is sampled, NaN payloads and subnormals included.
+    std::mt19937_64 rng(20260925);
+    for (int i = 0; i < 20000; ++i) {
+        const uint64_t bits = rng();
+        expect_plain_matches(ArgType::DOUBLE, std::bit_cast<double>(bits));
+        expect_plain_matches(ArgType::FLOAT, std::bit_cast<float>(static_cast<uint32_t>(bits)));
+        expect_plain_matches(ArgType::INT64_T, static_cast<int64_t>(bits));
+        expect_plain_matches(ArgType::UINT64_T, bits);
+        expect_plain_matches(ArgType::INT32_T, static_cast<int32_t>(bits >> 7));
+        expect_plain_matches(ArgType::INT16_T, static_cast<int16_t>(bits >> 13));
+        expect_plain_matches(ArgType::PTR, reinterpret_cast<const void*>(static_cast<uintptr_t>(bits)));
+        if (::testing::Test::HasFailure()) {
+            FAIL() << "first mismatch at bit pattern 0x" << std::hex << bits;
+        }
+    }
+    // Values a program actually logs: short decimals, prices, ratios.
+    for (int i = 0; i < 10000; ++i) {
+        const double price = static_cast<double>(rng() % 10000000) / 100.0;
+        expect_plain_matches(ArgType::DOUBLE, price);
+        expect_plain_matches(ArgType::FLOAT, static_cast<float>(price));
+        expect_plain_matches(ArgType::DOUBLE, 1.0 / static_cast<double>(1 + rng() % 1000));
+    }
+}
+
+TEST(PlainArgument, BareFieldsRenderAsTheirSpeccedEquivalent) {
+    // "{}" takes the fast path and "{:}" the general one, over the same
+    // arguments, through the whole message: literals between fields, explicit
+    // indices and missing arguments included.
+    const std::pair<const char*, const char*> formats[] = {
+        {"a={} b={} c={} d={} e={} f={} g={}", "a={:} b={:} c={:} d={:} e={:} f={:} g={:}"},
+        {"{6} {5} {4} {3} {2} {1} {0}", "{6:} {5:} {4:} {3:} {2:} {1:} {0:}"},
+        {"{}{}{}{}{}{}{}{}", "{:}{:}{:}{:}{:}{:}{:}{:}"},
+    };
+    for (const auto& [plain, specced] : formats) {
+        LogEntry a = message_entry(plain, slick::logger::kEntryStaticFormat);
+        LogEntry b = message_entry(specced, slick::logger::kEntryStaticFormat);
+        for (LogEntry* e : {&a, &b}) {
+            add_int_arg(*e, -42);
+            add_text_arg(*e, "text");
+            add_double_arg(*e, 0.1);
+            add_double_arg(*e, std::numeric_limits<double>::quiet_NaN());
+            e->args[e->arg_count++] = make_arg(ArgType::BOOL, true);
+            e->args[e->arg_count++] = make_arg(ArgType::WCHAR, L'\x00e9');
+            e->args[e->arg_count++] = make_arg(ArgType::UINT64_T, std::numeric_limits<uint64_t>::max());
+        }
+        const std::string expected = format_message(b);
+        EXPECT_EQ(format_message(a), expected) << plain;
+        a.flags = 0;  // and parsed per line
+        EXPECT_EQ(format_message(a), expected) << plain;
+    }
+
+    LogEntry spot = message_entry("{} {} {}", slick::logger::kEntryStaticFormat);
+    add_int_arg(spot, -42);
+    add_double_arg(spot, 0.1);
+    add_text_arg(spot, "x");
+    EXPECT_EQ(format_message(spot), "-42 0.1 x");
 }

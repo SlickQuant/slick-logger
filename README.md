@@ -363,7 +363,7 @@ supported; convert them yourself before logging.
 - **Extensible**: Easy to add custom formatters for user-defined types
 - **Standard**: Part of C++20 standard library, no external dependencies
 
-> **Caveat — format string must be a true string literal (or otherwise outlive processing):** slick-logger detects "safe to store pointer" format strings by checking whether the argument's type is `const char(&)[N]` — the type category string literals have. This is only a heuristic: any other `const char[N]` lvalue (e.g. a `const char` array **class member**, or a local `const char buf[N]`) has the exact same type and will be misidentified as a literal too. In that case only the pointer is queued, not a copy of the contents, so if the array is mutated or destroyed before the writer thread consumes the log entry, the logged output is corrupted or reads freed memory. Only pass genuine string literals this way; for a `const char` array member variable, pass it as `std::string_view{member}` (or another type convertible to `std::string_view`) instead, so its contents are copied into the queue.
+> **Caveat — format string must be a true string literal (or otherwise outlive processing):** slick-logger detects "safe to store pointer" format strings by checking whether the argument's type is `const char(&)[N]` — the type category string literals have. This is only a heuristic: any other `const char[N]` lvalue (e.g. a `const char` array **class member**, or a local `const char buf[N]`) has the exact same type and will be misidentified as a literal too. In that case only the pointer is queued, not a copy of the contents, so if the array is mutated or destroyed before the writer thread consumes the log entry, the logged output is corrupted or reads freed memory. (Mutating it *after* it has been logged is safe for the message parse cache: a cached parse is checked against the text on every line; see [Deferred Formatting](#deferred-formatting).) Only pass genuine string literals this way; for a `const char` array member variable, pass it as `std::string_view{member}` (or another type convertible to `std::string_view`) instead, so its contents are copied into the queue.
 
 ### Passing std::format_args
 
@@ -1288,6 +1288,18 @@ For optimal performance, the logger defers string formatting to the background t
 3. **Writer Thread**: Formats the message *and the line layout*, then writes to all matching sinks. The message is formatted at most once per entry, however many sinks render it, and only if one of them needs it
 
 This approach moves potentially expensive formatting and I/O operations off the critical path, making logging calls extremely fast and suitable for high-frequency logging scenarios.
+
+Message format strings get the same treatment. A `LOG_*` format is a string literal, so the writer thread parses its `{}` fields the first time it sees one and replays that parse for every later line: no brace scan and no per-field spec rebuilt, leaving only the arguments themselves to format. The parse is keyed by the literal's address, length and argument count and checked against a copy of its text, so a plugin reloaded with different text at the same address is parsed again rather than misread. Runtime (non-literal) format strings live in a reused ring slot and are parsed per line.
+
+The parse also tells which fields are a bare `{}` (or `{1}` once its index is dropped), and those skip `std::format` altogether: integers and floating point go through `std::to_chars` — the shortest round-trip form, which is exactly how `std::format` defines `{}` — pointers become `0x`-prefixed hex, and text is appended as it is. Values whose `{}` rendering is not a plain conversion (infinity, NaN, a null string, binary payloads) still go through `std::format`, and the output is identical either way; it is tested value for value against `std::format` on MSVC, GCC and Clang. Measured on Windows/MSVC `/O2`, minimum of 21 in-process runs, formatting the message alone:
+
+| Message | Before | After |
+|---|---|---|
+| `"user {} logged in from {}"` | 378 ns | 106 ns |
+| `"order {} filled {} @ {:.2f} side={} venue={}"` | 1061 ns | 474 ns |
+| `"[{:>8}] {:08x} {} {} {} {}"` | 1430 ns | 893 ns |
+
+Fields with a spec (`{:.2f}`, `{:>8}`) still cost a `std::format` call each, so prefer `{}` on a hot path when the default rendering will do.
 
 Line patterns follow the same principle: `set_pattern()` parses the pattern once, at configuration time, into a flat list of ops. The caller thread never sees it, and the writer thread renders it by walking that list into a buffer each sink reuses — no parsing and, in steady state, no allocation per line. See [Log Pattern Formatting](#log-pattern-formatting).
 
