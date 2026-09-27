@@ -1394,3 +1394,60 @@ TEST_F(PatternTest, FormatAppendsAfterWhatTheBufferAlreadyHolds) {
     append_default_layout(with_default, make_entry(), timestamp, "INFO", "m");
     EXPECT_EQ(with_default, "x" + timestamp.format_timestamp(kTimestamp) + " [INFO] m");
 }
+
+// grow_uninitialized() takes a different library path per toolchain (the C++23
+// member, MSVC's and libstdc++'s C++20 spellings of it, or resize()). Whichever
+// one compiles in, it must keep the prefix, land on the exact size and keep the
+// string terminated, both in place and across a reallocation.
+TEST_F(PatternTest, GrowUninitializedKeepsThePrefixAndTheExactSize) {
+    std::string s = "abc";
+    detail::grow_uninitialized(s, 5);
+    ASSERT_EQ(s.size(), 5u);
+    EXPECT_EQ(s.substr(0, 3), "abc");
+    EXPECT_EQ(s.c_str()[5], '\0');
+
+    const size_t past_capacity = s.capacity() + 100;
+    detail::grow_uninitialized(s, past_capacity);
+    ASSERT_EQ(s.size(), past_capacity);
+    EXPECT_EQ(s.substr(0, 3), "abc");
+    EXPECT_EQ(s.c_str()[past_capacity], '\0');
+
+    detail::grow_uninitialized(s, 2);
+    EXPECT_EQ(s, "ab");
+}
+
+// write_uint_backward() writes two digits per division and switches between a
+// 32- and a 64-bit loop, so every digit-count parity and both sides of the
+// switch are checked against std::to_string.
+TEST_F(PatternTest, DecimalWriterMatchesToStringAtEveryBoundary) {
+    const uint64_t values[] = {0, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 9999, 10000, 12345, 99999,
+                               100000, 4294967294ull, 4294967295ull, 4294967296ull, 10000000000ull,
+                               1234567890123456789ull, 18446744073709551615ull};
+    for (const uint64_t value : values) {
+        std::string out = "x";
+        detail::append_uint(out, value);
+        EXPECT_EQ(out, "x" + std::to_string(value)) << value;
+    }
+}
+
+// tag_length() finds the NUL eight bytes at a time with a bit trick, so it is
+// checked against strnlen() for every length, with non-ASCII bytes (whose high
+// bit the trick must not mistake for a zero) and with junk after the NUL (which
+// a borrow could otherwise turn into an earlier false match).
+TEST_F(PatternTest, TagLengthMatchesStrnlenForEveryLength) {
+    for (size_t length = 0; length <= SLICK_LOGGER_TAG_SIZE; ++length) {
+        for (const char fill : {'a', '\x80', '\xff'}) {
+            char tag[SLICK_LOGGER_TAG_SIZE];
+            std::memset(tag, fill, sizeof(tag));
+            if (length < sizeof(tag)) {
+                tag[length] = '\0';
+                // Junk after the terminator, including a 0x01 right behind it.
+                for (size_t i = length + 1; i < sizeof(tag); ++i) {
+                    tag[i] = static_cast<char>(i == length + 1 ? 0x01 : 0x80 + i);
+                }
+            }
+            EXPECT_EQ(detail::tag_length(tag), strnlen(tag, sizeof(tag)))
+                << "length " << length << " fill " << static_cast<int>(static_cast<unsigned char>(fill));
+        }
+    }
+}

@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
+#include <bit>
 #include <filesystem>
 #include <cassert>
 #include <memory>
@@ -146,6 +147,16 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void
 #define SLICK_LOGGER_FORCE_INLINE inline
 #endif
 
+// For a rare branch whose body would otherwise be inlined into a hot caller and
+// crowd out what that caller does on every line.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define SLICK_LOGGER_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define SLICK_LOGGER_NOINLINE __attribute__((noinline))
+#else
+#define SLICK_LOGGER_NOINLINE
+#endif
+
 #ifndef SLICK_LOGGER_FILE_NAME
 #if defined(__FILE_NAME__)
 #define SLICK_LOGGER_FILE_NAME __FILE_NAME__
@@ -171,17 +182,19 @@ inline constexpr const char* file_name_from_path(const char* path) noexcept {
     return file_name;
 }
 
+/// "00" through "99", back to back: two digits per lookup.
+inline constexpr char kDigitPairs[201] =
+    "00010203040506070809101112131415161718192021222324"
+    "25262728293031323334353637383940414243444546474849"
+    "50515253545556575859606162636465666768697071727374"
+    "75767778798081828384858687888990919293949596979899";
+
 /**
  * @brief Write a value in [0, 99] as two ASCII digits, without division by 10.
  */
 inline void write_2_digits(char* out, uint32_t value) noexcept {
-    static constexpr char kDigits[201] =
-        "00010203040506070809101112131415161718192021222324"
-        "25262728293031323334353637383940414243444546474849"
-        "50515253545556575859606162636465666768697071727374"
-        "75767778798081828384858687888990919293949596979899";
-    out[0] = kDigits[value * 2];
-    out[1] = kDigits[value * 2 + 1];
+    out[0] = kDigitPairs[value * 2];
+    out[1] = kDigitPairs[value * 2 + 1];
 }
 
 /**
@@ -229,17 +242,43 @@ inline constexpr size_t kMaxUint32Digits = 10;
 /// Most digits a uint64_t renders to.
 inline constexpr size_t kMaxUint64Digits = 20;
 
+/// write_uint_backward()'s loop, two digits per division, at the width of @p UInt.
+template <typename UInt>
+inline char* write_uint_backward_as(char* end, UInt value) noexcept {
+    char* p = end;
+    while (value >= 100) {
+        const UInt quotient = value / 100;
+        p -= 2;
+        write_2_digits(p, static_cast<uint32_t>(value - quotient * 100));
+        value = quotient;
+    }
+    if (value >= 10) {
+        p -= 2;
+        write_2_digits(p, static_cast<uint32_t>(value));
+    } else {
+        *--p = static_cast<char>('0' + value);
+    }
+    return p;
+}
+
+/// The 64-bit loop, out of line so that it does not bloat every caller.
+SLICK_LOGGER_NOINLINE inline char* write_uint64_backward(char* end, uint64_t value) noexcept {
+    return write_uint_backward_as(end, value);
+}
+
 /**
  * @brief Write @p value in decimal so that it ends just before @p end
  * @return Where the digits start. At most kMaxUint64Digits are written.
+ *
+ * Pids, line numbers, epoch seconds (until 2106) and most thread ids fit 32
+ * bits, and a 32-bit division by a constant is a cheaper multiply than a 64-bit
+ * one, so those take the inline path. Only a wider value reaches the other.
  */
 inline char* write_uint_backward(char* end, uint64_t value) noexcept {
-    char* p = end;
-    do {
-        *--p = static_cast<char>('0' + (value % 10));
-        value /= 10;
-    } while (value != 0);
-    return p;
+    if (value > UINT32_MAX) [[unlikely]] {
+        return write_uint64_backward(end, value);
+    }
+    return write_uint_backward_as(end, static_cast<uint32_t>(value));
 }
 
 /**
@@ -259,15 +298,31 @@ inline void append_uint(std::string& out, uint64_t value) {
  * @brief Grow a string to @p size without paying to initialize the new bytes
  *
  * The caller overwrites what it grew, so zero-filling it first is wasted work.
- * Where resize_and_overwrite() is missing this falls back to resize(), which
- * zero-fills: correct, and still one bulk memset rather than a check per piece.
+ * resize_and_overwrite() is C++23, but the major libraries ship the same member
+ * to C++20 under a reserved name: MSVC's STL as _Resize_and_overwrite (the
+ * public name is gated on /std:c++latest) and libstdc++ as a documented
+ * __resize_and_overwrite extension. Each is detected rather than version-checked,
+ * so a library without it simply falls through.
+ *
+ * The last resort is resize(), which zero-fills the growth - in practice libc++
+ * below C++23. Correct, and one bulk memset rather than a check per piece, but
+ * the budget is a bound, not an exact size (a %P field reserves room for a full
+ * tag), so every line pays for a memset of its unused slack on that path.
+ *
+ * A template only so the requires-expressions are SFINAE rather than hard errors.
  */
-inline void grow_uninitialized(std::string& s, size_t size) {
-#if defined(__cpp_lib_string_resize_and_overwrite)
-    s.resize_and_overwrite(size, [](char*, size_t n) noexcept { return n; });
-#else
-    s.resize(size);
-#endif
+template <typename String>
+void grow_uninitialized(String& s, size_t size) {
+    constexpr auto keep_all = [](char*, size_t n) noexcept { return n; };
+    if constexpr (requires { s.resize_and_overwrite(size, keep_all); }) {
+        s.resize_and_overwrite(size, keep_all);
+    } else if constexpr (requires { s._Resize_and_overwrite(size, keep_all); }) {
+        s._Resize_and_overwrite(size, keep_all);
+    } else if constexpr (requires { s.__resize_and_overwrite(size, keep_all); }) {
+        s.__resize_and_overwrite(size, keep_all);
+    } else {
+        s.resize(size);
+    }
 }
 
 /**
@@ -1212,6 +1267,36 @@ inline constexpr bool has_source_location(const LogEntry& entry) noexcept {
 }
 
 namespace detail {
+
+/**
+ * @brief Length of a NUL-padded LogEntry::tag, without a strnlen() call
+ *
+ * strnlen() is an out-of-line CRT call, and on MSVC it cost more than the rest
+ * of the pid-and-tag field put together. The tag is a fixed-size array, so it is
+ * read eight bytes at a time instead, and the first zero byte found with the
+ * has-zero-byte bit trick: its lowest set bit is always the first zero, since a
+ * false positive can only come from a borrow out of a real zero below it. Bytes
+ * past the last whole word, and every byte on a big-endian target, are checked
+ * one at a time.
+ */
+inline size_t tag_length(const char* tag) noexcept {
+    constexpr size_t kSize = SLICK_LOGGER_TAG_SIZE;
+    size_t offset = 0;
+    if constexpr (std::endian::native == std::endian::little) {
+        for (; offset + 8 <= kSize; offset += 8) {
+            uint64_t word;
+            std::memcpy(&word, tag + offset, 8);
+            const uint64_t zero_bytes = (word - 0x0101010101010101ull) & ~word & 0x8080808080808080ull;
+            if (zero_bytes != 0) {
+                return offset + static_cast<size_t>(std::countr_zero(zero_bytes)) / 8;
+            }
+        }
+    }
+    while (offset < kSize && tag[offset] != '\0') {
+        ++offset;
+    }
+    return offset;
+}
 
 /**
  * @brief The message of the entry being dispatched, formatted at most once
@@ -3898,13 +3983,13 @@ inline void write_process_id(detail::line_writer& out, const LogEntry& entry) no
     out.put_uint(entry.pid);
     if (entry.tag[0] != '\0') {
         out.put(':');
-        out.put(entry.tag, strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE));
+        out.put(entry.tag, detail::tag_length(entry.tag));
     }
     out.put(']');
 }
 
 /// Most write_process_id() writes. A bound rather than an exact size, so sizing
-/// a line costs neither a digit count nor a strnlen() of the tag.
+/// a line costs neither a digit count nor a scan of the tag.
 inline constexpr size_t kProcessIdBound = detail::kMaxUint32Digits + SLICK_LOGGER_TAG_SIZE + 4;
 
 /**
@@ -4365,7 +4450,7 @@ SLICK_LOGGER_FORCE_INLINE void PatternFormatter::write_op(detail::line_writer& o
             out.put_uint(entry.pid ? entry.pid : current_process_id());
             break;
         case Flag::kTag:
-            out.put(entry.tag, strnlen(entry.tag, SLICK_LOGGER_TAG_SIZE));
+            out.put(entry.tag, detail::tag_length(entry.tag));
             break;
         case Flag::kSinkName:
             out.put(ctx.sink_name);
@@ -4494,7 +4579,10 @@ inline void PatternFormatter::format(std::string& out, const LogEntry& entry,
     // copy for padded fields would double the loop and crowd the inliner out of
     // everything the op bodies call.
     for (const Op& op : ops_) {
-        writer.put(literals_.data() + op.prefix_off, op.prefix_len);
+        // Most ops carry no prefix. One test skips copy_bytes()' whole size ladder.
+        if (op.prefix_len != 0) {
+            writer.put(literals_.data() + op.prefix_off, op.prefix_len);
+        }
         const size_t start = writer.offset();
         write_op(writer, op, entry, ctx, cache, subsecond_ns);
         if (op.width != 0) {
