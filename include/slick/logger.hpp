@@ -4700,9 +4700,9 @@ inline void ConsoleSink::write(const LogEntry& entry) {
         : format_log_entry(entry);
 
     if (use_stderr_for_errors_ && (entry.level >= LogLevel::L_WARN)) {
-        std::cerr << formatted << std::endl;
+        std::cerr << formatted << "\n";
     } else {
-        std::cout << formatted << std::endl;
+        std::cout << formatted << "\n";
     }
 }
 
