@@ -25,6 +25,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 - **Shared-Library Redirection**: Route plugin or strategy-library logs into a host application's logger
 - **Multi-Process Logging**: Several processes can log into one shared-memory queue drained by a single collector process
 - **Runtime Statistics**: An optional background thread samples throughput, queue fullness and drop counts, and writes them to a CSV
+- **Queue Tuning**: Build-time switches to count lost entries and to control the CAS backoff producers use under contention
 - **Header-Only**: No linking required - just include and use
 - **Cross-Platform**: Supports Windows, Linux, and macOS
 - **Multi-Threaded**: Safe for concurrent logging from multiple threads
@@ -631,14 +632,14 @@ Useful controls:
 
 #### When entries reach disk
 
-The writer thread flushes the file sinks once it has drained the queue, not after every entry, so a burst of logging shares a single flush instead of paying a write syscall per line. In practice this means:
+The writer thread flushes its sinks once it has drained the queue, not after every entry, so a burst of logging shares a single flush instead of paying a write syscall per line. In practice this means:
 
 - Once the logger is caught up, everything logged so far is on disk.
 - While a backlog is still draining, recent entries may still be sitting in a sink's buffer.
 - `flush()` returns only after the writer thread has written **and** flushed every entry queued before the call, so use it whenever you need a guarantee at a specific point (before unloading a plugin, before inspecting the log file, at a checkpoint).
 - `shutdown()` drains and flushes before the writer thread exits.
 
-`ConsoleSink` is the exception: it flushes after every line. That is deliberate - an interactive terminal is line-buffered anyway, and when stdout is redirected to a file or a pipe (CI logs, `docker logs`, process supervisors) a per-line flush is what keeps each line immediately visible to the capturing process. Console output is rarely the hot path, so the per-line cost does not matter there.
+`ConsoleSink` follows the same rule: it ends each line with `'\n'` rather than `std::endl`, and `std::cout`/`std::cerr` are flushed with the other sinks once the queue drains. When stdout is redirected to a file or a pipe (CI logs, `docker logs`, process supervisors), a burst therefore reaches the capturing process once the writer catches up rather than line by line. `std::cerr` is unbuffered by default, so warnings and errors routed there by `use_stderr_for_errors` still appear immediately.
 
 A custom sink's `flush()` is only ever called on the writer thread, so it does not need its own locking against `write()`.
 
@@ -823,7 +824,7 @@ The line is then sized once, to an upper bound computed from the pattern and the
 
 Measured on Windows/MSVC `/O2` (Ryzen 9 5900HX), minimum of 21 interleaved rounds, rendering one line through `ISink::format_log_entry()` — an entry with a source location and a message without arguments, no I/O:
 
-| Line layout | 2.1.0 ns/line | now ns/line | change |
+| Line layout | 2.1.0 ns/line | 2.2.0 ns/line | change |
 | --- | --- | --- | --- |
 | Built-in layout | 253 | 207 | **-18%** |
 | `%+` | 253 | 227 | -10% |
@@ -832,7 +833,7 @@ Measured on Windows/MSVC `/O2` (Ryzen 9 5900HX), minimum of 21 interleaved round
 | `%T.%e %^%-5l%$ %-20@ %v` | 346 | 264 | -24% |
 | `[%l] %v` | 181 | 166 | -8% |
 
-A spelled-out pattern now renders within about 15% of the built-in layout, where 2.1.0 was about 30% slower. The rest of each row is the message itself, which costs the same whatever the layout: timing only the layout step, with the message already formatted, `%Y-%m-%d %H:%M:%S.%f [%l] [%@] %v` takes 91 ns against 90 ns for the built-in layout (2.1.0: 197 ns against 114 ns). On an entry with arguments, `std::format` dominates the line, and the layout accounts for only a few percent of it. On the producing thread the `LOG_*` call itself measured 96.6 → 97.8 ns, the cost of stamping the thread id.
+A spelled-out pattern now renders within about 15% of the built-in layout, where 2.1.0 was about 30% slower. The rest of each row is the message itself, which costs the same whatever the layout: timing only the layout step, with the message already formatted, `%Y-%m-%d %H:%M:%S.%f [%l] [%@] %v` takes 91 ns against 90 ns for the built-in layout (2.1.0: 197 ns against 114 ns). On an entry with arguments, `std::format` dominates the line, and the layout accounts for only a few percent of it. On the producing thread, stamping the thread id (added in 2.0.0) took the `LOG_*` call itself from 96.6 to 97.8 ns.
 
 A pattern also pays only for the fields it actually renders:
 
@@ -1293,7 +1294,7 @@ Message format strings get the same treatment. A `LOG_*` format is a string lite
 
 The parse also tells which fields are a bare `{}` (or `{1}` once its index is dropped), and those skip `std::format` altogether: integers and floating point go through `std::to_chars` — the shortest round-trip form, which is exactly how `std::format` defines `{}` — pointers become `0x`-prefixed hex, and text is appended as it is. Values whose `{}` rendering is not a plain conversion (infinity, NaN, a null string, binary payloads) still go through `std::format`, and the output is identical either way; it is tested value for value against `std::format` on MSVC, GCC and Clang. Measured on Windows/MSVC `/O2`, minimum of 21 in-process runs, formatting the message alone:
 
-| Message | Before | After |
+| Message | Parsed every line | Cached parse + bare `{}` fast path |
 |---|---|---|
 | `"user {} logged in from {}"` | 378 ns | 106 ns |
 | `"order {} filled {} @ {:.2f} side={} venue={}"` | 1061 ns | 474 ns |

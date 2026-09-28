@@ -118,9 +118,9 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void
 #endif
 
 #define SLICK_LOGGER_VERSION_MAJOR 2
-#define SLICK_LOGGER_VERSION_MINOR 1
+#define SLICK_LOGGER_VERSION_MINOR 2
 #define SLICK_LOGGER_VERSION_PATCH 0
-#define SLICK_LOGGER_VERSION "2.1.0"
+#define SLICK_LOGGER_VERSION "2.2.0"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20

@@ -1,3 +1,26 @@
+# v2.2.0 - 09-28-2026
+The writer thread spends much less time per line: messages are formatted once per entry and their parse is cached, and pattern layouts render up to 28% faster. Two new build switches tune the queues. Code that calls `LOG_*` needs no changes, and a 2.2.0 process can share a segment with a 2.1.0 one.
+
+- **Messages are formatted once, lazily.** An entry's message used to be formatted separately by each sink that rendered it. Now it is formatted at most once, and only when a sink asks for it
+  - New `ISink::formatted_message()` returns the message as a `std::string_view`, together with whether it formatted cleanly. While an entry is being dispatched, the first sink to call it pays for `std::format` and the rest reuse that result. A sink that never asks costs nothing
+  - Arguments are formatted with `std::vformat_to` straight into a reused buffer, so a line no longer allocates a `std::string` per argument or per message
+  - `format_log_message()` still exists and returns the same result as an owned `std::string`. Custom sinks keep working, but should switch to `formatted_message()` to avoid the copy
+- **Message parses are cached.** The writer thread parses each `LOG_*` literal format the first time it sees it, and later lines reuse that parse, so the brace scan and per-field spec rebuild happen once per literal
+  - Each cache entry is keyed by the literal's address, length and argument count. It also stores a copy of the text and checks it on every hit, so a plugin reloaded with different text at the same address gets parsed again rather than misread. Runtime (non-literal) format strings are still parsed on every line
+  - Bare `{}` fields (and `{N}` once the index is stripped) skip `std::format`. Integers and floating point go through `std::to_chars`, pointers become `0x`-prefixed hex, and text is appended as it is. Infinity, NaN, null strings and binary payloads still go through `std::format`. Tests compare the output to `std::format` value for value
+  - Formatting only the message: `"user {} logged in from {}"` went from 378 to 106 ns, and `"order {} filled {} @ {:.2f} side={} venue={}"` from 1061 to 474 ns. A field with a spec still costs one `std::format` call
+- **Faster pattern rendering.** The line is sized once, to an upper bound computed from the pattern and the entry, and every op copies through a cursor into that space. There is no per-piece capacity check, no `append` call and no out-of-line dispatch
+  - Literal runs are folded into the op that follows them, so `[%l] %v` renders as two ops rather than four. A `.%e`, `.%f` or `.%F` after a run of date/time flags joins that run's single `memcpy`
+  - On C++20 the buffer grows without being zero-filled: the logger detects MSVC's `_Resize_and_overwrite` and libstdc++'s `__resize_and_overwrite`, and uses `resize_and_overwrite` wherever the standard library provides it
+  - Decimals are written two digits per division through an inline 32-bit path, and the built-in layout no longer calls `std::to_string`. Tags are measured a word at a time instead of with `strnlen()`. Ops with no literal prefix skip the prefix copy
+  - Measured per line against 2.1.0: the built-in layout went from 253 to 207 ns (-18%), `%Y-%m-%d %H:%M:%S.%f [%l] [%s:%#] %v` from 332 to 240 ns (-28%), and `%T.%e %^%-5l%$ %-20@ %v` from 346 to 264 ns (-24%). A right-aligned field now costs about 10 ns instead of 20
+- **Queue tuning switches.** Both are CMake options, or macros you define before including `slick/logger.hpp`. The installed package also honors them if they are set before `find_package(slick-logger)`
+  - `SLICK_LOGGER_ENABLE_LOSS_DETECTION` (default `OFF`) counts entries a producer overwrote before the writer read them, and reports the count as `LogStats::entry_loss_count`. Only the writer thread pays for it, and the new `kLossDetectionEnabled` constant distinguishes "zero" from "not counted". In shared-memory mode the collector holds the count
+  - `SLICK_LOGGER_ENABLE_CPU_RELAX` (default `ON`) makes a producer execute a `pause`/`yield` instruction before retrying a lost slot-reservation CAS. Turning it off retries immediately, which can cut latency when there are few producers per core
+  - Both switches change the queue type `Logger` holds, so every translation unit and every shared library that shares a logger must use the same values. Processes sharing a segment need not agree, because neither switch changes the shared-memory layout
+- **`ConsoleSink` no longer flushes on every line.** It writes `'\n'` rather than `std::endl`, and `std::cout` is flushed along with the other sinks when the queue drains. When stdout is redirected to a file or a pipe, a burst now shows up once the writer catches up rather than line by line. `std::cerr` is unbuffered, so warnings and errors routed there are unaffected
+- New tests cover the message cache, the `{}` fast path, per-dispatch message sharing, the queue-trait switches and each rendering helper
+
 # v2.1.0 - 09-24-2026
 The string ring's memory footprint drops from 272 MB to 20 MB at the default settings, and logging from many threads at once got faster.
 
