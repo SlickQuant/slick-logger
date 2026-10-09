@@ -66,32 +66,49 @@ Call timings exclude the writer's drain and flush time; overloaded queues can ov
 
 ## Installation
 
-### Option 1: Direct Copy
+### Option 1: vcpkg (Recommended)
 
-The simplest route is the archive attached to a [release](https://github.com/SlickQuant/slick-logger/releases): it already bundles `slick/queue.h` and the `slick/shm/` headers alongside `slick/logger.hpp`, so unpacking it and adding `include/` to your include path is all that is needed.
+vcpkg installs slick-logger and its dependencies for you. In classic mode:
 
-To assemble the headers by hand instead, you need both slick-logger and its dependency:
-
-1. Copy the `include/slick/` directory to your project
-2. Download `queue.h` from https://raw.githubusercontent.com/SlickQuant/slick-queue/main/include/slick/queue.h
-3. Place `queue.h` in your include path or alongside the slick-logger headers
-4. Copy the `slick/shm/` headers from [slick-shm](https://github.com/SlickQuant/slick-shm) as well — slick-queue includes them for its shared-memory support
-
-Your project structure should look like:
-```
-your_project/
-├── include/
-│   ├── slick/
-│       └── logger.hpp
-│       └── queue.h
-│       └── shm/
-└── src/
-    └── main.cpp
+```sh
+vcpkg install slick-logger
 ```
 
-The CMake options below handle all of this automatically, and are the recommended path.
+For manifest-mode projects, add a `vcpkg.json` beside your `CMakeLists.txt`:
 
-### Option 2: CMake Integration (Recommended)
+```json
+{
+  "dependencies": [
+    "slick-logger"
+  ]
+}
+```
+
+Use the installed package in your C++20 CMake project:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(your_project LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(slick-logger CONFIG REQUIRED)
+
+add_executable(your_app main.cpp)
+target_link_libraries(your_app PRIVATE slick::logger)
+```
+
+Configure with the [vcpkg CMake toolchain](https://learn.microsoft.com/en-us/vcpkg/users/buildsystems/cmake-integration), replacing `<path-to-vcpkg>` with your vcpkg installation directory. In manifest mode, this also installs the declared dependencies automatically:
+
+```sh
+cmake -S . -B build "-DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --config Release
+```
+
+CI builds and runs this package-consumer example in both classic and manifest modes; see [tests/package_consumer](tests/package_consumer).
+
+### Option 2: CMake Integration
 
 CMake automatically handles the slick-queue dependency for you.
 
@@ -142,10 +159,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Optional: also accepts -DSLICK_LOGGER_ENABLE_SOURCE_LOCATION=OFF on the CMake command line
 set(SLICK_LOGGER_ENABLE_SOURCE_LOCATION OFF CACHE BOOL "" FORCE)
 
-find_package(slick-logger REQUIRED)
+find_package(slick-logger CONFIG REQUIRED)
 
 add_executable(your_app main.cpp)
-target_link_libraries(your_app slick::logger)
+target_link_libraries(your_app PRIVATE slick::logger)
 ```
 
 #### Manual Integration
@@ -161,6 +178,31 @@ include_directories(path/to/slick-logger/include, path/to/slick-queue/include)
 
 add_executable(your_app main.cpp)
 ```
+
+### Option 3: Direct Copy
+
+The simplest route is the archive attached to a [release](https://github.com/SlickQuant/slick-logger/releases): it already bundles `slick/queue.h` and the `slick/shm/` headers alongside `slick/logger.hpp`, so unpacking it and adding `include/` to your include path is all that is needed.
+
+To assemble the headers by hand instead, you need both slick-logger and its dependency:
+
+1. Copy the `include/slick/` directory to your project
+2. Download `queue.h` from https://raw.githubusercontent.com/SlickQuant/slick-queue/main/include/slick/queue.h
+3. Place `queue.h` in your include path or alongside the slick-logger headers
+4. Copy the `slick/shm/` headers from [slick-shm](https://github.com/SlickQuant/slick-shm) as well — slick-queue includes them for its shared-memory support
+
+Your project structure should look like:
+```
+your_project/
+├── include/
+│   ├── slick/
+│       └── logger.hpp
+│       └── queue.h
+│       └── shm/
+└── src/
+    └── main.cpp
+```
+
+The CMake options above also handle dependencies automatically.
 
 ## Usage
 

@@ -39,6 +39,48 @@ jobs:
         name: slick-logger-package
         path: build/dist/*.zip
 
+  vcpkg-consumer:
+    name: vcpkg consumer (${{ matrix.mode }})
+    runs-on: windows-latest
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - mode: classic
+          manifest: 'OFF'
+        - mode: manifest
+          manifest: 'ON'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/checkout@v4
+      with:
+        repository: microsoft/vcpkg
+        path: vcpkg
+
+    - name: Bootstrap vcpkg
+      run: ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
+
+    - name: Install package (classic mode)
+      if: matrix.mode == 'classic'
+      run: ./vcpkg/vcpkg.exe install slick-logger
+
+    - name: Configure README example
+      run: >-
+        cmake -S tests/package_consumer -B build-consumer
+        "-DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+        -DVCPKG_TARGET_TRIPLET=x64-windows
+        -DVCPKG_MANIFEST_MODE=${{ matrix.manifest }}
+
+    - name: Build README example
+      run: cmake --build build-consumer --config Release
+
+    - name: Run README example
+      run: ctest --test-dir build-consumer -C Release --output-on-failure
+
   # The default matrix covers g++ on Linux, AppleClang on macOS and MSVC on
   # Windows. Clang on x86-64 Linux is its own case: it is the only combination
   # that defines __SIZEOF_FLOAT128__ without providing _Float128 in C++ mode, so
