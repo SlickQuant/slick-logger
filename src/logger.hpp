@@ -618,6 +618,15 @@ struct logger_queue_traits : public slick::queue_traits {
     static constexpr bool enable_cpu_relax = SLICK_LOGGER_ENABLE_CPU_RELAX != 0;
 };
 
+/// Logger::shutdown() destroys the shared queues it created, which is only safe
+/// with slick-queue 2.3.0 or newer: before that, the creator's destructor
+/// shm_unlink()ed the segment and stranded every process still attached.
+/// remove_shm() arrived in the same release, so its presence identifies one.
+template<typename Queue>
+concept queue_keeps_segment_on_destroy = requires(const Queue& queue) { queue.remove_shm(); };
+static_assert(queue_keeps_segment_on_destroy<slick::queue<char, logger_queue_traits>>,
+              "slick-logger requires slick-queue 2.3.0 or newer");
+
 // P0718's std::atomic<std::shared_ptr<T>>. Availability has to be tested before
 // the type is ever named: libc++ ships no specialization, and naming it there
 // instantiates the primary std::atomic template, which hard-errors on its
@@ -2772,18 +2781,6 @@ private:
 
     /// Turn an entry's ring indices back into addresses valid in this process.
     void rebase_entry(LogEntry& entry) const noexcept;
-
-    /// Record a shared-memory queue this process created and must never destroy,
-    /// see shutdown(). The registry is itself never freed, which keeps the
-    /// retained queues reachable: leak detectors report unreachable allocations,
-    /// so an intentional retention must stay visible to avoid a false positive.
-    ///
-    /// Each init()/shutdown() cycle that CREATED its segments retains one more
-    /// mapping, so repeatedly re-initializing in a shared role grows memory
-    /// monotonically. Fine for the usual one-shot process lifecycle; a process
-    /// that cycles the logger many times should attach to a segment created
-    /// elsewhere, which is never retained.
-    static void retain_shared_queue(void* queue) noexcept;
 
     std::unique_ptr<slick::queue<LogEntry, logger_queue_traits>> log_queue_;
     std::unique_ptr<slick::queue<char, logger_queue_traits>> string_queue_;
@@ -6273,32 +6270,6 @@ inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
     entry.arg_count = static_cast<uint8_t>(arg_idx);
 }
 
-inline void Logger::retain_shared_queue(void* queue) noexcept {
-    if (!queue) {
-        return;
-    }
-    struct RetainedQueue {
-        void* queue;
-        RetainedQueue* next;
-    };
-    // Never emptied, and the head is a static so leak detectors treat it as a
-    // root: that is what keeps the retained queues reachable rather than looking
-    // like lost allocations. A by-value container would be destroyed at exit, and
-    // its ordering against the detector's final scan is not guaranteed.
-    static std::atomic<RetainedQueue*> head{nullptr};
-
-    auto* node = new (std::nothrow) RetainedQueue{queue, nullptr};
-    if (!node) {
-        // The queue is retained regardless; the registry only records it.
-        return;
-    }
-    node->next = head.load(std::memory_order_relaxed);
-    while (!head.compare_exchange_weak(node->next, node,
-                                       std::memory_order_release,
-                                       std::memory_order_relaxed)) {
-    }
-}
-
 inline void Logger::shutdown(bool clear_sinks) {
     if (running_.load(std::memory_order_relaxed)) {
         running_.store(false, std::memory_order_release);
@@ -6340,28 +6311,13 @@ inline void Logger::shutdown(bool clear_sinks) {
         // only other user of sinks_, has been joined above.
         release_sinks();
     }
-#ifndef _WIN32
-    // POSIX only: slick-queue's destructor shm_unlink()s a segment this process
-    // created. Unlinking frees the NAME while existing mappings stay valid, so any
-    // process still attached would keep draining memory that newcomers can no
-    // longer reach - they would create a fresh segment under the same name and
-    // their entries would silently vanish. Producer-first startup makes this easy
-    // to hit: a short-lived first producer would strand the collector.
-    //
-    // Nobody can safely unlink while others might still attach, so the creating
-    // handle is retained for the life of the process instead of destroyed. The OS
-    // reclaims the mapping at exit; the name persists until removed (see the POSIX
-    // cleanup note in the README).
-    //
-    // use_shm() must be checked as well: a local heap queue also reports
-    // own_buffer() == true, and retaining that one would hold the whole buffer.
-    if (log_queue_ && log_queue_->use_shm() && log_queue_->own_buffer()) {
-        retain_shared_queue(log_queue_.release());
-    }
-    if (string_queue_ && string_queue_->use_shm() && string_queue_->own_buffer()) {
-        retain_shared_queue(string_queue_.release());
-    }
-#endif
+    // Destroying a shared queue only unmaps it: since slick-queue 2.3.0 no queue
+    // shm_unlink()s its segment, not even the one that created it. Unlinking frees
+    // the NAME while existing mappings stay valid, so a creator that unlinked on
+    // exit would strand every process still attached - newcomers would create a
+    // fresh segment under the same name and their entries would silently vanish.
+    // The name therefore persists until removed (see the POSIX cleanup note in the
+    // README), and this process's mapping is released here like any other.
     log_queue_.reset();
     string_queue_.reset();
 

@@ -1,10 +1,12 @@
 # v2.2.1 - 10-08-2026
-A dependency update with no change to the logger's API or behaviour. A 2.2.1 process can share a segment with a 2.2.0 one.
+Updates slick-queue to 2.3.0, which lets `shutdown()` unmap the shared-memory segments it created rather than keeping them mapped until the process exits. The segments themselves persist as before. The API is unchanged, and a 2.2.1 process can share a segment with a 2.2.0 one.
 
-- **slick-queue 2.3.0 is now the minimum.** `find_package`, the tag `FetchContent` pulls, and the installed package's `find_dependency` all require it, so an older slick-queue fails at configure time
-  - 2.3.0 changes how slick-queue ends a shared-memory segment's life. On POSIX, the queue that created a segment used to `shm_unlink()` it when destroyed, and now no queue does. A new `remove_shm()` unlinks it on request
-  - slick-logger already kept its segments alive this way: it holds on to the handle of any segment it created until the process exits, so the old destructor never unlinked one. Multi-process logging therefore behaves exactly as in 2.2.0, and on POSIX segments still stay in `/dev/shm/` until you remove them (see the README's cleanup note)
-  - Neither 2.2.0 nor 2.3.0 changes slick-queue's segment layout
+- **slick-queue 2.3.0 is now the minimum.** `find_package`, the tag `FetchContent` pulls, and the installed package's `find_dependency` all require it, so an older slick-queue fails at configure time. The header also checks it at compile time, so copying `slick/logger.hpp` next to an older `slick/queue.hpp` fails to build
+  - 2.3.0 changes how a shared-memory segment's life ends. On POSIX, the queue that created a segment used to `shm_unlink()` it when destroyed. That freed the name while peers were still attached, so a later process created a fresh segment under the same name and its entries never reached the collector. Now no queue unlinks on destruction
+- **`shutdown()` unmaps the segments it created, without removing them (POSIX).** To stop that unlink, 2.2.0 never destroyed a queue it had created: it kept the mapping open until the process exited, so each `init()`/`shutdown()` cycle that created its segments left one more mapping behind. With 2.3.0 the queue is destroyed like any other, which unmaps this process's view only
+  - The segment itself is never removed, so processes still attached keep logging into it, and the next `init()` with the same name attaches to it and replays its backlog. On POSIX, segments still stay in `/dev/shm/` until you remove them (see the README's cleanup note)
+  - Windows is unaffected: the kernel frees a segment when its last handle closes, and slick-logger never kept one there
+- Neither slick-queue 2.2.0 nor 2.3.0 changes the segment layout, which is why 2.2.0 and 2.2.1 processes can share a segment
 
 # v2.2.0 - 09-28-2026
 The writer thread spends much less time per line: messages are formatted once per entry and their parse is cached, and pattern layouts render up to 28% faster. Two new build switches tune the queues. Code that calls `LOG_*` needs no changes, and a 2.2.0 process can share a segment with a 2.1.0 one.

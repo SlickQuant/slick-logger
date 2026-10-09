@@ -986,15 +986,20 @@ TEST_F(SlickLoggerTest, SetInstanceRedirectsLogsToHostLogger) {
 
     // --- Host setup: Logger::instance() writes to host.log ---
     slick::logger::Logger::instance().add_file_sink("test_set_instance_host.log", "host_sink");
-    slick::logger::Logger::instance().init(1024);
 
     // --- Plugin setup: same instance gets a second sink (plugin.log) ---
     // In a real scenario this would be the plugin's own Logger::instance_,
     // but since we can't construct a Logger directly, we reuse the same object
     // and differentiate by adding a dedicated plugin sink.
+    //
+    // Added before init(): the writer thread reads the sink list without
+    // synchronization, so add_sink() on a running logger races with it - the
+    // push_back can reallocate the vector under the writer's dispatch loop.
     auto plugin_sink = std::make_shared<slick::logger::FileSink>("test_set_instance_plugin.log", "plugin_sink");
     plugin_sink->set_dedicated(true); // dedicated: only receives direct writes, not LOG_* broadcasts
     slick::logger::Logger::instance().add_sink(plugin_sink);
+
+    slick::logger::Logger::instance().init(1024);
 
     // --- Simulate plugin redirect: set_instance points to the host logger ---
     // After this, LOG_* goes to host.log. plugin.log only receives direct writes.

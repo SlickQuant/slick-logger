@@ -36,7 +36,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 
 - **C++20 compatible compiler** with `std::format` support (GCC 11+, Clang 14+, MSVC 19.29+)
 - CMake 3.20 or higher (for building examples/tests)
-- slick-queue 2.3.0 or newer (the string ring uses its `items_per_slot` constructor, and multi-process logging relies on its shared-memory support). The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
+- slick-queue 2.3.0 or newer (the string ring uses its `items_per_slot` constructor, and multi-process logging relies on its shared-memory support, including 2.3.0's guarantee that a queue never unlinks its segment when destroyed). The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
 - Internet connection for downloading the slick-queue header when it is not already installed
 
 ## Installation
@@ -519,12 +519,13 @@ int main() {
     // This goes to dedicated.log only
     dedicated_sink->log_info("Direct message to dedicated sink");
 
-    // You can also make any sink dedicated
+    // Any sink can be made dedicated, but only while the logger is stopped:
+    // the writer thread reads the flag without synchronization
+    Logger::instance().shutdown(false);  // stop, keeping the sinks
     auto regular_sink = Logger::instance().get_sink("regular");
-    if (regular_sink) {
-        regular_sink->set_dedicated(true);  // Now it's dedicated too
-        regular_sink->log_warn("This goes to regular.log only");
-    }
+    regular_sink->set_dedicated(true);   // Now it's dedicated too
+    Logger::instance().init(8192);
+    regular_sink->log_warn("This goes to regular.log only");
 
     Logger::instance().shutdown();
     return 0;
@@ -629,6 +630,10 @@ Useful controls:
 - `reset()`: return the singleton to an uninitialized state; mainly intended for tests
 - `set_level()` / `get_level()`: update or read the global level filter
 - `clear_sinks()`: remove all currently registered sinks before reconfiguration
+
+Register sinks before `init()`, or between `shutdown()` and the next `init()`. The writer thread reads the sink list without locking, so `add_sink()`, the `add_*_sink()` helpers and `clear_sinks()` must not be called while the logger is running.
+
+Only two sink settings may change while the logger is running: `set_min_level()` and `set_pattern()`, which the writer thread reads atomically. `set_pattern()` must still be called from one thread at a time. Every other sink setting, such as `set_dedicated()` and `set_timestamp_format()`, is read by the writer thread without synchronization, so configure it while the logger is stopped.
 
 #### When entries reach disk
 
@@ -1092,11 +1097,6 @@ instance already wrote.
   on one segment writes each entry twice.
 - **`process_tag` is truncated to 15 bytes**, on a UTF-8 character boundary so a multi-byte tag is
   never cut mid-sequence.
-- **Re-initializing in a shared role is not free on POSIX.** Because a created segment is never
-  unlinked (see below), each `init()`/`shutdown()` cycle that *created* its segments retains one
-  more mapping for the life of the process. That suits the normal one-shot lifecycle; a process
-  that cycles the logger many times should attach to a segment created elsewhere, which is never
-  retained. Windows is unaffected.
 - **POSIX cleanup is manual, by design.** slick-logger never `shm_unlink`s a segment. Unlinking
   frees the *name* while existing mappings stay valid, so whichever process did it would strand
   everyone still attached: newcomers would create a fresh segment under the same name and their

@@ -443,6 +443,64 @@ TEST_F(SharedMemoryTest, CollectBacklogFalseSkipsEntriesAlreadyInTheRing) {
         << "collect_backlog = false still replayed the earlier entry:\n" << second;
 }
 
+#ifdef __linux__
+// shutdown() must release the mapping of a segment this process created, yet
+// leave the segment itself for anyone attached or yet to attach. Before
+// slick-queue 2.3.0 a creator's destructor unlinked its segment, so the logger
+// kept every queue it created alive until exit instead: each init()/shutdown()
+// cycle in a shared role leaked one more mapping.
+TEST_F(SharedMemoryTest, ShutdownUnmapsCreatedSegmentButKeepsItsName) {
+    const auto first_path = temp_log("test_shm_release_first.log");
+    const auto second_path = temp_log("test_shm_release_second.log");
+    const auto segment = unique_segment_name("slt_rl_");
+
+    // Matches the entry and string segments alike, "<segment>" and "<segment>_str".
+    auto mapped = [&] {
+        std::ifstream maps("/proc/self/maps");
+        const std::string needle = "/dev/shm/" + segment;
+        std::string line;
+        while (std::getline(maps, line)) {
+            if (line.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto make_config = [&](const std::filesystem::path& path) {
+        LogConfig config;
+        config.mode = QueueMode::SharedCollector;
+        config.shared_memory_name = segment;
+        config.log_queue_size = 1024;
+        config.string_buffer_size = 1 << 16;
+        config.sinks.push_back(std::make_shared<slick::logger::FileSink>(path));
+        return config;
+    };
+
+    // The first run creates both segments and logs into them.
+    Logger::instance().init(make_config(first_path));
+    ASSERT_TRUE(mapped());
+    LOG_INFO("entry from the creating run");
+    ASSERT_TRUE(wait_for([&] {
+        return read_all(first_path).find("entry from the creating run") != std::string::npos;
+    }));
+    Logger::instance().shutdown();
+    EXPECT_FALSE(mapped()) << "shutdown() kept the segments it created mapped";
+
+    // The name outlived the mapping: a second run attaches to the same segment
+    // and replays its backlog rather than creating an empty one.
+    Logger::instance().reset();
+    Logger::instance().init(make_config(second_path));
+    const bool replayed = wait_for([&] {
+        return read_all(second_path).find("entry from the creating run") != std::string::npos;
+    });
+    Logger::instance().shutdown();
+    EXPECT_TRUE(replayed) << "the segment did not survive its creator's shutdown:\n" << read_all(second_path);
+
+    slick::shm::shared_memory::remove(segment.c_str());
+    slick::shm::shared_memory::remove((segment + "_str").c_str());
+}
+#endif
+
 // Strings are copied into a ring whose reservation size is a 16-bit field, so an
 // over-long one must be truncated rather than overflowing the write cursor.
 TEST_F(SharedMemoryTest, OverlongStringsAreTruncatedNotCorrupting) {

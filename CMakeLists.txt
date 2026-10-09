@@ -21,8 +21,9 @@ option(SLICK_LOGGER_ENABLE_CPU_RELAX "Pause/yield before a producer retries a lo
 option(BUILD_SLICK_LOGGER_COLLECTOR "Build the standalone slick_log_collector executable" OFF)
 option(BUILD_SLICK_LOGGER_BENCHMARKS "Build performance benchmarks" OFF)
 
-# 2.1.0 or newer is required: the string ring is built with the items_per_slot
-# constructor introduced in slick-queue 2.1.0.
+# 2.3.0 or newer is required: the string ring is built with the items_per_slot
+# constructor (2.1.0), and Logger::shutdown() relies on a queue never unlinking
+# its shared-memory segment on destruction (2.3.0).
 find_package(slick-queue 2.3.0 CONFIG QUIET)
 
 if (NOT slick-queue_FOUND)
