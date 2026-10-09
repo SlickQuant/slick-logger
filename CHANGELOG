@@ -1,5 +1,10 @@
 # v2.2.1 - 10-08-2026
-Update slick-queue to v2.3.0
+A dependency update with no change to the logger's API or behaviour. A 2.2.1 process can share a segment with a 2.2.0 one.
+
+- **slick-queue 2.3.0 is now the minimum.** `find_package`, the tag `FetchContent` pulls, and the installed package's `find_dependency` all require it, so an older slick-queue fails at configure time
+  - 2.3.0 changes how slick-queue ends a shared-memory segment's life. On POSIX, the queue that created a segment used to `shm_unlink()` it when destroyed, and now no queue does. A new `remove_shm()` unlinks it on request
+  - slick-logger already kept its segments alive this way: it holds on to the handle of any segment it created until the process exits, so the old destructor never unlinked one. Multi-process logging therefore behaves exactly as in 2.2.0, and on POSIX segments still stay in `/dev/shm/` until you remove them (see the README's cleanup note)
+  - Neither 2.2.0 nor 2.3.0 changes slick-queue's segment layout
 
 # v2.2.0 - 09-28-2026
 The writer thread spends much less time per line: messages are formatted once per entry and their parse is cached, and pattern layouts render up to 28% faster. Two new build switches tune the queues. Code that calls `LOG_*` needs no changes, and a 2.2.0 process can share a segment with a 2.1.0 one.

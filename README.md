@@ -36,7 +36,7 @@ A high-performance, cross-platform **header-only** logging library for C++20 usi
 
 - **C++20 compatible compiler** with `std::format` support (GCC 11+, Clang 14+, MSVC 19.29+)
 - CMake 3.20 or higher (for building examples/tests)
-- slick-queue 2.1.0 or newer (the string ring uses its `items_per_slot` constructor, and multi-process logging relies on its shared-memory support). The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
+- slick-queue 2.3.0 or newer (the string ring uses its `items_per_slot` constructor, and multi-process logging relies on its shared-memory support). The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
 - Internet connection for downloading the slick-queue header when it is not already installed
 
 ## Installation
