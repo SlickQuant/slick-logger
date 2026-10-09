@@ -7,7 +7,32 @@
 [![CI](https://github.com/SlickQuant/slick-logger/actions/workflows/ci.yml/badge.svg)](https://github.com/SlickQuant/slick-logger/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/SlickQuant/slick-logger)](https://github.com/SlickQuant/slick-logger/releases)
 
-A high-performance, cross-platform **header-only** logging library for C++20 using a multi-producer, multi-consumer ring buffer with **multi-sink support**, **source-location logging**, **multi-process logging**, and **log rotation** capabilities.
+## Overview
+
+slick-logger is a **header-only C++20** logging library for Windows, Linux, and macOS. `LOG_*` calls enqueue entries in a ring buffer; a background writer formats them and sends them to console, file, or custom sinks. It also supports log rotation, binary payloads, and shared-memory logging across processes.
+
+## Benchmark Highlights
+
+Recorded on an AMD Ryzen 9 5900HX, Windows 11, MSVC 19.44 `/O2`, with log output on a local NVMe SSD (2026-09-22):
+
+| Producer-side measurement | Result |
+| --- | ---: |
+| Literal message, 1 producer | **7.67 million calls/sec** |
+| Literal message, 8 producers | **10.96 million calls/sec** |
+| Three-argument message, 8 producers | **5.10 million calls/sec** |
+| Mean call latency, literal message | **169 ns** |
+
+Call timings exclude the writer's drain and flush time; overloaded queues can overwrite entries. See the [full results, comparisons, and methodology](benchmarks/README.md#results) and [build/run instructions](benchmarks/README.md#building) to reproduce the measurements on your hardware.
+
+## Navigation
+
+- **Get started:** [Requirements](#requirements), [Installation](#installation), [Basic usage](#basic-usage)
+- **Configure logging:** [Advanced configuration](#advanced-configuration), [Lifecycle and runtime controls](#lifecycle-and-runtime-controls), [Log macros and levels](#log-macros-and-levels)
+- **Format output:** [String formatting](#string-formatting-with-stdformat), [Log patterns](#log-pattern-formatting), [Timestamps](#timestamp-formatting), [Source locations](#source-location-logging)
+- **Choose destinations:** [Sink types](#sink-types), [Custom sinks](#custom-sinks), [Binary logging](#binary-logging)
+- **Share the logger:** [Shared libraries](#sharing-the-logger-across-shared-libraries-plugin--strategy-pattern), [Multi-process logging](#multi-process-logging-shared-memory)
+- **Monitor and tune:** [Benchmark highlights](#benchmark-highlights), [Runtime statistics](#runtime-statistics), [Queue tuning](#queue-tuning), [Architecture](#architecture)
+- **Build and explore:** [Examples](#examples), [Building examples/tests](#building-examplestests)
 
 ## Features
 
