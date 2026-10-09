@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(slick-logger
-    VERSION 2.2.0
+    VERSION 2.2.1
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -23,7 +23,7 @@ option(BUILD_SLICK_LOGGER_BENCHMARKS "Build performance benchmarks" OFF)
 
 # 2.1.0 or newer is required: the string ring is built with the items_per_slot
 # constructor introduced in slick-queue 2.1.0.
-find_package(slick-queue 2.1.0 CONFIG QUIET)
+find_package(slick-queue 2.3.0 CONFIG QUIET)
 
 if (NOT slick-queue_FOUND)
     message(STATUS "Fetching slick-queue...")
@@ -34,7 +34,7 @@ if (NOT slick-queue_FOUND)
     FetchContent_Declare(
         slick-queue
         GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-        GIT_TAG v2.1.0
+        GIT_TAG v2.3.0
     )
     FetchContent_MakeAvailable(slick-queue)
 else()

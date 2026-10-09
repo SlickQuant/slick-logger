@@ -1,3 +1,6 @@
+# v2.2.1 - 10-08-2026
+Update slick-queue to v2.3.0
+
 # v2.2.0 - 09-28-2026
 The writer thread spends much less time per line: messages are formatted once per entry and their parse is cached, and pattern layouts render up to 28% faster. Two new build switches tune the queues. Code that calls `LOG_*` needs no changes, and a 2.2.0 process can share a segment with a 2.1.0 one.
 
