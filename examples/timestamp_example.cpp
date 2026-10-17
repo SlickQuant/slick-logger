@@ -1,4 +1,6 @@
+#include <atomic>
 #include <iostream>
+#include <memory>
 #include <slick/logger.hpp>
 #include <thread>
 #include <chrono>
@@ -107,7 +109,44 @@ int main() {
     std::cout << "  - millisecond_timestamps.log (milliseconds)\n";
     std::cout << "  - iso8601_timestamps.log (ISO8601 format)\n";
     std::cout << "  - custom_timestamps.log (YYYYMMDD_HHMMSS format)\n\n";
-    
+
+    // 8. Custom timestamper: changes where the time comes from, not how it is printed
+    std::cout << "8. Custom timestamper (simulated clock):\n";
+
+    // A stateful clock, e.g. the event time of a backtest replay
+    class ReplayClock : public ITimestamper {
+    public:
+        uint64_t now() noexcept override { return time_ns_.load(std::memory_order_relaxed); }
+        void advance_to(uint64_t time_ns) noexcept { time_ns_.store(time_ns, std::memory_order_relaxed); }
+    private:
+        std::atomic<uint64_t> time_ns_{0};
+    };
+
+    constexpr uint64_t kReplayStart = 1704067200000000000ULL;  // 2024-01-01 00:00:00 UTC, printed in local time
+    auto replay_clock = std::make_shared<ReplayClock>();
+    replay_clock->advance_to(kReplayStart);
+
+    Logger::instance().reset();
+    Logger::instance().add_console_sink();
+    Logger::instance().set_timestamper(replay_clock);
+    Logger::instance().init(8192);
+
+    LOG_INFO("Replayed event at the simulated time");
+    replay_clock->advance_to(kReplayStart + 1500000);  // +1.5 ms
+    LOG_INFO("Next replayed event, 1.5 ms later");
+
+    // A lambda with captures works too, without writing a class
+    std::atomic<uint64_t> ticks{0};
+    Logger::instance().set_timestamper([&ticks]() noexcept {
+        return kReplayStart + ticks.fetch_add(1000000, std::memory_order_relaxed);  // +1 ms per call
+    });
+    LOG_INFO("Stamped by a capturing lambda");
+    LOG_INFO("One millisecond later on the lambda's clock");
+
+    Logger::instance().shutdown();
+    Logger::instance().reset();  // back to std::chrono::system_clock
+    std::cout << "\n";
+
     std::cout << "Example complete! Check the log files to see different timestamp formats.\n";
     
     return 0;

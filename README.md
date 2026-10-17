@@ -28,7 +28,7 @@ Call timings exclude the writer's drain and flush time; overloaded queues can ov
 
 - **Get started:** [Requirements](#requirements), [Installation](#installation), [Basic usage](#basic-usage)
 - **Configure logging:** [Advanced configuration](#advanced-configuration), [Lifecycle and runtime controls](#lifecycle-and-runtime-controls), [Log macros and levels](#log-macros-and-levels)
-- **Format output:** [String formatting](#string-formatting-with-stdformat), [Log patterns](#log-pattern-formatting), [Timestamps](#timestamp-formatting), [Source locations](#source-location-logging)
+- **Format output:** [String formatting](#string-formatting-with-stdformat), [Log patterns](#log-pattern-formatting), [Timestamps](#timestamp-formatting), [Custom timestamper](#custom-timestamper), [Source locations](#source-location-logging)
 - **Choose destinations:** [Sink types](#sink-types), [Custom sinks](#custom-sinks), [Binary logging](#binary-logging)
 - **Share the logger:** [Shared libraries](#sharing-the-logger-across-shared-libraries-plugin--strategy-pattern), [Multi-process logging](#multi-process-logging-shared-memory)
 - **Monitor and tune:** [Benchmark highlights](#benchmark-highlights), [Runtime statistics](#runtime-statistics), [Queue tuning](#queue-tuning), [Architecture](#architecture)
@@ -43,7 +43,7 @@ Call timings exclude the writer's drain and flush time; overloaded queues can ov
 - **Colored Console Output**: ANSI color support with configurable error routing
 - **Customizable Log Pattern**: spdlog-style `set_pattern()` controls the whole line — field order, widths, column alignment, and which span gets colored — globally or per sink
 - **Source Locations by Default**: `LOG_*` macros include the call-site file and line, with runtime controls for basename vs full path
-- **Runtime Configuration**: Configure sinks, queue sizes, log level, source-location output, line patterns, and timestamp formats
+- **Runtime Configuration**: Configure sinks, queue sizes, log level, source-location output, line patterns, timestamp formats, and the clock entries are stamped with
 - **Macro Fast Path**: Disabled log levels skip argument evaluation before queueing, globally and per sink
 - **Direct Sink Logging**: Route messages to a named sink or a sink reference when a message should not be broadcast
 - **Binary Payloads**: Log raw bytes and write them to a file verbatim with `BinarySink`, encoding entirely under your control
@@ -655,6 +655,7 @@ int main() {
 - `stats_interval_ms`: how often a CSV row is appended and a snapshot published, default `1000`
 - `stats_sample_interval_ms`: how often the queue-fullness gauges are sampled between reports, default `10`
 - `stats_max_file_size`: roll the CSV to `<stem>.1.csv` at this size, default 16 MB; `0` disables rolling
+- `timestamper`: where entry timestamps come from; null keeps the current one, which is `std::chrono::system_clock` unless changed (see [Custom Timestamper](#custom-timestamper))
 
 #### Sizing the string ring
 
@@ -696,6 +697,7 @@ Useful controls:
 - `shutdown(clear_sinks = true)`: flush, stop the writer thread, and optionally clear sinks
 - `reset()`: return the singleton to an uninitialized state; mainly intended for tests
 - `set_level()` / `get_level()`: update or read the global level filter
+- `set_timestamper()`: change the clock entries are stamped with; safe while the logger is running (see [Custom Timestamper](#custom-timestamper))
 - `clear_sinks()`: remove all currently registered sinks before reconfiguration
 
 Register sinks before `init()`, or between `shutdown()` and the next `init()`. The writer thread reads the sink list without locking, so `add_sink()`, the `add_*_sink()` helpers and `clear_sinks()` must not be called while the logger is running.
@@ -981,6 +983,49 @@ The predefined formats are rendered by writing digits straight into a stack buff
 
 `strftime` itself is the floor, and it is why `Format::CUSTOM` still measures more than an order of magnitude slower per entry than the predefined formats. Measured on Windows/MSVC `/O2`, minimum of many runs, appending one timestamp to a buffer already sized for it: **25 ns** for `WITH_MICROSECONDS` against **590 ns** for `"%Y-%m-%d %H:%M:%S.%f"`. Prefer a predefined format, or the pattern flags above, on a hot logging path.
 
+### Custom Timestamper
+
+`TimestampFormatter` and the pattern flags decide how a time is *printed*. The timestamper decides which time is *recorded*: it is read once per entry, on the logging thread, and stored in `LogEntry::timestamp`. It defaults to `std::chrono::system_clock`. Replace it to stamp entries with a cheaper clock (a calibrated TSC), a simulated one (a backtest replaying historical events), or a fixed one in tests.
+
+```cpp
+using namespace slick::logger;
+
+// 1. Derive from ITimestamper for a stateful clock
+class ReplayClock : public ITimestamper {
+public:
+    uint64_t now() noexcept override { return time_ns_.load(std::memory_order_relaxed); }
+    void advance_to(uint64_t ns) noexcept { time_ns_.store(ns, std::memory_order_relaxed); }
+private:
+    std::atomic<uint64_t> time_ns_{0};
+};
+auto replay = std::make_shared<ReplayClock>();
+Logger::instance().set_timestamper(replay);
+
+// 2. Or pass any callable - a lambda with captures, a function, a function pointer
+Logger::instance().set_timestamper([&feed]() noexcept { return feed.event_time_ns(); });
+
+// 3. Or name a std::chrono-style clock type (any type with a static now())
+Logger::instance().set_timestamper<MyTscClock>();
+
+// Or through LogConfig, applied by init() before its first entry
+LogConfig config;
+config.timestamper = replay;
+
+// nullptr goes back to std::chrono::system_clock
+Logger::instance().set_timestamper(nullptr);
+```
+
+The contract:
+
+- **`now()` returns nanoseconds since the Unix epoch**, which is what `LogEntry::timestamp` holds and what the formatters render. A clock on another epoch still works, but prints the wrong date: `steady_clock` counts from boot, so its lines show 1970, and `utc_clock` counts leap seconds, so its lines run ahead of the wall clock.
+- **It must be thread-safe.** Every logging thread calls it concurrently, and so does the statistics thread: `LogStats::timestamp_ns` comes from the same timestamper, so statistics rows line up with the log.
+- **It must not throw.** `now()` is `noexcept`; a wrapped callable that throws terminates the program.
+- **It is on the hot path**, so its cost is added to every log call. On Windows/MSVC `/O2` (minimum of 40 rounds), reading `system_clock` costs about **52 ns**, a timestamper returning a stored value about **3.5 ns**, and the default path's dispatch adds under 1 ns to `system_clock` itself.
+
+`set_timestamper()` is safe while the logger is running. Logging threads read the timestamper through one atomic pointer, so a swap takes no lock and blocks no one. A thread caught mid-call finishes that one entry on the previous timestamper, which is why a replaced timestamper is kept alive until `reset()` instead of being destroyed on the spot. As with `set_pattern()`, call it from one thread at a time.
+
+The timestamper survives `shutdown()`, and `init(config)` with a null `config.timestamper` keeps the current one, the same rule as an empty `config.pattern`; `reset()` restores `system_clock`. In shared-memory mode each producer process stamps its entries with its own timestamper. `DailyFileSink` still picks the date in its file name from the wall clock.
+
 ### Sharing the Logger Across Shared Libraries (Plugin / Strategy Pattern)
 
 Because slick-logger is header-only, each binary (EXE or `.dll`/`.so`) that includes `logger.hpp` gets its own `Logger` instance. This means `LOG_*` calls inside a dynamically-loaded plugin will not appear in the host application's log file by default.
@@ -1030,6 +1075,8 @@ extern "C" void strategy_shutdown() {
 > **Unload ordering — important:** `LOG_*` with string literals stores a raw pointer to the format string, which lives in the plugin's code segment. The host must call `Logger::instance().flush()` **before** calling `FreeLibrary`/`dlclose`. `flush()` blocks until the writer thread has consumed all queued entries, then returns with the logger still running so host logging can continue normally. Using `shutdown()` instead would stop the logger entirely.
 
 > **Multiple plugins:** Each shared library (`.dll`/`.so`) holds its own copy of `override_instance_`. All plugins can independently call `set_instance()` with the same host logger — the host logger's lock-free queue is designed for concurrent producers.
+
+> **Same version on both sides:** a plugin's `LOG_*` calls are compiled into the plugin but operate on the host's `Logger` object, so the plugin and the host must be built from the same slick-logger version, with the same `SLICK_LOGGER_MAX_ARGS`, `SLICK_LOGGER_TAG_SIZE`, `SLICK_LOGGER_ENABLE_THREAD_ID`, `SLICK_LOGGER_ENABLE_LOSS_DETECTION` and `SLICK_LOGGER_ENABLE_CPU_RELAX`. A mismatch in the `Logger` layout is not detected; it is undefined behavior. The host's settings, such as its level, pattern and [timestamper](#custom-timestamper), apply to the plugin's entries too.
 
 ### Multi-Process Logging (Shared Memory)
 
@@ -1156,6 +1203,9 @@ instance already wrote.
   `SLICK_LOGGER_ENABLE_LOSS_DETECTION` to count lost entries.
 - **Pointer arguments** (`ArgType::PTR`) print addresses that are only meaningful inside the
   producing process.
+- **Each process stamps its own entries.** A producer's entries carry the time from *its*
+  [timestamper](#custom-timestamper), not the collector's, so give every process a clock on the
+  same epoch.
 - **Sink indices** used by `log_to_sink()` and `ISink::log()` are resolved against the
   *collector's* sink list.
 - **A producer killed between reserve and publish** leaves a hole. The collector abandons it
@@ -1467,7 +1517,7 @@ The repository includes comprehensive examples:
 
 - **`logger_example.exe`**: Basic usage with console + file output
 - **`multi_sink_example.exe`**: Demonstrates all sink types, rotation, and custom sinks
-- **`timestamp_example.exe`**: Demonstrates predefined and custom timestamp formats
+- **`timestamp_example.exe`**: Demonstrates predefined and custom timestamp formats, and a custom timestamper
 - **`multi_process_example.exe`**: Collector and producer roles logging across process boundaries
 - **`binary_sink_example.exe`**: Raw binary capture, custom framing, and the `LOG_SINK_*` fast path
 - **`statistics_example.exe`**: Live throughput, queue-fullness peaks, and the statistics CSV under load

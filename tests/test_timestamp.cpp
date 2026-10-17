@@ -418,3 +418,304 @@ TEST_F(TimestampTest, CustomFormatIsRenderedWhateverItsLength) {
     EXPECT_EQ(TimestampFormatter(std::string{}).format_timestamp(ts),
               TimestampFormatter(TimestampFormatter::Format::DEFAULT).format_timestamp(ts));
 }
+
+// ------------------------------------------------------------------ timestamper
+
+namespace {
+
+constexpr uint64_t kFixedTimestamp = 1693038674123456789ULL;
+constexpr const char* kTimestamperLog = "test_timestamper.log";
+
+uint64_t system_now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+/// Records the timestamp of every entry it is handed. Written on the writer
+/// thread only, and read after flush() or shutdown(), which order the two.
+class TimestampCaptureSink : public ISink {
+public:
+    TimestampCaptureSink() : ISink("timestamp_capture") {}
+    void write(const LogEntry& entry) override { stamps_.push_back(entry.timestamp); }
+    void flush() override {}
+    const std::vector<uint64_t>& stamps() const noexcept { return stamps_; }
+
+private:
+    std::vector<uint64_t> stamps_;
+};
+
+class FixedTimestamper : public ITimestamper {
+public:
+    explicit FixedTimestamper(uint64_t value) : value_(value) {}
+    uint64_t now() noexcept override { return value_; }
+
+private:
+    uint64_t value_;
+};
+
+/// Calls a LingeringTimestamper served after its destructor had already run.
+std::atomic<int> g_calls_after_destruction{0};
+
+/// A fixed timestamper that notices being called once destroyed. now() yields
+/// between reading its value and checking it is still alive, which widens the
+/// window in which a swap racing the call could free it from under the caller.
+class LingeringTimestamper : public ITimestamper {
+public:
+    explicit LingeringTimestamper(uint64_t value) : value_(value) {}
+    ~LingeringTimestamper() override { alive_.store(false, std::memory_order_relaxed); }
+
+    uint64_t now() noexcept override {
+        const uint64_t value = value_;
+        std::this_thread::yield();
+        if (!alive_.load(std::memory_order_relaxed)) {
+            g_calls_after_destruction.fetch_add(1, std::memory_order_relaxed);
+        }
+        return value;
+    }
+
+private:
+    uint64_t value_;
+    std::atomic<bool> alive_{true};
+};
+
+/// A chrono-style clock frozen at kFixedTimestamp, in microseconds so the
+/// adapter's conversion to nanoseconds is exercised too.
+struct FrozenMicrosecondClock {
+    using duration = std::chrono::microseconds;
+    using rep = duration::rep;
+    using period = duration::period;
+    using time_point = std::chrono::time_point<FrozenMicrosecondClock>;
+    static constexpr bool is_steady = true;
+    static time_point now() noexcept {
+        return time_point{duration{static_cast<rep>(kFixedTimestamp / 1000)}};
+    }
+};
+
+} // namespace
+
+class TimestamperTest : public ::testing::Test {
+protected:
+    void SetUp() override { Logger::instance().reset(); }
+
+    void TearDown() override {
+        Logger::instance().reset();
+        std::filesystem::remove(kTimestamperLog);
+    }
+
+    /// Start the logger on a fresh capture sink. The banner init() logs is
+    /// captured as well, so every test sees at least one stamp.
+    std::shared_ptr<TimestampCaptureSink> start(LogConfig config = {}) {
+        auto sink = std::make_shared<TimestampCaptureSink>();
+        config.sinks.push_back(sink);
+        Logger::instance().init(config);
+        return sink;
+    }
+
+    static void expect_all_equal(const std::vector<uint64_t>& stamps, uint64_t expected) {
+        ASSERT_FALSE(stamps.empty());
+        for (const uint64_t stamp : stamps) {
+            EXPECT_EQ(stamp, expected);
+        }
+    }
+};
+
+TEST_F(TimestamperTest, DefaultIsSystemClock) {
+    EXPECT_EQ(Logger::instance().timestamper(), nullptr);
+
+    const uint64_t before = system_now_ns();
+    auto sink = start();
+    LOG_INFO("default clock");
+    Logger::instance().flush();
+    const uint64_t after = system_now_ns();
+
+    ASSERT_FALSE(sink->stamps().empty());
+    for (const uint64_t stamp : sink->stamps()) {
+        EXPECT_GE(stamp, before);
+        EXPECT_LE(stamp, after);
+    }
+    EXPECT_GE(Logger::instance().current_timestamp(), after);
+}
+
+TEST_F(TimestamperTest, DerivedTimestamperStampsEveryEntry) {
+    Logger::instance().set_timestamper(std::make_shared<FixedTimestamper>(kFixedTimestamp));
+    EXPECT_EQ(Logger::instance().current_timestamp(), kFixedTimestamp);
+
+    auto sink = std::make_shared<TimestampCaptureSink>();
+    LogConfig config;
+    config.sinks.push_back(sink);
+    config.sinks.push_back(std::make_shared<FileSink>(kTimestamperLog));
+    Logger::instance().init(config);
+    LOG_INFO("fixed clock");
+    Logger::instance().shutdown();
+
+    ASSERT_EQ(sink->stamps().size(), 2u); // the init() banner and the message
+    expect_all_equal(sink->stamps(), kFixedTimestamp);
+
+    // End to end: the rendered line carries the configured time, not the wall clock.
+    const std::string expected =
+        TimestampFormatter(TimestampFormatter::Format::WITH_MICROSECONDS).format_timestamp(kFixedTimestamp);
+    std::ifstream in(kTimestamperLog);
+    std::string line;
+    size_t lines = 0;
+    while (std::getline(in, line)) {
+        ++lines;
+        EXPECT_EQ(line.rfind(expected, 0), 0u) << line;
+    }
+    EXPECT_EQ(lines, 2u);
+}
+
+TEST_F(TimestamperTest, CapturingLambdaStampsEntries) {
+    std::atomic<uint64_t> ticks{0};
+    Logger::instance().set_timestamper([&ticks]() noexcept {
+        return kFixedTimestamp + ticks.fetch_add(1, std::memory_order_relaxed);
+    });
+    ASSERT_NE(Logger::instance().timestamper(), nullptr);
+
+    auto sink = start();
+    for (int i = 0; i < 10; ++i) {
+        LOG_INFO("tick {}", i);
+    }
+    // Stopped before ticks goes out of scope; reset() in TearDown frees the lambda.
+    Logger::instance().shutdown();
+
+    // One producing thread, so the stamps reach the sink in the order taken.
+    ASSERT_EQ(sink->stamps().size(), 11u);
+    for (size_t i = 0; i < sink->stamps().size(); ++i) {
+        EXPECT_EQ(sink->stamps()[i], kFixedTimestamp + i);
+    }
+}
+
+TEST_F(TimestamperTest, ChronoClockType) {
+    Logger::instance().set_timestamper<FrozenMicrosecondClock>();
+    const uint64_t expected = kFixedTimestamp / 1000 * 1000;
+    EXPECT_EQ(Logger::instance().current_timestamp(), expected);
+
+    auto sink = start();
+    LOG_INFO("frozen clock");
+    Logger::instance().flush();
+    expect_all_equal(sink->stamps(), expected);
+}
+
+TEST_F(TimestamperTest, NullRestoresSystemClock) {
+    Logger::instance().set_timestamper(std::make_shared<FixedTimestamper>(kFixedTimestamp));
+    ASSERT_EQ(Logger::instance().current_timestamp(), kFixedTimestamp);
+
+    Logger::instance().set_timestamper(nullptr);
+    EXPECT_EQ(Logger::instance().timestamper(), nullptr);
+
+    const uint64_t before = system_now_ns();
+    const uint64_t now = Logger::instance().current_timestamp();
+    EXPECT_GE(now, before);
+    EXPECT_LE(now, system_now_ns());
+}
+
+TEST_F(TimestamperTest, LogConfigTimestamperAppliesAndPersists) {
+    auto fixed = std::make_shared<FixedTimestamper>(kFixedTimestamp);
+    LogConfig config;
+    config.timestamper = fixed;
+    auto sink = start(config);
+    EXPECT_EQ(Logger::instance().timestamper(), fixed);
+    LOG_INFO("configured");
+    Logger::instance().flush();
+    // The banner too: init() installs the timestamper before it starts logging.
+    expect_all_equal(sink->stamps(), kFixedTimestamp);
+
+    // A config without one keeps the current timestamper, as an empty pattern does.
+    auto second = start();
+    EXPECT_EQ(Logger::instance().timestamper(), fixed);
+    LOG_INFO("still configured");
+    Logger::instance().flush();
+    expect_all_equal(second->stamps(), kFixedTimestamp);
+
+    // reset() is what goes back to system_clock.
+    Logger::instance().reset();
+    EXPECT_EQ(Logger::instance().timestamper(), nullptr);
+    EXPECT_NE(Logger::instance().current_timestamp(), kFixedTimestamp);
+}
+
+TEST_F(TimestamperTest, LogConfigKeepsPositionalInitializerOrder) {
+    // LogConfig is an aggregate, so a positional initializer written against a
+    // release without timestamper must still compile and mean the same thing.
+    // Inserting the new member anywhere but last shifts every value after it:
+    // mode would land on a shared_ptr and this would not compile at all.
+    auto fixed = std::make_shared<FixedTimestamper>(kFixedTimestamp);
+    const LogConfig config{
+        {},                          // sinks
+        LogLevel::L_WARN,            // min_level
+        1024,                        // log_queue_size
+        4096,                        // string_buffer_size
+        16,                          // string_items_per_slot
+        false,                       // include_source_location
+        QueueMode::SharedCollector,  // mode
+        "segment",                   // shared_memory_name
+        "tag",                       // process_tag
+        false,                       // collect_backlog
+        250,                         // stalled_entry_timeout_ms
+        "%v",                        // pattern
+        true,                        // enable_stats
+        "stats.csv",                 // stats_file
+        500,                         // stats_interval_ms
+        5,                           // stats_sample_interval_ms
+        2048,                        // stats_max_file_size
+        fixed,                       // timestamper, the newest member
+    };
+
+    EXPECT_TRUE(config.sinks.empty());
+    EXPECT_EQ(config.min_level, LogLevel::L_WARN);
+    EXPECT_EQ(config.log_queue_size, 1024u);
+    EXPECT_EQ(config.string_buffer_size, 4096u);
+    EXPECT_EQ(config.string_items_per_slot, 16u);
+    EXPECT_FALSE(config.include_source_location);
+    EXPECT_EQ(config.mode, QueueMode::SharedCollector);
+    EXPECT_EQ(config.shared_memory_name, "segment");
+    EXPECT_EQ(config.process_tag, "tag");
+    EXPECT_FALSE(config.collect_backlog);
+    EXPECT_EQ(config.stalled_entry_timeout_ms, 250u);
+    EXPECT_EQ(config.pattern, "%v");
+    EXPECT_TRUE(config.enable_stats);
+    EXPECT_EQ(config.stats_file, std::filesystem::path("stats.csv"));
+    EXPECT_EQ(config.stats_interval_ms, 500u);
+    EXPECT_EQ(config.stats_sample_interval_ms, 5u);
+    EXPECT_EQ(config.stats_max_file_size, 2048u);
+    EXPECT_EQ(config.timestamper, fixed);
+}
+
+TEST_F(TimestamperTest, SwapWhileLoggingIsSafe) {
+    constexpr uint64_t kA = kFixedTimestamp;
+    constexpr uint64_t kB = kFixedTimestamp + 1000;
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 2000;
+
+    g_calls_after_destruction.store(0, std::memory_order_relaxed);
+    Logger::instance().set_timestamper(std::make_shared<LingeringTimestamper>(kA));
+    auto sink = start();
+
+    std::atomic<int> producing{kThreads};
+    std::vector<std::thread> producers;
+    for (int t = 0; t < kThreads; ++t) {
+        producers.emplace_back([&producing] {
+            for (int i = 0; i < kPerThread; ++i) {
+                LOG_INFO("swap {}", i);
+            }
+            producing.fetch_sub(1, std::memory_order_relaxed);
+        });
+    }
+    // A fresh object every swap, and the main thread keeps no reference to it:
+    // a replaced timestamper freed on the spot would be a use-after-free here.
+    uint64_t swaps = 0;
+    do {
+        Logger::instance().set_timestamper(
+            std::make_shared<LingeringTimestamper>((swaps++ & 1) ? kB : kA));
+    } while (producing.load(std::memory_order_relaxed) > 0);
+    for (auto& producer : producers) {
+        producer.join();
+    }
+    Logger::instance().flush();
+
+    EXPECT_GT(swaps, 0u);
+    EXPECT_EQ(g_calls_after_destruction.load(std::memory_order_relaxed), 0);
+    ASSERT_EQ(sink->stamps().size(), static_cast<size_t>(kThreads * kPerThread + 1));
+    for (const uint64_t stamp : sink->stamps()) {
+        EXPECT_TRUE(stamp == kA || stamp == kB) << stamp;
+    }
+}

@@ -118,9 +118,9 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void
 #endif
 
 #define SLICK_LOGGER_VERSION_MAJOR 2
-#define SLICK_LOGGER_VERSION_MINOR 2
-#define SLICK_LOGGER_VERSION_PATCH 1
-#define SLICK_LOGGER_VERSION "2.2.1"
+#define SLICK_LOGGER_VERSION_MINOR 3
+#define SLICK_LOGGER_VERSION_PATCH 0
+#define SLICK_LOGGER_VERSION "2.3.0"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20
@@ -2073,8 +2073,9 @@ protected:
 struct LogStats {
     // ---- Sample identity ----
 
-    /// Wall-clock time of the sample, in nanoseconds since the epoch. Same clock
-    /// and epoch as LogEntry::timestamp, so it lines up with the log itself.
+    /// Time of the sample, in nanoseconds since the epoch. Read from the logger's
+    /// timestamper (system_clock by default), the same clock as
+    /// LogEntry::timestamp, so it lines up with the log itself.
     uint64_t timestamp_ns = 0;
     /// Measured seconds since the previous sample; 0.0 on the first one. Rates
     /// below divide by this rather than by the configured interval, so a late
@@ -2168,6 +2169,51 @@ struct LogStats {
 };
 
 /**
+ * @brief Source of the time stamped on every log entry
+ *
+ * now() returns nanoseconds since the Unix epoch, which is what
+ * LogEntry::timestamp holds and what TimestampFormatter and the pattern flags
+ * render as a wall-clock time. A timestamper on another epoch still works, but
+ * its entries then render as times counted from 1970.
+ *
+ * It is called on every logging thread at once, and on the statistics thread,
+ * so it must be thread-safe, and it sits on the logging hot path, so it should
+ * be cheap. Derive from it for a stateful clock (a calibrated TSC, a simulated
+ * clock in a backtest), or pass a lambda or a chrono clock type straight to
+ * Logger::set_timestamper() without writing a class at all.
+ */
+class ITimestamper {
+public:
+    virtual ~ITimestamper() = default;
+    /// The current time, in nanoseconds since the Unix epoch.
+    virtual uint64_t now() noexcept = 0;
+};
+
+namespace detail {
+
+/// Nanoseconds since @p Clock's epoch. With std::chrono::system_clock this is
+/// the logger's default timestamp.
+template<typename Clock>
+inline uint64_t clock_timestamp() noexcept {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Clock::now().time_since_epoch()).count());
+}
+
+/// Adapts any callable - a lambda with captures, a function, a function pointer -
+/// to ITimestamper. now() is noexcept, so a callable that throws terminates.
+template<typename F>
+class callable_timestamper final : public ITimestamper {
+public:
+    explicit callable_timestamper(F f) : f_(std::move(f)) {}
+    uint64_t now() noexcept override { return static_cast<uint64_t>(f_()); }
+
+private:
+    F f_;
+};
+
+} // namespace detail
+
+/**
  * @brief Configuration struct for initializing the logger
  */
 struct LogConfig {
@@ -2250,6 +2296,20 @@ struct LogConfig {
     /// Roll the CSV to "<stem>.1.csv" once it reaches this size, so a long-running
     /// process cannot fill a disk. Zero lets it grow without bound.
     size_t stats_max_file_size = 16 * 1024 * 1024;
+
+    // ---- Timestamps ----
+    // New members go at the end: LogConfig is an aggregate, so inserting one
+    // earlier would silently shift every positional initializer written against
+    // an older release.
+
+    /// Where entry timestamps come from. See ITimestamper and
+    /// Logger::set_timestamper().
+    ///
+    /// Null means "do not change the current timestamper", the same rule as
+    /// pattern above, so `set_timestamper(t)` followed by `init(config)` keeps
+    /// `t`. On a logger that has never been given one - including one just past
+    /// reset() - that amounts to std::chrono::system_clock.
+    std::shared_ptr<ITimestamper> timestamper;
 };
 
 /**
@@ -2442,6 +2502,87 @@ public:
     std::string_view pattern() const noexcept {
         return default_pattern_ ? std::string_view{default_pattern_->pattern()}
                                 : std::string_view{};
+    }
+
+    /**
+     * @brief Replace the source of entry timestamps
+     * @param timestamper The new source; null restores std::chrono::system_clock
+     *
+     * Safe to call while the logger is running: logging threads read the
+     * timestamper through one atomic pointer, so a swap takes no lock and
+     * blocks no one. A thread caught mid-call keeps using the previous
+     * timestamper for that one entry, which is why a replaced timestamper is
+     * kept alive until reset() rather than freed here.
+     *
+     * Like set_pattern(), call it from one thread at a time.
+     *
+     * @code
+     * class SimClock : public ITimestamper {
+     * public:
+     *     uint64_t now() noexcept override { return sim_time_ns_.load(std::memory_order_relaxed); }
+     *     std::atomic<uint64_t> sim_time_ns_{0};
+     * };
+     * Logger::instance().set_timestamper(std::make_shared<SimClock>());
+     * @endcode
+     */
+    void set_timestamper(std::shared_ptr<ITimestamper> timestamper);
+
+    /**
+     * @brief Use a callable as the source of entry timestamps
+     * @param fn Called with no arguments; returns nanoseconds since the Unix epoch
+     *
+     * Takes a lambda with captures, a function or a function pointer, so a
+     * stateful clock needs no class of its own. The same rules as the
+     * ITimestamper overload apply, and fn must not throw.
+     *
+     * @code
+     * Logger::instance().set_timestamper([&sim]() noexcept { return sim.now_ns(); });
+     * @endcode
+     */
+    template<typename F>
+        requires std::is_invocable_r_v<uint64_t, std::decay_t<F>&>
+    void set_timestamper(F&& fn) {
+        set_timestamper(std::make_shared<detail::callable_timestamper<std::decay_t<F>>>(
+            std::forward<F>(fn)));
+    }
+
+    /**
+     * @brief Use a std::chrono-style clock as the source of entry timestamps
+     *
+     * Any type with a static now() returning a time_point works, such as a TSC
+     * clock of your own. Mind its epoch: entries are rendered as time since the
+     * Unix epoch, so std::chrono::steady_clock (which counts from boot) prints
+     * dates in 1970, and std::chrono::utc_clock (which counts leap seconds)
+     * prints times that run ahead of the wall clock.
+     *
+     * @code
+     * Logger::instance().set_timestamper<MyTscClock>();
+     * @endcode
+     */
+    template<typename Clock>
+        requires requires { Clock::now().time_since_epoch(); }
+    void set_timestamper() {
+        set_timestamper([]() noexcept { return detail::clock_timestamp<Clock>(); });
+    }
+
+    /// The timestamper in use, or null while the system_clock default is.
+    std::shared_ptr<ITimestamper> timestamper() const noexcept { return timestamper_; }
+
+    /**
+     * @brief The current time on the clock entries are stamped with
+     * @return Nanoseconds since the Unix epoch, from the active timestamper
+     *
+     * What the next log entry would be stamped with, so a caller can compare
+     * against LogEntry::timestamp and LogStats::timestamp_ns.
+     */
+    uint64_t current_timestamp() const noexcept {
+        // Acquire pairs with the release in set_timestamper(), so whatever the
+        // timestamper set up before it was installed is visible here. On x86
+        // this is a plain load; the default path then costs one predictable
+        // branch and calls system_clock directly, with no virtual call.
+        ITimestamper* const timestamper = active_timestamper_.load(std::memory_order_acquire);
+        return timestamper ? timestamper->now()
+                           : detail::clock_timestamp<std::chrono::system_clock>();
     }
 
     /**
@@ -2825,6 +2966,17 @@ private:
     /// that inherits one, so the store outlives this logger if a sink does.
     std::shared_ptr<detail::pattern_store> pattern_store_ =
         std::make_shared<detail::pattern_store>();
+    /// The only timestamper state a logging thread touches: a raw pointer into
+    /// timestamper_, or null for the system_clock default. See current_timestamp().
+    std::atomic<ITimestamper*> active_timestamper_{nullptr};
+    /// Owns what active_timestamper_ points at. Control-plane only.
+    std::shared_ptr<ITimestamper> timestamper_;
+    /// Every timestamper replaced since the last reset(). A logging thread may
+    /// have loaded the old pointer just before a swap and still be inside its
+    /// now(), and nothing tells the swapping thread when it is done - so like
+    /// pattern_store_, nothing handed out is freed while the logger may use it.
+    /// Swaps are rare, so this stays tiny.
+    std::vector<std::shared_ptr<ITimestamper>> retired_timestampers_;
 
     // ---- Multi-process state; all inert while mode_ is Local ----
     QueueMode mode_ = QueueMode::Local;
@@ -5274,9 +5426,8 @@ inline bool Logger::sample_string_occupancy(LogStats& stats) noexcept {
 }
 inline LogStats Logger::sample_stats() noexcept {
     LogStats stats;
-    const auto now = std::chrono::system_clock::now();
-    stats.timestamp_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    // The entries' own clock, so a sample lines up with the lines it describes.
+    stats.timestamp_ns = current_timestamp();
     stats.sample_count = stats_sample_count_;
 
     if (!log_queue_ || !string_queue_) {
@@ -5649,6 +5800,11 @@ inline void Logger::init(const LogConfig& config) {
     if (!config.pattern.empty()) {
         set_pattern(config.pattern);
     }
+    // Before start(), so even its version banner carries the configured time.
+    // Null leaves an earlier set_timestamper() alone, as with the pattern above.
+    if (config.timestamper) {
+        set_timestamper(config.timestamper);
+    }
 
     for (auto& sink : config.sinks) {
         add_sink(sink);
@@ -5816,6 +5972,24 @@ inline void Logger::set_pattern(std::string_view pattern) {
             sink->apply_default_pattern(pattern_store_, compiled);
         }
     }
+}
+
+inline void Logger::set_timestamper(std::shared_ptr<ITimestamper> timestamper) {
+    if (timestamper == timestamper_) {
+        return;
+    }
+    // Room first: push_back is the only step that can throw, and doing it before
+    // the swap means a failure leaves the old timestamper fully in place.
+    if (timestamper_) {
+        retired_timestampers_.reserve(retired_timestampers_.size() + 1);
+    }
+    // Release so the new timestamper's own state is visible to every thread
+    // that loads the pointer, see current_timestamp().
+    active_timestamper_.store(timestamper.get(), std::memory_order_release);
+    if (timestamper_) {
+        retired_timestampers_.push_back(std::move(timestamper_));
+    }
+    timestamper_ = std::move(timestamper);
 }
 
 inline void Logger::release_sinks() {
@@ -5988,8 +6162,7 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
         return;
     }
 
-    auto now = std::chrono::system_clock::now();
-    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    const uint64_t timestamp = current_timestamp();
 
     // In shared-memory mode every string reference must be a ring index, because
     // the segment maps at a different base address in each attached process.
@@ -5997,7 +6170,7 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
 
     LogEntry entry;
     entry.level = level;
-    entry.timestamp = ns;
+    entry.timestamp = timestamp;
     entry.flags = entry_flags_;
     entry.pid = pid_;
 #if SLICK_LOGGER_ENABLE_THREAD_ID
@@ -6375,6 +6548,12 @@ inline void Logger::reset() {
     // pattern surviving reset() would silently reappear on sinks registered by
     // the next init() - exactly the cross-contamination reset() exists to avoid.
     default_pattern_ = nullptr;
+    // Back to system_clock, for the same reason. Only here, never in shutdown():
+    // the retired ones may be freed now because reset(), like the rest of this
+    // function, presumes no thread is still logging.
+    active_timestamper_.store(nullptr, std::memory_order_relaxed);
+    timestamper_.reset();
+    retired_timestampers_.clear();
 
     // shutdown() has joined the writer thread, so nothing else can be touching the
     // wake and flush state by now. None of this is required for correctness: the

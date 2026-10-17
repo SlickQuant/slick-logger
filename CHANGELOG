@@ -1,3 +1,18 @@
+# v2.3.0 - 10-17-2026
+Entries can now be stamped by a clock of your choice instead of always `std::chrono::system_clock`: a calibrated TSC, a backtest's simulated time, or a fixed clock in tests. Code that calls `LOG_*` needs no changes, the default output is unchanged, and a 2.3.0 process can share a segment with a 2.2.x one.
+
+- **Configurable timestamper.** The new `ITimestamper` interface (`uint64_t now() noexcept`, returning nanoseconds since the Unix epoch) decides the time stored in `LogEntry::timestamp`. `TimestampFormatter` and the pattern flags still decide how that time is printed
+  - Three ways to set one: derive from `ITimestamper` and pass it to `Logger::set_timestamper()`; pass any callable, including a lambda with captures; or name a chrono-style clock type with `set_timestamper<Clock>()`. `LogConfig::timestamper` sets it at `init()`, before the version banner is logged
+  - `set_timestamper(nullptr)` and `reset()` go back to `system_clock`. A null `LogConfig::timestamper` keeps the current one, the same rule as an empty `LogConfig::pattern`, and `shutdown()` leaves it alone
+  - `timestamper()` returns the one in use (null while the default is), and `current_timestamp()` reads the logger's clock directly
+- **Safe to swap while logging.** Logging threads read the timestamper through one atomic pointer, so `set_timestamper()` takes no lock and blocks no one. A replaced timestamper is kept alive until `reset()`, because a thread may still be inside its `now()`. As with `set_pattern()`, call it from one thread at a time
+- **Cost.** The timestamper runs on every log call, on every logging thread, so it must be cheap and thread-safe, and it must not throw: `now()` is `noexcept`, so a throwing callable terminates the program. Measured on Windows/MSVC `/O2` (minimum of 40 rounds), the default path adds under 1 ns to the ~52 ns `system_clock` read it wraps, and a timestamper returning a stored value costs about 3.5 ns
+- **`LogStats::timestamp_ns` follows the timestamper**, so statistics rows keep lining up with the log lines they describe. `DailyFileSink` still takes the date in its file name from the wall clock
+- **Compatibility.** `LogEntry` is unchanged, so 2.3.0 and 2.2.x processes can share a segment; each producer stamps its entries with its own timestamper. `Logger` itself gained members, so a plugin that routes its `LOG_*` calls to the host through `set_instance()` must be rebuilt against the same version as the host
+  - `timestamper` is the last member of `LogConfig`, so positional (aggregate) initializers written for 2.2.x keep compiling and keep their meaning. A test pins the member order
+- **Documentation and CI.** The README opens with an overview, navigation and benchmark highlights, and its installation section now leads with vcpkg. A new CI job builds and runs the README's vcpkg example in both classic and manifest mode
+- New tests cover each way to set a timestamper, `LogConfig` handling, the statistics timestamp, and swapping the timestamper while four threads log
+
 # v2.2.1 - 10-08-2026
 Updates slick-queue to 2.3.0, which lets `shutdown()` unmap the shared-memory segments it created rather than keeping them mapped until the process exits. The segments themselves persist as before. The API is unchanged, and a 2.2.1 process can share a segment with a 2.2.0 one.
 

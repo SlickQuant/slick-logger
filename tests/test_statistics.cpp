@@ -260,6 +260,17 @@ TEST_F(SlickLoggerStatsTest, LossCountIsReadableAndZeroByDefault) {
     EXPECT_EQ(stats.string_loss_count, 0u);
 }
 
+TEST_F(SlickLoggerStatsTest, SampleTimestampFollowsTimestamper) {
+    // LogStats::timestamp_ns promises the entries' own clock, so a custom
+    // timestamper has to reach the sample too, not just the log lines.
+    constexpr uint64_t kFixed = 1693038674123456789ULL;
+    Logger::instance().set_timestamper([]() noexcept { return kFixed; });
+    Logger::instance().init(make_config(20, 2, false));
+    LOG_INFO("stamped on a fixed clock");
+
+    EXPECT_EQ(wait_for_sample().timestamp_ns, kFixed);
+}
+
 TEST_F(SlickLoggerStatsTest, ResetClearsStats) {
     Logger::instance().init(make_config(50, 5));
     for (int i = 0; i < 50; ++i) {
