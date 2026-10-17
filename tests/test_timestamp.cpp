@@ -436,7 +436,12 @@ uint64_t system_now_ns() {
 class TimestampCaptureSink : public ISink {
 public:
     TimestampCaptureSink() : ISink("timestamp_capture") {}
-    void write(const LogEntry& entry) override { stamps_.push_back(entry.timestamp); }
+    void write(const LogEntry& entry) override {
+        // Copied out first: LogEntry is #pragma pack(1), so push_back's const
+        // reference must not bind to entry.timestamp, which can sit misaligned.
+        const uint64_t timestamp = entry.timestamp;
+        stamps_.push_back(timestamp);
+    }
     void flush() override {}
     const std::vector<uint64_t>& stamps() const noexcept { return stamps_; }
 
