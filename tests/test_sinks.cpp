@@ -261,7 +261,7 @@ TEST_F(SinkTest, DailyFileSinkRotation) {
     slick::logger::Logger::instance().add_sink(test_sink);
     slick::logger::Logger::instance().init(1024);
     
-    // Log new messages on "day 2" - these should go to the fresh base file
+    // Log new messages on "day 2"; these should go to the fresh base file
     LOG_INFO("Message from day 2");
     
     slick::logger::Logger::instance().reset();
@@ -274,7 +274,7 @@ TEST_F(SinkTest, DailyFileSinkRotation) {
     
     EXPECT_TRUE(final_base_content.find("Message from day 2") != std::string::npos);
     
-    // Ensure day 1 messages are NOT in the current base file
+    // Ensure day 1 messages are not in the current base file
     EXPECT_FALSE(final_base_content.find("Message from day 1") != std::string::npos);
 }
 
@@ -438,7 +438,7 @@ TEST_F(SinkTest, NamedSinkDirectLogging) {
     EXPECT_TRUE(sink1_content.find("Debug to sink1") != std::string::npos);
     EXPECT_TRUE(sink1_content.find("Trace to sink1") != std::string::npos);
     
-    // Should NOT contain messages meant for other sinks
+    // Should not contain messages meant for other sinks
     EXPECT_FALSE(sink1_content.find("Error message to sink2 only") != std::string::npos);
     EXPECT_FALSE(sink1_content.find("Warning to console only") != std::string::npos);
     EXPECT_FALSE(sink1_content.find("Fatal to sink2") != std::string::npos);
@@ -453,7 +453,7 @@ TEST_F(SinkTest, NamedSinkDirectLogging) {
     EXPECT_TRUE(sink2_content.find("Error message to sink2 only") != std::string::npos);
     EXPECT_TRUE(sink2_content.find("Fatal to sink2") != std::string::npos);
     
-    // Should NOT contain messages meant for other sinks
+    // Should not contain messages meant for other sinks
     EXPECT_FALSE(sink2_content.find("Info message to sink1 only") != std::string::npos);
     EXPECT_FALSE(sink2_content.find("Warning to console only") != std::string::npos);
 }
@@ -637,7 +637,7 @@ TEST_F(SinkTest, DailyFileSinkNoSizeRotationWhenZero) {
         current_date = "1970-01-01"; // fallback
     }
 
-    // Verify that NO size-based rotation files were created
+    // Verify that no size-based rotation files were created
     std::string unexpected_rotation_file = "daily_no_size_rotation_" + current_date + "_000.log";
     EXPECT_FALSE(std::filesystem::exists(unexpected_rotation_file));
 
@@ -749,7 +749,7 @@ TEST_F(SinkTest, DailyFileSinkRestartWithOldFile) {
     // Wait a bit to ensure file system has updated the timestamp
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // Now initialize the logger - it should rotate the old file
+    // Now initialize the logger, which should rotate the old file
     slick::logger::Logger::instance().clear_sinks();
     slick::logger::Logger::instance().add_daily_file_sink("daily_restart_test.log", config);
     slick::logger::Logger::instance().init(1024);
@@ -828,7 +828,7 @@ TEST_F(SinkTest, DailyFileSinkRestartWithExistingRotatedFiles) {
     // Wait a bit to ensure file system has updated the timestamp
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // Initialize logger - should rotate without overwriting
+    // Initialize the logger, which should rotate without overwriting
     slick::logger::Logger::instance().clear_sinks();
     slick::logger::Logger::instance().add_daily_file_sink("daily_restart_existing.log", config);
     slick::logger::Logger::instance().init(1024);
@@ -951,7 +951,7 @@ TEST_F(SinkTest, InitCreatesMissingDirectories) {
 }
 
 TEST_F(SinkTest, FileSinkWithoutDirectoryComponentStillWorks) {
-    // A bare filename has an empty parent_path() - must not be treated as a directory
+    // A bare filename has an empty parent_path(), which must not be treated as a directory
     slick::logger::Logger::instance().clear_sinks();
     slick::logger::Logger::instance().add_file_sink("regular_sink.log");
     slick::logger::Logger::instance().init(1024);
@@ -985,7 +985,7 @@ std::vector<unsigned char> read_bytes(const std::string& path) {
                                       std::istreambuf_iterator<char>());
 }
 
-// "ab" repeated `count` times - the hex rendering of `count` 0xAB bytes.
+// "ab" repeated `count` times: the hex rendering of `count` 0xAB bytes.
 std::string hex_ab(size_t count) {
     std::string s;
     for (size_t i = 0; i < count; ++i) {
@@ -1088,8 +1088,8 @@ TEST_F(SinkTest, BinaryPayloadTruncatedAtMaxPayloadBytes) {
 
 TEST_F(SinkTest, LargePayloadSplitAcrossArgsOfOneEntryIsContiguous) {
     // The documented way to log more than kMaxPayloadBytes: several chunks as
-    // several arguments of ONE entry. The sink writes an entry's payloads back to
-    // back, so the file must come out byte-identical to the unsplit buffer.
+    // several arguments of a single entry. The sink writes an entry's payloads
+    // back to back, so the file must come out byte-identical to the unsplit buffer.
     slick::logger::Logger::instance().clear_sinks();
     auto sink = slick::logger::Logger::instance().add_binary_sink("binary_chunked.bin");
     slick::logger::Logger::instance().init(1024, 1 << 22);

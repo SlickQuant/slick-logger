@@ -1,4 +1,4 @@
-// Compiles the statistics publish against the NO-P0718 branch of
+// Compiles the statistics publish against the no-P0718 branch of
 // detail::atomic_shared_ptr, whatever this toolchain actually provides.
 //
 // libc++ ships no std::atomic<std::shared_ptr<T>>, and naming that type there
@@ -9,7 +9,8 @@
 //
 // This must be its own executable. The macro changes the type of
 // Logger::stats_latest_, so a TU built with it linked against one built without
-// it would be two different definitions of Logger - an ODR violation, not a test.
+// it would be two different definitions of Logger, which is an ODR violation
+// rather than a test.
 #define SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR 0
 
 #include <slick/logger.hpp>

@@ -14,11 +14,11 @@
 using namespace slick::logger;
 
 // LogEntry is the layout shared-memory producers and collectors agree on, so its
-// size is part of the ABI, not an implementation detail. Pinned here so a field
-// added without thinking about multi-process peers fails the build rather than a
-// user's attach. The thread id adds exactly one uint32_t to the 1.3.0 layout, and
-// the field is reserved whatever SLICK_LOGGER_ENABLE_THREAD_ID says - a flat size
-// here is what pins that: the option may cost the capture, never the layout.
+// size is part of the ABI. Pinned here so a field added without thinking about
+// multi-process peers fails the build rather than a user's attach. The thread id
+// adds exactly one uint32_t to the 1.3.0 layout, and the field is reserved
+// whatever SLICK_LOGGER_ENABLE_THREAD_ID says. One expected size for both
+// settings pins that: the option may cost the capture, never the layout.
 #if (defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)) \
     && SLICK_LOGGER_MAX_ARGS == 20 && SLICK_LOGGER_TAG_SIZE == 16
 static_assert(sizeof(LogEntry) == 327,
@@ -339,8 +339,8 @@ TEST_F(PatternTest, TwelveHourAndNameFlags) {
     EXPECT_EQ(render_with("%E", entry), std::to_string(kTimestamp / 1000000000ULL));
 }
 
-// %e, %f, %F and %E read the entry's own timestamp - a division and some
-// digits - while every calendar flag needs the broken-down time behind
+// %e, %f, %F and %E read the entry's own timestamp (a division and some
+// digits), while every calendar flag needs the broken-down time behind
 // cached_second(). Only the second group makes format() pay for that lookup, so
 // the first group has to render correctly with no calendar flag beside it to
 // force one, and both groups have to agree when they do share a line.
@@ -871,7 +871,7 @@ TEST_F(PatternTest, LoggerWidePatternIsCompiledOnceForEverySink) {
 }
 
 // A sink can outlive the logger-wide default that reached it: a caller holding
-// its own shared_ptr past reset(), or - the reason this matters - a plugin whose
+// its own shared_ptr past reset(), or (the case that matters) a plugin whose
 // Logger goes away while the host still holds the sink. The sink keeps the
 // compiled pattern alive, so rendering afterwards is the inherited layout rather
 // than a read through a dangling pointer.
@@ -1148,15 +1148,15 @@ TEST_F(PatternTest, PatternAccessorReportsWhatWasSet) {
 // 11. Reconfiguring while a sink renders
 // ---------------------------------------------------------------------------
 
-// The only reason the writer thread may hold a bare pointer to a compiled
-// pattern is that the store is grow-only and backed by a deque: compiling a new
-// pattern never moves or frees one already handed out. That is the whole safety
-// argument for set_pattern() being callable while logging is in flight, so it
-// gets a test rather than only a comment - and under a thread sanitizer this is
-// where a race on the handoff would surface.
+// The writer thread may hold a bare pointer to a compiled pattern only because
+// the store is grow-only and backed by a deque: compiling a new pattern never
+// moves or frees one already handed out. That is the entire case for calling
+// set_pattern() while logging is in flight, so it gets a test and not just a
+// comment. Under a thread sanitizer this is where a race on the handoff would
+// surface.
 TEST_F(PatternTest, LoggerPatternCanChangeWhileASinkRenders) {
-    // All distinct, so each set_pattern() below really does compile a formatter
-    // and push it into the store the render thread is reading through.
+    // All distinct, so each set_pattern() below compiles a new formatter and
+    // pushes it into the store the render thread is reading through.
     constexpr int kPatternCount = 128;
     const LogEntry entry = make_entry();
     std::vector<std::string> patterns;
@@ -1207,12 +1207,12 @@ TEST_F(PatternTest, LoggerPatternCanChangeWhileASinkRenders) {
     stop.store(true, std::memory_order_relaxed);
     renderer.join();
 
-    // Not just "it did not crash": the render loop has to have run alongside the
-    // reconfiguration for any of this to have been tested. Guaranteed rather than
-    // hoped for now - one render per pattern is waited on above.
+    // Passing proves more than "it did not crash" only if the render loop ran
+    // alongside the reconfiguration. Waiting for one render per pattern above
+    // guarantees that it did.
     EXPECT_TRUE(renderer_running) << "the render thread stopped making progress";
     EXPECT_GE(render_count.load(), static_cast<size_t>(2 * kPatternCount));
-    // Every line rendered was one of the layouts that were in force - never a
+    // Every line rendered was one of the layouts that were in force: never a
     // half-applied one, and never a read through a formatter that had moved.
     EXPECT_TRUE(unexpected.empty())
         << unexpected.size() << " unrecognized line(s), first: "

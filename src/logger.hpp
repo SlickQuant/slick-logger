@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
+#include <array>
 #include <thread>
 #include <atomic>
 #include <bit>
@@ -71,10 +72,18 @@
 #include <unistd.h>
 #endif
 
+// The CPU cycle counter TscTimestamper reads: compiler intrinsics only, no OS headers.
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <x86intrin.h>
+#include <cpuid.h>
+#endif
+
 // Stamp the producing thread id into every entry, for the %t pattern flag.
-// Turning this off drops the per-call capture - one thread-local read - and
-// leaves every entry carrying thread id 0. It does NOT change the LogEntry
-// layout: the field is always reserved, so processes sharing a segment stay
+// Turning this off drops the per-call capture (one thread-local read) and
+// leaves every entry carrying thread id 0. The LogEntry layout stays the same:
+// the field is always reserved, so processes sharing a segment stay
 // attach-compatible whatever each of them chose here.
 #ifndef SLICK_LOGGER_ENABLE_THREAD_ID
 #define SLICK_LOGGER_ENABLE_THREAD_ID 1
@@ -101,11 +110,11 @@
 #endif
 
 #if SLICK_LOGGER_ENABLE_THREAD_ID
-// The real OS thread id is what a debugger, `top -H` and ETW show, so it is worth
-// a little platform code rather than hashing std::thread::id. GetCurrentThreadId
-// is declared here rather than by including <windows.h>, which this header
-// deliberately keeps out of every translation unit that logs. The declaration is
-// identical to the SDK's, so including <windows.h> either side of this is fine.
+// Debuggers, `top -H` and ETW all show the real OS thread id, which is worth a
+// little platform code over hashing std::thread::id. GetCurrentThreadId is
+// declared here instead of coming from <windows.h>, which this header keeps out
+// of every translation unit that logs. The declaration is identical to the
+// SDK's, so including <windows.h> before or after this is fine.
 #  if defined(_WIN32)
 extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
 #  elif defined(__linux__)
@@ -302,10 +311,10 @@ inline void append_uint(std::string& out, uint64_t value) {
  * __resize_and_overwrite extension. Each is detected rather than version-checked,
  * so a library without it simply falls through.
  *
- * The last resort is resize(), which zero-fills the growth - in practice libc++
- * below C++23. Correct, and one bulk memset rather than a check per piece, but
- * the budget is a bound, not an exact size (a %P field reserves room for a full
- * tag), so every line pays for a memset of its unused slack on that path.
+ * The last resort is resize(), which zero-fills the growth (in practice, libc++
+ * below C++23). That is correct, and one bulk memset beats a check per piece,
+ * but the budget is a bound and not an exact size (a %P field reserves room for
+ * a full tag), so on that path every line pays for a memset of its unused slack.
  *
  * A template only so the requires-expressions are SFINAE rather than hard errors.
  */
@@ -333,8 +342,8 @@ void grow_uninitialized(String& s, size_t size) {
  * surrounded. finish() trims the string back to what was actually written.
  *
  * The bound is the caller's promise: nothing checks a put() against it. A piece
- * with no bound known up front - a CUSTOM timestamp, which is strftime's to size
- * - goes through append_unbounded() instead.
+ * with no bound known up front, such as a CUSTOM timestamp that only strftime
+ * can size, goes through append_unbounded() instead.
  */
 class line_writer {
 public:
@@ -592,10 +601,10 @@ inline uint32_t current_process_id() noexcept {
 /**
  * @brief The broken-down time to render when localtime() fails
  *
- * TimestampFormatter falls back to "1970-01-01 00:00:00.000000" rather than
- * dropping the timestamp, so pattern date flags use the same placeholder. One
- * line reporting two different stories - a 1970 date from %q next to an empty
- * %Y - would be worse than either on its own.
+ * TimestampFormatter falls back to "1970-01-01 00:00:00.000000" instead of
+ * dropping the timestamp, so pattern date flags use the same placeholder. A
+ * line showing a 1970 date from %q next to an empty %Y would be worse than
+ * either on its own.
  */
 inline const second_cache& epoch_fallback_cache() noexcept {
     static const second_cache fallback = []() noexcept {
@@ -657,15 +666,14 @@ static_assert(queue_keeps_segment_on_destroy<slick::queue<char, logger_queue_tra
  * @brief Atomic load and store of a std::shared_ptr
  *
  * The C++20 std::atomic<std::shared_ptr<T>> where the standard library provides
- * it, and the pre-C++20 free functions where it does not - libc++ being the case
- * that matters, which implements neither P0718 nor its feature-test macro.
+ * it, and the pre-C++20 free functions where it does not. libc++ is the case
+ * that matters: it implements neither P0718 nor its feature-test macro.
  *
- * Both spellings carry the same guarantee, which is the one the statistics
- * publish is built on: a reader gets either the old pointer or the new one, never
- * a torn read, and whichever it gets stays alive for as long as it holds it.
- * Neither is required to be lock-free - MSVC and libc++ both take an internal
- * lock - and nothing here sits on the logging hot path, so that costs nothing
- * that matters.
+ * Both spellings carry the guarantee the statistics publish is built on: a
+ * reader gets either the old pointer or the new one, never a torn read, and
+ * whichever it gets stays alive for as long as it holds it. Neither is required
+ * to be lock-free (MSVC and libc++ both take an internal lock), but nothing here
+ * sits on the logging hot path, so the lock costs nothing that matters.
  *
  * The free functions are removed in C++26, which the fallback would care about
  * only on a libc++ new enough to compile as C++26 while still lacking P0718.
@@ -808,7 +816,7 @@ public:
     /**
      * @brief Write the timestamp as one piece of a line being rendered
      *
-     * Counts for write_bound() bytes of the writer's budget - none for a CUSTOM
+     * Takes write_bound() bytes of the writer's budget, or none for a CUSTOM
      * format, which strftime sizes and which therefore goes around the budget.
      */
     void write(detail::line_writer& out, uint64_t timestamp_ns) const {
@@ -832,9 +840,9 @@ public:
     /**
      * @brief An upper bound on what append_timestamp() writes, for reserve()
      *
-     * Exact for the built-in formats - ISO8601 is the longest, at 27 characters.
-     * A CUSTOM format expands through strftime, so there this is an estimate
-     * rather than a bound; reserve() takes a hint, not a promise.
+     * Exact for the built-in formats; ISO8601 is the longest, at 27 characters.
+     * A CUSTOM format expands through strftime, so there this is only an
+     * estimate, which is fine because reserve() only takes a hint.
      */
     size_t max_length() const noexcept {
         return format_ == Format::CUSTOM ? custom_format_.size() + 32 : kMaxBoundedLength;
@@ -917,8 +925,8 @@ private:
      * @brief Render a CUSTOM format: one strftime per segment, %f between them
      *
      * Allocation-free in the steady state. The format was split at every %f when
-     * it was set, so nothing here parses it, and the microseconds are written
-     * unpadded - "123", not "000123" - which is what %f has always meant on this
+     * it was set, so nothing here parses it. The microseconds are written
+     * unpadded ("123", not "000123"), which is what %f has always meant on this
      * path.
      */
     void append_custom(std::string& out, const std::tm& tm, uint32_t us) const {
@@ -935,11 +943,11 @@ private:
     /**
      * @brief Append one strftime() expansion, through a stack buffer
      *
-     * strftime() reports "did not fit" and "expanded to nothing" the same way,
-     * with a 0 return, which is the whole difficulty here: a zero cannot simply be
-     * taken for empty, or a format too long for the buffer would render as nothing
-     * at all. The fast path is one call into a stack buffer; anything that does not
-     * fit there goes to grow_strftime(), which settles the ambiguity properly.
+     * strftime() returns 0 both for "did not fit" and for "expanded to nothing".
+     * A zero cannot simply be taken for empty, or a format too long for the
+     * buffer would render as nothing at all. The fast path is one call into a
+     * stack buffer; anything that does not fit there goes to grow_strftime(),
+     * which tells the two cases apart.
      */
     static void append_strftime(std::string& out, const std::string& format, const std::tm& tm) {
         if (format.empty()) {
@@ -1021,9 +1029,9 @@ private:
     Format format_;
     std::string custom_format_;
     // custom_format_ split at every %f, once, when it was set. Rendering walks the
-    // segments and writes the microseconds between them, which is what keeps a
-    // CUSTOM line allocation-free: the ostringstream this replaced allocated twice
-    // per line, once for a copy of the format string and once for the result.
+    // segments and writes the microseconds between them, so a CUSTOM line does
+    // not allocate. An ostringstream would allocate twice per line, once for a
+    // copy of the format string and once for the result.
     std::vector<std::string> custom_segments_;
 };
 
@@ -1043,12 +1051,12 @@ enum class ArgType : uint8_t {
     FLOAT,
     DOUBLE,
     PTR,             // pointer types
-    STRING_LITERAL,  // const char* - safe to store pointer
-    STRING_DYNAMIC,  // std::string - stored in separate queue
+    STRING_LITERAL,  // const char*: safe to store the pointer
+    STRING_DYNAMIC,  // std::string: stored in a separate queue
     // New values must be appended here. Shared-memory producers and collectors
     // can be built against different revisions of this header, and they agree on
     // argument types by numeric value.
-    BLOB             // raw bytes - copied into the string queue, length is authoritative
+    BLOB             // raw bytes: copied into the string queue, length is authoritative
 };
 
 /**
@@ -1058,7 +1066,8 @@ enum class ArgType : uint8_t {
  * would corrupt the write cursor. Strings and binary payloads are truncated to
  * this length instead.
  *
- * To log more than this, pass the payload as several arguments of ONE log call:
+ * To log more than this, pass the payload as several arguments of a single log
+ * call:
  *
  * @code
  * LOG_SINK_INFO(sink, "{}{}", as_binary(p, kMaxPayloadBytes),
@@ -1067,7 +1076,7 @@ enum class ArgType : uint8_t {
  *
  * A BinarySink writes an entry's payloads back to back with nothing between
  * them, so the file is byte-identical to the unsplit buffer. Spreading the
- * chunks over separate log calls does NOT work: the queue is multi-producer, so
+ * chunks over separate log calls does not work: the queue is multi-producer, so
  * another thread's entry can land between them and interleave the two payloads.
  * One entry is the unit of atomicity, which caps a payload at
  * SLICK_LOGGER_MAX_ARGS * kMaxPayloadBytes.
@@ -1160,8 +1169,8 @@ inline constexpr bool is_float128_v =
     false;
 #endif
 
-// True when Args... is exactly one type convertible to std::format_args —
-// used to detect the pre-built format_args overload in log_to_sink.
+// True when Args... is exactly one type convertible to std::format_args, which
+// is how log_to_sink detects the pre-built format_args overload.
 // std::make_format_args() returns an implementation-defined store type
 // (e.g. std::_Format_arg_store on MSVC) that converts to std::format_args,
 // so we check convertibility rather than exact type identity.
@@ -1173,12 +1182,12 @@ inline constexpr bool is_single_format_args_v =
 /**
  * @brief Where a Logger's ring buffers live and what role it plays
  *
- * Local            - process-private heap queues; the logger owns a writer thread and sinks.
- * SharedProducer   - queues live in named shared memory; the logger only enqueues entries.
- *                    It has no writer thread and no sinks; a collector process owns those.
- * SharedCollector  - queues live in named shared memory; this logger owns the writer thread
- *                    and the sinks, and drains entries produced by every attached process
- *                    (including its own).
+ * Local:           process-private heap queues; the logger owns a writer thread and sinks.
+ * SharedProducer:  queues live in named shared memory; the logger only enqueues entries.
+ *                  It has no writer thread and no sinks; a collector process owns those.
+ * SharedCollector: queues live in named shared memory; this logger owns the writer thread
+ *                  and the sinks, and drains entries produced by every attached process
+ *                  (including its own).
  */
 enum class QueueMode : uint8_t {
     Local,
@@ -1198,7 +1207,8 @@ inline constexpr uint8_t kEntryOffsets = 0x01;
 inline constexpr uint8_t kEntryHasSourceLocation = 0x02;
 // The format is a string literal referenced in place: fixed text at a fixed
 // address, so a parse of it holds for every entry that carries it. Never set
-// alongside kEntryOffsets - a format copied into a ring has no fixed address.
+// alongside kEntryOffsets, because a format copied into a ring has no fixed
+// address.
 inline constexpr uint8_t kEntryStaticFormat = 0x04;
 
 #pragma pack(push, 1)
@@ -1312,7 +1322,7 @@ inline size_t tag_length(const char* tag) noexcept {
  * alone, yet every text sink needs them. The logger keeps one of these for the
  * entry it is handing to its sinks: the first sink that needs the message
  * formats it here, and every later sink reuses it. A sink that never needs the
- * message - a binary sink, or a pattern that renders neither %v nor a level -
+ * message (a binary sink, or a pattern that renders neither %v nor a level)
  * never causes it to be formatted at all.
  */
 struct dispatch_message {
@@ -1323,7 +1333,7 @@ struct dispatch_message {
 };
 
 /// The dispatch_message of the entry this thread is dispatching, or null when
-/// it is not dispatching one - a sink written to directly, say.
+/// it is not dispatching one, as when a sink is written to directly.
 inline dispatch_message*& current_dispatch() noexcept {
     thread_local dispatch_message* current = nullptr;
     return current;
@@ -1369,8 +1379,8 @@ private:
  * walks that vector and appends into a buffer the caller owns, so a log line
  * costs no parsing and no allocation. Every date and time flag reads the
  * per-second cache behind detail::cached_second(), and the weekday/month names
- * come from static tables - there is no strftime, no put_time, no ostringstream
- * and no locale anywhere on this path.
+ * come from static tables. Nothing on this path uses strftime, put_time, an
+ * ostringstream or the locale.
  *
  * Supported flags:
  *
@@ -1421,7 +1431,7 @@ public:
      * @brief True if rendering needs the formatted message
      *
      * False lets a caller skip the whole std::format pass for a pattern that
-     * renders neither the message nor a level - the level is only known to be
+     * renders neither the message nor a level. The level is only known to be
      * ERROR once formatting the message has been attempted, so a pattern that
      * shows a level still has to pay for it.
      */
@@ -1493,7 +1503,7 @@ private:
      *
      * The one list of the flags that need a broken-down time: compile() asks it
      * what to set needs_cache_ to, and format() hands write_op() a cache only
-     * when it says so. %e, %f, %F and %E are the time flags that answer false -
+     * when it says so. %e, %f, %F and %E are the time flags that answer false:
      * they slice or divide the entry's own timestamp and never look at a tm.
      */
     static bool flag_needs_cache(Flag flag) noexcept;
@@ -1534,8 +1544,8 @@ private:
     /**
      * @brief Most an op can write that is fixed by the op itself
      *
-     * A flag rendering a string the line supplies - the message, the level, the
-     * sink name, a source file, a color escape, %+ and %q - counts nothing here;
+     * A flag rendering a string the line supplies (the message, the level, the
+     * sink name, a source file, a color escape, %+ and %q) counts nothing here;
      * compile() tallies those instead, and line_bound() adds them per line.
      */
     static size_t fixed_length(const Op& op) noexcept;
@@ -1585,12 +1595,12 @@ namespace detail {
  * @brief Grow-only store of compiled patterns, shared by everything that points into one
  *
  * A compiled pattern reaches the writer thread as a bare pointer, and there is
- * no safe point at which one could be reclaimed - the writer may have loaded it
- * an instant ago - so nothing here is ever freed. What stops that from being a
- * leak is the lookup: an identical pattern hands back the formatter already
- * held, so a process that toggles between two layouts at runtime (debug detail
- * on and off, say) keeps two formatters rather than one per call. The scan is
- * linear over a handful of entries, on a configuration call.
+ * no safe point at which one could be reclaimed (the writer may have loaded it
+ * an instant ago), so nothing here is ever freed. The lookup keeps that from
+ * becoming a leak: an identical pattern hands back the formatter already held,
+ * so a process that toggles between two layouts at runtime (debug detail on and
+ * off, say) keeps two formatters rather than one per call. The scan is linear
+ * over a handful of entries, on a configuration call.
  *
  * The deque is what makes the pointers safe: it never moves an element it
  * already holds.
@@ -1631,6 +1641,9 @@ class ISink {
 public:
     ISink(std::string&& name = "") : name_(std::move(name)) {}
     virtual ~ISink() = default;
+    /// Called on the writer thread for every entry routed here. @p entry is the
+    /// writer's own copy, not the ring slot, so nothing changes it during the
+    /// call; it is reused for the next entry, so keep a copy, not the reference.
     virtual void write(const LogEntry& entry) = 0;
     virtual void flush() = 0;
 
@@ -1645,8 +1658,8 @@ public:
      * written. Checks the sink's own minimum level before consulting the logger,
      * so a filtered-out call never touches its arguments.
      *
-     * The index_ test is not an optimization: an unregistered sink has index -1,
-     * and -1 means "broadcast to every sink" further down the pipeline.
+     * The index_ test is needed for correctness: an unregistered sink has index
+     * -1, and -1 means "broadcast to every sink" further down the pipeline.
      *
      * Callers that go on to log should pass the same Logger reference they will
      * log through, as the macros do. Resolving Logger::instance() separately for
@@ -1719,9 +1732,9 @@ public:
      * takes a lock to read it. Marking the sink explicitly patterned also stops a
      * later Logger::set_pattern() from overwriting a deliberate choice.
      *
-     * Safe to call while logging is in flight, but NOT concurrently with itself:
-     * it is a configuration call. Each call retains its compiled pattern for the
-     * life of the sink - a few hundred bytes - so a pointer the writer thread has
+     * Safe to call while logging is in flight, but not concurrently with itself:
+     * it is a configuration call. Each call retains its compiled pattern (a few
+     * hundred bytes) for the life of the sink, so a pointer the writer thread has
      * already loaded can never dangle.
      */
     void set_pattern(std::string_view pattern);
@@ -1740,9 +1753,9 @@ protected:
      *         copy it to keep it
      *
      * While the logger dispatches an entry, its message is formatted once and
-     * shared by every sink that asks for it, so N text sinks cost one format,
-     * not N. Called outside a dispatch - a sink written to directly - it formats
-     * into a buffer this sink reuses. Writer thread only.
+     * shared by every sink that asks for it, so N text sinks cost one format.
+     * Called outside a dispatch (a sink written to directly), it formats into a
+     * buffer this sink reuses. Writer thread only.
      */
     std::pair<std::string_view, bool> formatted_message(const LogEntry& entry);
 
@@ -1761,7 +1774,7 @@ protected:
      *
      * The single implementation of a log line, shared by every text sink. Writer
      * thread only. Reusing the buffer is what keeps a steady-state line free of
-     * allocations, so do not hold the view across calls - copy it if you must.
+     * allocations, so do not hold the view across calls; copy it to keep it.
      *
      * The color is resolved from the level the line actually reports, which is
      * why this takes a function rather than a ready-made escape: an entry whose
@@ -1785,10 +1798,10 @@ private:
      * that point. The formatter arrives compiled because every sink inheriting
      * the same default shares one, rather than each compiling the same text.
      *
-     * noexcept, and deliberately so: Logger::set_pattern() walks every sink
-     * calling this, and a throw partway through would leave the sinks split
-     * between two layouts. Nothing here allocates - the formatter is already
-     * compiled, and the store arrives as a shared_ptr the caller copied.
+     * It is noexcept because Logger::set_pattern() walks every sink calling
+     * this, and a throw partway through would leave the sinks split between two
+     * layouts. Nothing here allocates: the formatter is already compiled, and the
+     * store arrives as a shared_ptr the caller copied.
      */
     void apply_default_pattern(std::shared_ptr<detail::pattern_store> store,
                                const PatternFormatter* compiled) noexcept;
@@ -1847,8 +1860,8 @@ inline ISink* sink_ptr(const std::unique_ptr<T, D>& sink) noexcept { return sink
  * @brief Open @p path into @p stream with an explicit buffer, creating parents first
  *
  * Factored out of FileSinkBase::open_stream() so the statistics CSV writer can
- * reuse it: the statistics thread is not a sink - sinks belong to the writer
- * thread alone - so it cannot reach that protected member, and duplicating the
+ * reuse it. The statistics thread is not a sink (sinks belong to the writer
+ * thread alone), so it cannot reach that protected member, and duplicating the
  * body would leave two copies of the buffering and directory rules to keep in
  * step.
  *
@@ -1856,8 +1869,8 @@ inline ISink* sink_ptr(const std::unique_ptr<T, D>& sink) noexcept { return sink
  * Directory creation is best-effort: if it fails the open fails too, which the
  * caller already handles.
  *
- * @p buffer backs the stream and must outlive it - pubsetbuf() does not take
- * ownership - and is only installed while the stream is closed, which is the
+ * @p buffer backs the stream and must outlive it, since pubsetbuf() does not
+ * take ownership. It is only installed while the stream is closed, which is the
  * only state in which it takes effect.
  */
 /// Size of the explicit stream buffer open_buffered_stream() installs.
@@ -2009,8 +2022,8 @@ protected:
  * @brief Writes raw binary payloads to a file, byte for byte
  *
  * Every BinaryView argument of an entry is written out verbatim, in the order it
- * was logged. Nothing else about the entry reaches the file - no timestamp, no
- * level, no format string, no separators, no framing. The file is exactly the
+ * was logged. Nothing else about the entry reaches the file: no timestamp,
+ * level, format string, separators or framing. The file is exactly the
  * concatenation of what the caller encoded, so the encoding (and any framing
  * needed to read it back) is entirely the caller's to define.
  *
@@ -2054,16 +2067,16 @@ protected:
 /**
  * @brief One sample of the logging pipeline, published by the statistics thread
  *
- * Most fields are derived from counters that already exist - the two ring write
- * cursors, the writer thread's read cursor and slick-queue's loss counter - so
- * the producer path is untouched: logging costs exactly what it did before,
- * enabled or not.
+ * Most fields are derived from counters that already exist (the two ring write
+ * cursors, the writer thread's read cursor and slick-queue's loss counter), so
+ * the producer path is untouched and logging costs the same whether statistics
+ * are enabled or not.
  *
- * The string occupancy fields are the exception, and only just: with statistics
- * enabled the writer reads the two ring cursors once per drained BATCH (not per
- * entry) and compares one of them against its own read cursor. It never looks
- * inside an entry to do it. That is the whole cost enabling statistics adds to
- * the logging pipeline, and none of it lands on the producing thread.
+ * The string occupancy fields are a small exception: with statistics enabled
+ * the writer reads the two ring cursors once per drained batch, not per entry,
+ * and compares one of them against its own read cursor. It never looks inside
+ * an entry to do it. That is all enabling statistics adds to the logging
+ * pipeline, and none of it lands on the producing thread.
  *
  * Read it with Logger::stats_snapshot(). A zeroed instance is what a logger with
  * statistics disabled returns.
@@ -2092,7 +2105,7 @@ struct LogStats {
     uint64_t entries_consumed = 0;
     /// produced - consumed at report time: how far the reader is behind.
     uint64_t entry_queue_depth = 0;
-    /// Peak depth across the reporting interval. THIS is the figure to alert on -
+    /// Peak depth across the reporting interval. This is the figure to alert on:
     /// entry_queue_depth is a single point sample and will miss a burst that
     /// filled the ring and drained again between two reports.
     uint64_t entry_queue_depth_max = 0;
@@ -2103,7 +2116,7 @@ struct LogStats {
     double entry_queue_pct = 0.0;
     /// entry_queue_depth_max as a percentage of capacity, clamped to 100.
     double entry_queue_pct_max = 0.0;
-    /// Messages per second entering the queue - the log throughput figure.
+    /// Messages per second entering the queue: the log throughput figure.
     double produced_per_sec = 0.0;
     /// Messages per second leaving it. Steady state has the two roughly equal;
     /// consumed lagging produced is what makes the depth grow.
@@ -2112,13 +2125,13 @@ struct LogStats {
     // ---- String ring: occupancy ----
 
     /// Bytes between the oldest string the writer thread still needs and the
-    /// producers' write cursor - the true in-flight span of the string ring.
+    /// producers' write cursor, which is the in-flight span of the string ring.
     ///
     /// The logger never calls read() on the string ring, so there is no read
     /// cursor to subtract. Computed instead as write_cursor - frontier, where the
     /// frontier is the position the writer publishes once it has provably drained
-    /// past every string below it - see stats_string_frontier_ for the cursor-pair
-    /// rule behind that. Entry contents are never read to derive it. Only
+    /// past every string below it (see stats_string_frontier_ for the cursor-pair
+    /// rule behind that). Entry contents are never read to derive it. Only
     /// meaningful when string_pct_valid. Like string_bytes_written, it measures
     /// ring footprint, including each string's rounding to string_items_per_slot.
     uint64_t string_inflight_bytes = 0;
@@ -2132,8 +2145,8 @@ struct LogStats {
     double string_pct = 0.0;
     /// string_inflight_bytes_max as a percentage of capacity, clamped to 100.
     double string_pct_max = 0.0;
-    /// False only when there is no string ring to measure at all - the logger is
-    /// not running, or was built with a zero-capacity ring - in which case
+    /// False only when there is no string ring to measure at all, because the
+    /// logger is not running or was built with a zero-capacity ring. Then
     /// string_inflight_bytes and string_pct carry the previous sample's values
     /// rather than a misleading zero. Whenever a ring exists a measurement is
     /// always available: the frontier is seeded at start(), so there is always a
@@ -2147,7 +2160,7 @@ struct LogStats {
     uint64_t string_bytes_written = 0;
     double string_bytes_per_sec = 0.0;
     /// Bytes written this interval as a percentage of capacity: how much of the
-    /// ring was recycled. This is a RATE, not an occupancy - 100 means the ring
+    /// ring was recycled. This is a rate, not an occupancy: 100 means the ring
     /// turned over exactly once during the interval. string_pct is the occupancy.
     double string_turnover_pct = 0.0;
     /// The same figure expressed as whole ring wraps per second.
@@ -2155,13 +2168,14 @@ struct LogStats {
 
     // ---- Loss ----
 
-    /// Entries a producer overwrote before the writer thread could read them.
+    /// Entries a producer overwrote before the writer thread could read them, or
+    /// while it was copying one out (it then discards the copy).
     /// Always 0 unless the build defines SLICK_LOGGER_ENABLE_LOSS_DETECTION=1,
     /// which kLossDetectionEnabled reports. Counted by the process that reads the
     /// queue, so a SharedProducer reads 0 here; its collector has the count.
     uint64_t entry_loss_count = 0;
     /// Structurally always 0: slick-queue counts losses inside read(), and the
-    /// logger never calls read() on the string ring - strings are reached by
+    /// logger never calls read() on the string ring, since strings are reached by
     /// pointer. Present so the CSV schema stays symmetric and self-describing.
     uint64_t string_loss_count = 0;
 };
@@ -2197,7 +2211,7 @@ inline uint64_t clock_timestamp() noexcept {
         Clock::now().time_since_epoch()).count());
 }
 
-/// Adapts any callable - a lambda with captures, a function, a function pointer -
+/// Adapts any callable (a lambda with captures, a function, a function pointer)
 /// to ITimestamper. now() is noexcept, so a callable that throws terminates.
 template<typename F>
 class callable_timestamper final : public ITimestamper {
@@ -2209,7 +2223,276 @@ private:
     F f_;
 };
 
+/// The CPU's free-running counter: the TSC on x86-64, the generic timer's virtual
+/// count on ARM64, and 0 where there is neither.
+inline uint64_t read_cycle_counter() noexcept {
+#if defined(_MSC_VER) && defined(_M_X64)
+    return __rdtsc();
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+    return static_cast<uint64_t>(_ReadStatusReg(0x5F02)); // CNTVCT_EL0, as winnt.h encodes it
+#elif defined(__x86_64__)
+    return __rdtsc();
+#elif defined(__aarch64__)
+    uint64_t ticks;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
+#else
+    return 0;
+#endif
+}
+
+/// Whether read_cycle_counter() ticks at one constant rate on every core, so it
+/// can stand in for a clock. x86 says so with the invariant-TSC CPUID bit, which
+/// hypervisors clear when they cannot keep the promise; ARMv8 requires it.
+inline bool cycle_counter_is_steady() noexcept {
+#if defined(_MSC_VER) && defined(_M_X64)
+    int regs[4];
+    __cpuid(regs, static_cast<int>(0x80000000u));
+    if (static_cast<unsigned>(regs[0]) < 0x80000007u) {
+        return false;
+    }
+    __cpuid(regs, static_cast<int>(0x80000007u));
+    return (regs[3] >> 8) & 1;
+#elif defined(__x86_64__)
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (!__get_cpuid(0x80000000u, &eax, &ebx, &ecx, &edx) || eax < 0x80000007u) {
+        return false;
+    }
+    __get_cpuid(0x80000007u, &eax, &ebx, &ecx, &edx);
+    return (edx >> 8) & 1;
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+/// (a * b) >> 32 over the full 128-bit product, so neither operand has to be
+/// small: a counter delta after an idle hour times a 32.32 rate overflows 64 bits.
+inline uint64_t mul_shift_32(uint64_t a, uint64_t b) noexcept {
+#if defined(__SIZEOF_INT128__)
+    return static_cast<uint64_t>((static_cast<unsigned __int128>(a) * b) >> 32);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    uint64_t high;
+    const uint64_t low = _umul128(a, b, &high);
+    return (high << 32) | (low >> 32);
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+    return (__umulh(a, b) << 32) | ((a * b) >> 32);
+#else
+    const uint64_t a_hi = a >> 32, a_lo = a & 0xFFFFFFFFu, b_hi = b >> 32, b_lo = b & 0xFFFFFFFFu;
+    const uint64_t mid = a_lo * b_hi + ((a_lo * b_lo) >> 32); // cannot overflow
+    return (a_hi * b_hi << 32) + a_hi * b_lo + mid;
+#endif
+}
+
 } // namespace detail
+
+/**
+ * @brief Nanosecond timestamps from the CPU's cycle counter
+ *
+ * system_clock::now() asks the OS for the time on every log call. This
+ * timestamper reads the CPU's time stamp counter instead and converts ticks to
+ * nanoseconds since the Unix epoch with one multiply, so entries keep full
+ * nanosecond resolution (the counter ticks faster than that on x86-64). On the
+ * Windows laptop it was measured on, now() took 25 ns against system_clock's
+ * 58 ns, which took 29 ns off a four-argument LOG_INFO.
+ *
+ * It is anchored to system_clock: the constructor measures the counter's rate
+ * against steady_clock over @p calibration (a sleep, so construct it before the
+ * hot path starts), and every @p resync_interval the first caller past it
+ * re-anchors, refining the rate over everything measured since construction.
+ * Drift that has built up is slewed away over the next interval rather than
+ * stepped, so timestamps from one thread never go backwards; only a jump in the
+ * wall clock larger than a slew can absorb (more than 0.1% of the interval) is
+ * followed by a step, as system_clock itself would show it. Readers never wait
+ * on a re-anchor in progress.
+ *
+ * Where the counter cannot stand in for a clock (x86 without an invariant TSC,
+ * as some virtual machines report, or an architecture with no counter),
+ * uses_cycle_counter() is false and now() is simply system_clock. The counter
+ * must also agree across cores, which it does on current x86 and ARM systems.
+ * On ARM64 its rate is fixed by the platform and can be much coarser: 24 MHz on
+ * Apple silicon, so ~42 ns steps there.
+ *
+ * @code
+ * Logger::instance().set_timestamper(std::make_shared<slick::logger::TscTimestamper>());
+ * @endcode
+ */
+class TscTimestamper final : public ITimestamper {
+public:
+    explicit TscTimestamper(std::chrono::nanoseconds calibration = std::chrono::milliseconds(10),
+                            std::chrono::nanoseconds resync_interval = std::chrono::seconds(1));
+
+    uint64_t now() noexcept override;
+
+    /// False when this CPU has no counter that can stand in for a clock, in which
+    /// case now() returns system_clock's time instead.
+    bool uses_cycle_counter() const noexcept { return use_counter_; }
+
+private:
+    /// One mapping from counter ticks to wall time: ns + (t - ticks) * rate.
+    struct Anchor {
+        std::atomic<uint64_t> ticks{0};
+        std::atomic<uint64_t> ns{0};
+        std::atomic<uint64_t> ns_per_tick_q32{0}; ///< nanoseconds per tick, 32.32 fixed point
+    };
+
+    /// A counter reading and a clock reading taken as close together as three
+    /// attempts allow, the counter value being the midpoint around the clock read.
+    template<typename Clock>
+    static void sample(uint64_t& ticks, uint64_t& clock_ns) noexcept;
+
+    static uint64_t project(uint64_t ticks, uint64_t anchor_ticks, uint64_t anchor_ns, uint64_t rate) noexcept;
+
+    /// Re-anchor to system_clock, unless another thread already is. Returns
+    /// whether this call published a new anchor.
+    bool resync() noexcept;
+
+    // Read by every now(): the published anchor pair and what selects between them.
+    // A re-anchor writes the anchor not in use and then bumps generation_, so a
+    // reader only ever retries, never waits.
+    alignas(64) std::atomic<uint64_t> generation_{0};
+    Anchor anchors_[2];
+    uint64_t resync_ticks_ = 0;
+    bool use_counter_ = false;
+
+    // Re-anchor state: touched only by the thread holding resyncing_.
+    alignas(64) std::atomic<bool> resyncing_{false};
+    uint64_t resync_interval_ns_ = 0;
+    uint64_t base_ticks_ = 0;      ///< where the rate is measured from
+    uint64_t base_steady_ns_ = 0;
+    uint64_t rate_q32_ = 0;        ///< the measured rate, before any slew
+};
+
+inline TscTimestamper::TscTimestamper(std::chrono::nanoseconds calibration,
+                                      std::chrono::nanoseconds resync_interval) {
+    if (!detail::cycle_counter_is_steady()) {
+        return;
+    }
+    sample<std::chrono::steady_clock>(base_ticks_, base_steady_ns_);
+    std::this_thread::sleep_for(std::max(calibration, std::chrono::nanoseconds(std::chrono::milliseconds(1))));
+    uint64_t ticks = 0, steady_ns = 0;
+    sample<std::chrono::steady_clock>(ticks, steady_ns);
+    if (ticks <= base_ticks_ || steady_ns <= base_steady_ns_) {
+        return; // a counter that did not advance is no clock
+    }
+    rate_q32_ = static_cast<uint64_t>(static_cast<double>(steady_ns - base_steady_ns_) * 4294967296.0 /
+                                      static_cast<double>(ticks - base_ticks_));
+    resync_interval_ns_ = static_cast<uint64_t>(std::max<int64_t>(resync_interval.count(), 1));
+    resync_ticks_ = static_cast<uint64_t>(static_cast<double>(resync_interval_ns_) * 4294967296.0 /
+                                          static_cast<double>(std::max<uint64_t>(rate_q32_, 1)));
+
+    uint64_t wall_ns = 0;
+    sample<std::chrono::system_clock>(ticks, wall_ns);
+    anchors_[0].ticks.store(ticks, std::memory_order_relaxed);
+    anchors_[0].ns.store(wall_ns, std::memory_order_relaxed);
+    anchors_[0].ns_per_tick_q32.store(rate_q32_, std::memory_order_relaxed);
+    use_counter_ = rate_q32_ != 0 && resync_ticks_ != 0;
+}
+
+template<typename Clock>
+inline void TscTimestamper::sample(uint64_t& ticks, uint64_t& clock_ns) noexcept {
+    uint64_t best_width = UINT64_MAX;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const uint64_t before = detail::read_cycle_counter();
+        const uint64_t ns = detail::clock_timestamp<Clock>();
+        const uint64_t width = detail::read_cycle_counter() - before;
+        if (width < best_width) {
+            best_width = width;
+            ticks = before + width / 2;
+            clock_ns = ns;
+        }
+    }
+}
+
+inline uint64_t TscTimestamper::project(uint64_t ticks, uint64_t anchor_ticks, uint64_t anchor_ns,
+                                        uint64_t rate) noexcept {
+    // A thread that read the counter just before another re-anchored can land a
+    // few ticks before the new anchor.
+    return ticks >= anchor_ticks ? anchor_ns + detail::mul_shift_32(ticks - anchor_ticks, rate)
+                                 : anchor_ns - detail::mul_shift_32(anchor_ticks - ticks, rate);
+}
+
+inline uint64_t TscTimestamper::now() noexcept {
+    if (!use_counter_) [[unlikely]] {
+        return detail::clock_timestamp<std::chrono::system_clock>();
+    }
+    const uint64_t ticks = detail::read_cycle_counter();
+    for (;;) {
+        const uint64_t generation = generation_.load(std::memory_order_acquire);
+        const Anchor& anchor = anchors_[generation & 1];
+        const uint64_t anchor_ticks = anchor.ticks.load(std::memory_order_relaxed);
+        const uint64_t anchor_ns = anchor.ns.load(std::memory_order_relaxed);
+        const uint64_t rate = anchor.ns_per_tick_q32.load(std::memory_order_relaxed);
+        // Pairs with the release fence in resync(): if any of the three loads saw
+        // a later re-anchor's write, the generation has moved on and this retries.
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (generation_.load(std::memory_order_relaxed) != generation) [[unlikely]] {
+            continue;
+        }
+        if (ticks - anchor_ticks >= resync_ticks_ && ticks > anchor_ticks) [[unlikely]] {
+            if (resync()) {
+                continue; // stamp with the anchor just published
+            }
+        }
+        return project(ticks, anchor_ticks, anchor_ns, rate);
+    }
+}
+
+inline bool TscTimestamper::resync() noexcept {
+    if (resyncing_.load(std::memory_order_relaxed) ||
+        resyncing_.exchange(true, std::memory_order_acquire)) {
+        return false;
+    }
+    // Every store below goes to the anchor no reader was handed by the current
+    // generation. Ordered after that generation was published, so a reader that
+    // sees one of these stores also sees the generation it has to retry on.
+    std::atomic_thread_fence(std::memory_order_release);
+    const uint64_t generation = generation_.load(std::memory_order_relaxed);
+    const Anchor& current = anchors_[generation & 1];
+    const uint64_t current_ticks = current.ticks.load(std::memory_order_relaxed);
+    const uint64_t current_ns = current.ns.load(std::memory_order_relaxed);
+    const uint64_t current_rate = current.ns_per_tick_q32.load(std::memory_order_relaxed);
+
+    uint64_t ticks = 0, steady_ns = 0, wall_ns = 0;
+    sample<std::chrono::steady_clock>(ticks, steady_ns);
+    // The rate over everything since construction: steady_clock's own read jitter
+    // shrinks against an ever longer span. A rate that disagrees with the last by
+    // over 1% means the counter and steady_clock parted ways (a suspend that one
+    // of them counted), so measuring starts over from here instead.
+    if (ticks > base_ticks_ && steady_ns > base_steady_ns_) {
+        const uint64_t measured = static_cast<uint64_t>(static_cast<double>(steady_ns - base_steady_ns_) *
+                                                        4294967296.0 / static_cast<double>(ticks - base_ticks_));
+        if (measured > rate_q32_ - rate_q32_ / 100 && measured < rate_q32_ + rate_q32_ / 100) {
+            rate_q32_ = measured;
+        } else {
+            base_ticks_ = ticks;
+            base_steady_ns_ = steady_ns;
+        }
+    }
+
+    sample<std::chrono::system_clock>(ticks, wall_ns);
+    const uint64_t projected = project(ticks, current_ticks, current_ns, current_rate);
+    const int64_t error = static_cast<int64_t>(wall_ns - projected);
+    const int64_t slew_limit = static_cast<int64_t>(resync_interval_ns_ / 1000); // 0.1% of the interval
+    uint64_t anchor_ns = projected;
+    uint64_t rate = rate_q32_;
+    if (error > slew_limit || error < -slew_limit) {
+        anchor_ns = wall_ns; // the wall clock jumped: follow it, as system_clock would
+    } else {
+        // Continuous at the anchor, and back on the wall clock one interval later.
+        const double correction = static_cast<double>(error) / static_cast<double>(resync_interval_ns_);
+        rate = static_cast<uint64_t>(static_cast<double>(rate_q32_) * (1.0 + correction));
+    }
+
+    Anchor& next = anchors_[(generation + 1) & 1];
+    next.ticks.store(ticks, std::memory_order_relaxed);
+    next.ns.store(anchor_ns, std::memory_order_relaxed);
+    next.ns_per_tick_q32.store(rate, std::memory_order_relaxed);
+    generation_.store(generation + 1, std::memory_order_release);
+    resyncing_.store(false, std::memory_order_release);
+    return true;
+}
 
 /**
  * @brief Configuration struct for initializing the logger
@@ -2260,8 +2543,8 @@ struct LogConfig {
     ///
     /// Empty means "do not change the current default", not "use the built-in
     /// layout", so `set_pattern(p)` followed by `init(config)` keeps `p`. On a
-    /// logger that has never been given a pattern - including one just past
-    /// reset(), which clears it - that amounts to the built-in layout. To drop a
+    /// logger that has never been given a pattern (including one just past
+    /// reset(), which clears it), that amounts to the built-in layout. To drop a
     /// pattern without resetting, call `set_pattern("")`.
     std::string pattern;
 
@@ -2273,7 +2556,7 @@ struct LogConfig {
     /// The producer path is unaffected either way. The one cost of enabling this
     /// falls on the writer thread, which then reads the two ring reservation
     /// cursors once per drained batch to publish the string-ring frontier. It
-    /// never looks inside an entry to do it - see LogStats.
+    /// never looks inside an entry to do it; see LogStats.
     bool enable_stats = false;
     /// Where the statistics CSV is written. Leave empty to run the thread for
     /// stats_snapshot() alone and write no file.
@@ -2305,8 +2588,8 @@ struct LogConfig {
     ///
     /// Null means "do not change the current timestamper", the same rule as
     /// pattern above, so `set_timestamper(t)` followed by `init(config)` keeps
-    /// `t`. On a logger that has never been given one - including one just past
-    /// reset() - that amounts to std::chrono::system_clock.
+    /// `t`. On a logger that has never been given one (including one just past
+    /// reset()), that amounts to std::chrono::system_clock.
     std::shared_ptr<ITimestamper> timestamper;
 };
 
@@ -2348,7 +2631,7 @@ public:
     const std::string& shared_memory_name() const noexcept { return shm_name_; }
 
     /**
-     * @brief Initialize logger with pre-added sinks - sinks should be added before calling this
+     * @brief Initialize the logger with sinks that were already added; add them before calling this
      * @param queue_size Size of the internal log queue (must be power of 2, default 65536)
      * @param string_buffer_size Size of the internal string buffer (must be power of 2, default 16777216)
      */
@@ -2472,7 +2755,7 @@ public:
      * @param name Optional name for the sink
      * @return The sink, ready to pass to the LOG_SINK_* macros
      *
-     * Returns the sink rather than void - unlike the text sinks, a binary sink is
+     * Returns the sink instead of void. Unlike the text sinks, a binary sink is
      * addressed directly at every call site, so handing it back saves a
      * get_sink() round trip.
      */
@@ -2584,15 +2867,15 @@ public:
     }
 
     /**
-     * @brief Get the sink of givent type
-     * @return The shared_ptr of the given sink type. It could be null if the sink of give type doesn't exist
+     * @brief Get the first sink of the given type
+     * @return The sink, or null if no sink of that type exists
      */
     template<typename SinkT>
     std::shared_ptr<ISink> get_sink() const noexcept;
 
     /**
      * @brief Get the sink by name
-     * @return The shared_ptr of the given sink name. It could be null if the sink of give name doesn't exist
+     * @return The sink, or null if no sink has that name
      */
     std::shared_ptr<ISink> get_sink(std::string_view name) const noexcept;
 
@@ -2741,7 +3024,7 @@ public:
      * @brief Log a message to a specific sink by index with a source path and precomputed file name
      * @param index Index of the sink to log to
      * @param level LogLevel of the message
-     * @param file_name Source file path; copied before the entry is queued when full path output is enabled
+     * @param file_name Source file path; copied before the entry is queued when copy_file_name is true, and always in shared-memory mode
      * @param line Source line; copied before the entry is queued
      * @param copy_file_name Whether to copy the file name into the log entry (true) or store a pointer to it (false)
      * @param format Format string (printf-style)
@@ -2760,7 +3043,7 @@ public:
 
     /**
      * @brief Block until all log entries queued before this call have been
-     * written to all sinks. The logger keeps running — unlike shutdown(),
+     * written to all sinks. Unlike shutdown(), it leaves the logger running, so
      * logging can continue normally after flush() returns.
      *
      * Primary use case: call flush() before unloading a shared library whose
@@ -2775,7 +3058,7 @@ public:
 
     /**
      * @brief Reset the logger to uninitialized state
-     * Note: This is primarily for testing purposes. Use with caution.
+     * Note: this is meant mainly for tests.
      */
     void reset();
 
@@ -2817,7 +3100,10 @@ private:
     /// Perform one read/dispatch step, including stalled-slot recovery.
     /// Shared by the running loop and the shutdown drain so the two cannot diverge.
     DrainResult drain_pending();
-    void write_log_entry(const LogEntry* entry_ptr, uint32_t count);
+    /// Copy the entry read from reservation @p index out of its slot into
+    /// entry_scratch_, with shared-memory references resolved. False if a producer
+    /// may have rewritten the slot during the copy, which then must not be used.
+    bool snapshot_entry(const LogEntry& slot, uint64_t index);
     void dispatch_entry(const LogEntry& entry);
 
     /// Drop every sink, resetting each one's index so handles the caller kept
@@ -2834,7 +3120,7 @@ private:
     void wake_writer() noexcept;
 
     /// Release the writer thread whether or not it looks parked. Used by the rare
-    /// paths - flush() and shutdown() - where missing a wake-up would stall the
+    /// paths, flush() and shutdown(), where missing a wake-up would stall the
     /// caller rather than merely delay an entry.
     void force_wake_writer() noexcept;
 
@@ -2843,8 +3129,8 @@ private:
     void park_writer();
 
     /// Wait on a caller's thread until @p ready holds or the logger stops.
-    /// Stays hot briefly - a drain usually completes well inside that - before
-    /// falling back to sleeping so a long wait does not pin a core. The
+    /// Stays hot briefly, since a drain usually completes well inside that, then
+    /// falls back to sleeping so a long wait does not pin a core. The
     /// predicate is re-checked every pass, so no wake-up can be missed and
     /// shutdown always ends the wait.
     template<typename Predicate>
@@ -2889,7 +3175,9 @@ private:
     template<typename T>
     void enqueue_argument(LogArgument& arg, T&& value);
 
-    void enqueue_format_args(LogEntry& entry, std::format_args fa);
+    /// Unpack @p fa into @p out, which has room for SLICK_LOGGER_MAX_ARGS, and
+    /// return how many arguments it held.
+    uint8_t enqueue_format_args(LogArgument* out, std::format_args fa);
 
     /// Copy bytes into the string ring, optionally NUL-terminating them.
     /// Truncates at kMaxPayloadBytes; shared by the string and binary paths.
@@ -2934,11 +3222,15 @@ private:
     /// though nothing synchronises through it: relaxed is enough because it
     /// carries no data, only progress. The ordering that makes flush() a real
     /// guarantee is the flush_request_/flush_done_ handshake below.
-    std::atomic<uint64_t> read_index_{0};
+    ///
+    /// On a cache line of its own, as is flush_request_ after it: the writer stores
+    /// this after every entry, and sharing a line with running_, writer_parked_ or
+    /// log_level_ (which every log call reads) would cost each call a cache miss.
+    alignas(64) std::atomic<uint64_t> read_index_{0};
     /// Sink flushing is owned by the writer thread, so flush() cannot touch the
     /// sinks directly without racing it. A caller bumps flush_request_ and waits
     /// for the writer thread to publish the same generation in flush_done_.
-    std::atomic<uint64_t> flush_request_{0};
+    alignas(64) std::atomic<uint64_t> flush_request_{0};
     std::atomic<uint64_t> flush_done_{0};
     /// Set while the writer thread is blocked in wake_token_.wait(). Producers
     /// read it after publishing and only pay for a wake-up when one is needed.
@@ -2971,16 +3263,30 @@ private:
     std::shared_ptr<ITimestamper> timestamper_;
     /// Every timestamper replaced since the last reset(). A logging thread may
     /// have loaded the old pointer just before a swap and still be inside its
-    /// now(), and nothing tells the swapping thread when it is done - so like
+    /// now(), and nothing tells the swapping thread when it is done. So, as with
     /// pattern_store_, nothing handed out is freed while the logger may use it.
     /// Swaps are rare, so this stays tiny.
     std::vector<std::shared_ptr<ITimestamper>> retired_timestampers_;
+
+    /// How far producers have got through the entry ring, in pages of
+    /// 2^entry_page_shift_ slots: the first producer into a page raises it before
+    /// writing there. snapshot_entry() tests a copy against this rather than the
+    /// queue's reservation cursor, which every producer writes on every call: read
+    /// once per entry, that line would move to the writer thread and back on every
+    /// log call. This one changes once a page, so both sides almost always find it
+    /// in cache. Local mode only; in shared mode the producers are other processes.
+    struct alignas(64) PageCursor {
+        std::atomic<uint64_t> page{0};
+    };
+    PageCursor entry_page_cursor_;
 
     // ---- Multi-process state; all inert while mode_ is Local ----
     QueueMode mode_ = QueueMode::Local;
     // Cached per-entry stamp, applied on the caller thread by log_to_sink_with_location.
     // Holding these as members keeps the hot path to a load plus a fixed-size copy.
     uint8_t entry_flags_ = 0;
+    // log2 of the slots per entry_page_cursor_ page, fixed when the queue is built.
+    uint32_t entry_page_shift_ = 0;
     uint32_t pid_ = 0;
     char tag_[SLICK_LOGGER_TAG_SIZE] = {};
     std::string shm_name_;
@@ -2991,7 +3297,7 @@ private:
     std::thread stats_thread_;
     /// The published sample, immutable once stored. The statistics thread swaps in
     /// a fresh one per report and readers only ever see a completed object, so
-    /// stats_snapshot() involves no data race - see publish_stats(). Held through
+    /// stats_snapshot() involves no data race; see publish_stats(). Held through
     /// detail::atomic_shared_ptr because libc++ has no std::atomic<std::shared_ptr>.
     detail::atomic_shared_ptr<const LogStats> stats_latest_;
     /// Position just past the last string the writer thread has finished with, so
@@ -3003,7 +3309,7 @@ private:
     std::atomic<uint64_t> stats_string_frontier_{0};
     // The cursor pair the frontier is promoted from, and the rule behind it.
     //
-    // A producer reserves its string bytes BEFORE it reserves an entry slot, so
+    // A producer reserves its string bytes before it reserves an entry slot, so
     // string order and slot order are two independent races and neither implies
     // the other. Taking the frontier from the string of whichever entry the
     // writer happened to drain last is therefore unsound: a producer holding
@@ -3015,7 +3321,7 @@ private:
     // cursor, and promotes the string half only once its read cursor has passed
     // the entry half. At that moment every slot taken before the snapshot has
     // been drained, and every one of those strings was reserved before the
-    // snapshot too, so the whole string ring below it is provably free - whatever
+    // snapshot too, so the whole string ring below it is provably free, whatever
     // order the producers published in. Between promotions the frontier simply
     // stays put, which is the conservative direction: the span grows and the
     // gauge reads fuller, which is what a stalled writer means.
@@ -3058,14 +3364,19 @@ private:
     /// Whether a CSV write has already failed, so the diagnostic is printed once
     /// rather than on every interval.
     bool stats_write_failed_ = false;
-    // Scratch used by the writer thread to rebase shared-memory entries. Owned by
-    // that thread alone, so no synchronization is needed.
-    LogEntry rebase_scratch_{};
+    // The writer thread's copy of the entry it is dispatching: sinks are handed
+    // this, never the ring slot, which a producer can rewrite at any moment (see
+    // snapshot_entry()). Owned by that thread alone, so no synchronization is needed.
+    LogEntry entry_scratch_{};
+    // Entries snapshot_entry() discarded because a producer rewrote their slot
+    // mid-copy. Written by the writer thread alone, read by the statistics thread,
+    // and only counted where kLossDetectionEnabled, like the queue's own count.
+    std::atomic<uint64_t> torn_entry_count_{0};
     // The dispatched entry's message, formatted once for all sinks. Writer thread
     // only; its buffer is reused across entries. See detail::dispatch_message.
     detail::dispatch_message dispatch_message_;
     // When the writer thread first noticed an unpublished slot blocking progress.
-    // Writer-thread-only, like rebase_scratch_.
+    // Writer-thread-only, like entry_scratch_.
     std::chrono::steady_clock::time_point stalled_since_{};
 
     // The logger instance local to this shared library / executable.
@@ -3103,7 +3414,7 @@ inline void ISink::log(LogLevel level, FormatT&& format, Args&&... args) {
     // below-threshold entries then cost neither a queue slot nor a string-ring
     // copy, and a sink that is not attached to a logger has index -1, which
     // log_to_sink() would read as "broadcast to every sink". The arguments were
-    // already evaluated by the caller - use the macros to avoid that too.
+    // already evaluated by the caller; use the macros to avoid that too.
     if (!should_log(logger, level)) {
         return;
     }
@@ -3240,7 +3551,7 @@ inline char spec_presentation_type(std::string_view format_spec) noexcept {
 /**
  * @brief Encode one Unicode code point as UTF-8
  * @return Number of bytes written to @p out, or 0 if @p code_point is not a
- *         Unicode scalar value - an unpaired UTF-16 surrogate (what a lone
+ *         Unicode scalar value: an unpaired UTF-16 surrogate (what a lone
  *         wchar_t holding half a surrogate pair looks like on Windows) or a
  *         value beyond U+10FFFF. Those have no character to encode.
  */
@@ -3294,7 +3605,7 @@ inline uint64_t checked_spec_value(T value) {
  * reader nothing to go on.
  *
  * @note The union member is read by value. These members are packed and may be
- *       misaligned, so a reference must never be bound to one - see
+ *       misaligned, so a reference must never be bound to one; see
  *       append_one_arg.
  * @throws std::format_error if the argument cannot serve as a width/precision
  */
@@ -3315,11 +3626,12 @@ inline uint64_t dynamic_spec_value(const LogArgument& arg) {
 
 /**
  * @brief Append a single log argument, formatted against one "{...}" spec
- * @note The value is taken BY VALUE on purpose. LogEntry and LogArgument are
+ * @note The value is taken by value on purpose. LogEntry and LogArgument are
  *       "#pragma pack(1)", so their members can sit at misaligned addresses,
  *       and std::make_format_args binds a reference to whatever it is handed.
  *       Binding that reference directly to a packed member is undefined
- *       behavior - UBSan reports "reference binding to misaligned address".
+ *       behavior, which UBSan reports as "reference binding to misaligned
+ *       address".
  *       Reading a packed member into a by-value parameter is well defined, and
  *       the parameter itself is always suitably aligned.
  */
@@ -3353,8 +3665,8 @@ inline void append_log_argument(std::string& out, std::string_view format_spec, 
             // std::format does for char instead: render it as text by
             // default and as a number under a b/B/d/o/x/X presentation
             // type. Dispatching on the spec rather than on the value
-            // keeps "{}" and "{:5}" producing the same kind of output -
-            // and the same default alignment - for every code point,
+            // keeps "{}" and "{:5}" producing the same kind of output
+            // (and the same default alignment) for every code point,
             // instead of silently switching to a number above U+007F.
             //
             // wchar_t is signed on Linux and macOS, so go through the
@@ -3371,7 +3683,7 @@ inline void append_log_argument(std::string& out, std::string_view format_spec, 
                     as_number = true;
                     break;
                 case 'c':
-                    // "render as a character" - already the default
+                    // "render as a character" is already the default
                     // here, and std::format's string formatter would
                     // reject the 'c', so drop it.
                     char_spec.assign(format_spec, 0, format_spec.size() - 2);
@@ -3389,7 +3701,7 @@ inline void append_log_argument(std::string& out, std::string_view format_spec, 
             } else {
                 // Either the spec asked for a number, or the value is
                 // not a Unicode scalar value and has no character to
-                // print - fall back to the numeric code point.
+                // print, so fall back to the numeric code point.
                 append_one_arg(out, spec, code_point);
             }
             break;
@@ -3455,8 +3767,8 @@ inline void append_log_argument(std::string& out, std::string_view format_spec, 
  * type-erased arguments to reach the same result, and "{}" is by far the most
  * common field, so skipping it is most of what a line spends on its arguments.
  *
- * Anything whose rendering is not a plain conversion - an infinity or NaN, a
- * null string, a binary payload - goes through append_log_argument instead, so
+ * Anything whose rendering is not a plain conversion (an infinity or NaN, a
+ * null string, a binary payload) goes through append_log_argument instead, so
  * the output never depends on which path was taken.
  */
 inline void append_plain_argument(std::string& out, const LogArgument& arg) {
@@ -3580,12 +3892,12 @@ struct spec_piece {
  * The format a LOG_* macro passes is a string literal: fixed text at a fixed
  * address, so its fields come out the same on every line. It is parsed the first
  * time it is seen, into ops ready to replay, and every later line goes straight
- * to formatting its arguments - no brace scan, no spec rebuilt per field.
+ * to formatting its arguments, with no brace scan and no spec rebuilt per field.
  *
  * Keyed by (address, length, argument count). The count is part of the key
- * because what the fields resolve to depends on it - which report <MISSING_ARG>,
- * and so how far the automatic index advances - and a literal the compiler
- * pools can arrive from two calls passing different counts.
+ * because what the fields resolve to depends on it (which ones report
+ * <MISSING_ARG>, and so how far the automatic index advances), and a literal
+ * the compiler pools can arrive from two calls passing different counts.
  *
  * Only entries flagged kEntryStaticFormat are cached. Any other format lives in
  * the string ring, whose slots are reused, so its address says nothing about its
@@ -3755,8 +4067,8 @@ private:
     op_range parse(std::string_view fmt, uint8_t arg_count) {
         const size_t begin = ops_.size();
 
-        // Text runs that turn out adjacent - "a{{b" is "a{" then "b" - become
-        // one op, so an escaped brace costs no extra append.
+        // Text runs that turn out adjacent ("a{{b" is "a{" then "b") become one
+        // op, so an escaped brace costs no extra append.
         auto literal = [&](size_t off, size_t len) {
             if (len == 0) {
                 return;
@@ -3807,7 +4119,7 @@ private:
             // Find this field's closing brace. The spec may itself contain
             // replacement fields, for a dynamic width or precision
             // ("{:{}.{}f}"), so the first '}' is not necessarily the one that
-            // ends the field - step over a nested field rather than stopping
+            // ends the field; step over a nested field rather than stopping
             // inside it. A nested field cannot nest any further, so one level
             // is all the grammar allows for.
             //
@@ -3844,7 +4156,7 @@ private:
             //
             // std::format rejects a format string that mixes explicit indices
             // with bare {} automatic placeholders. This parser tolerates the
-            // mix - the two counters are independent - rather than losing the
+            // mix (the two counters are independent) rather than losing the
             // whole log line to a format error.
             uint8_t resolved_index = 0;
             size_t spec_prefix_len = 0; // leading digits consumed from the placeholder
@@ -3859,7 +4171,7 @@ private:
                         // and further digits can only push it further out, so
                         // stop accumulating there. Multiplying through a long
                         // digit run would overflow uint32_t and could wrap a
-                        // huge index back onto a valid argument - "{4294967296}"
+                        // huge index back onto a valid argument: "{4294967296}"
                         // would otherwise select argument 0.
                         id = id * 10 + static_cast<uint32_t>(fmt[brace_start + 1 + spec_prefix_len] - '0');
                     }
@@ -3985,9 +4297,9 @@ private:
             }
             // A zero width is dropped rather than written out. A literal 0
             // in the width position is the zero-padding flag and not a
-            // width at all - "{:0}" pads a number, and is rejected outright
-            // for a text argument - whereas a width of zero just means no
-            // minimum width, which is exactly what leaving it out says.
+            // width at all ("{:0}" pads a number, and is rejected outright
+            // for a text argument), whereas a width of zero just means no
+            // minimum width, which is what leaving it out says.
             // Zero is a meaningful precision ("{:.0f}"), so only the width
             // case is dropped; the '.' that introduces a precision is
             // already in the spec by the time we get here.
@@ -4061,9 +4373,9 @@ inline bool append_formatted_message(std::string& out, const LogEntry& entry) {
     // error text replaces the partial message instead of trailing it.
     const size_t base = out.size();
 
-    // Since std::make_format_args doesn't work with custom types in MSVC,
-    // we'll use a manual implementation that preserves std::format functionality
-    // by manually parsing format specifiers and applying them to each argument
+    // std::make_format_args doesn't work with custom types on MSVC, so the format
+    // specifiers are parsed by hand and applied to each argument, which keeps
+    // std::format's behavior.
     try {
         out.reserve(base + fmt.size() + 256); // Reserve some space for formatting
         detail::message_formats::local().append(out, fmt, entry);
@@ -4698,7 +5010,7 @@ inline void PatternFormatter::format(std::string& out, const LogEntry& entry,
     // Null exactly when the pattern renders no calendar field, which is the only
     // case in which nothing reads it: every op that does is a flag_needs_cache()
     // flag, and those are what set needs_cache_. When one is present the pointer
-    // is never null - a localtime failure renders the same 1970 placeholder the
+    // is never null: a localtime failure renders the same 1970 placeholder the
     // built-in layout uses, which keeps every date op free of a null check.
     const detail::second_cache* cache = nullptr;
     if (needs_cache_) {
@@ -5031,7 +5343,7 @@ inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, cons
             current_file_size_ = std::filesystem::file_size(base_path_);
         }
     }
-    // Keep logging to base_path (e.g., daily.log) - FileSink constructor already opened it
+    // Keep logging to base_path (e.g., daily.log); the FileSink constructor already opened it
 }
 
 inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
@@ -5092,7 +5404,7 @@ inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, cons
             current_file_size_ = std::filesystem::file_size(base_path_);
         }
     }
-    // Keep logging to base_path (e.g., daily.log) - FileSink constructor already opened it
+    // Keep logging to base_path (e.g., daily.log); the FileSink constructor already opened it
 }
 
 inline void DailyFileSink::write(const LogEntry& entry) {
@@ -5151,7 +5463,7 @@ inline void DailyFileSink::rotate_files_for_date(const std::string& date) {
 
     if (config_.max_files == 1) {
         // If max_files is 1, we only keep the dated file (no indexed files)
-        // Just remove the old dated file - it will be replaced by the new one
+        // Just remove the old dated file; the new one replaces it
         if (std::filesystem::exists(dated_file)) {
             std::filesystem::remove(dated_file);
         }
@@ -5300,12 +5612,12 @@ inline void Logger::publish_stats(const LogStats& stats) noexcept {
     // Each report publishes a fresh, immutable LogStats and swaps the pointer, so
     // a reader is never looking at storage the statistics thread is writing.
     //
-    // A seqlock over a shared LogStats would be cheaper, but it is a data race by
-    // the letter of the memory model - the reader copies the payload while the
-    // writer assigns it and only afterwards learns the generation moved - which is
+    // A seqlock over a shared LogStats would be cheaper, but by the letter of the
+    // memory model it is a data race: the reader copies the payload while the
+    // writer assigns it, and only afterwards learns the generation moved. That is
     // undefined behavior no fence can repair. One allocation per reporting
-    // interval (once a second by default), entirely off the logging path, is a
-    // trivial price for a snapshot that is actually race-free.
+    // interval (once a second by default), off the logging path, is a small
+    // price for a snapshot with no race at all.
     try {
         stats_latest_.store(std::make_shared<const LogStats>(stats),
                             std::memory_order_release);
@@ -5332,9 +5644,9 @@ inline void Logger::accumulate_stats_sample() noexcept {
     ++stats_sample_count_;
 
     // The string ring is a gauge too, and is invisible to a once-per-report read
-    // for exactly the same reason the depth is: by the time a report lands, the
-    // burst that backed the ring up has usually drained. Sampling it costs three
-    // relaxed loads - the writer's read cursor and the two ring cursors - so it is
+    // for the same reason the depth is: by the time a report lands, the burst
+    // that backed the ring up has usually drained. Sampling it costs three
+    // relaxed loads (the writer's read cursor and the two ring cursors), so it is
     // cheap enough to run on the tick.
     if (mode_ == QueueMode::SharedProducer) {
         return; // no local reader, so there is no frontier to measure against
@@ -5355,13 +5667,13 @@ inline void Logger::advance_string_frontier() noexcept {
     // stats_string_frontier_: hold one (entry cursor, string cursor) snapshot and
     // promote the string half only once the read cursor has passed the entry half.
     if (!stats_gen_open_) {
-        // Order matters and is the whole proof. R is read FIRST: every entry with
-        // a slot below R had already taken that slot, and a producer reserves its
-        // string before it takes a slot, so every one of those strings was
-        // reserved before R was read - and therefore before S, read after it. So
-        // "all slots below R drained" really does mean "everything below S
-        // consumed". Reading S first would let a slot below R reserve a string
-        // above S in between, and the promotion would free bytes still in use.
+        // The read order is the proof. R is read first: every entry with a slot
+        // below R had already taken that slot, and a producer reserves its string
+        // before it takes a slot, so every one of those strings was reserved
+        // before R was read, and therefore before S, which is read after it. So
+        // "all slots below R drained" means "everything below S consumed".
+        // Reading S first would let a slot below R reserve a string above S in
+        // between, and the promotion would free bytes still in use.
         stats_gen_entry_ = log_queue_->initial_reading_index();
         stats_gen_string_ = string_queue_->initial_reading_index();
         stats_gen_open_ = true;
@@ -5383,16 +5695,16 @@ inline bool Logger::sample_string_occupancy(LogStats& stats) noexcept {
         return false;
     }
 
-    // The entry ring's reservation cursor is NOT a publication boundary: a producer
+    // The entry ring's reservation cursor is not a publication boundary: a producer
     // reserves a slot, then fills it, then publishes. Reading a slot off that
     // cursor would race the fill and yield torn data, so the statistics thread
     // never touches the entry ring directly. The writer thread instead publishes
     // the frontier below, taken from an entry read() has already handed it.
     if (read_index_.load(std::memory_order_relaxed) >=
         log_queue_->initial_reading_index()) {
-        // Nothing outstanding, so nothing in the string ring is still needed. A
-        // real measurement of zero, not an absent one: reporting it as invalid
-        // would hide the healthiest state the pipeline has.
+        // Nothing outstanding, so nothing in the string ring is still needed.
+        // This zero is a measurement, and reporting it as invalid would hide the
+        // healthiest state the pipeline has.
         stats.string_inflight_bytes = 0;
         stats.string_pct = 0.0;
         stats.string_pct_valid = true;
@@ -5402,15 +5714,15 @@ inline bool Logger::sample_string_occupancy(LogStats& stats) noexcept {
     // Everything from the frontier to the write cursor is still outstanding. The
     // frontier starts life at the ring cursor start() saw, so there is always a
     // floor to measure from: before the writer has confirmed a single drain,
-    // nothing has been consumed, and the whole span since start really is in
-    // flight. That is a measurement, not an absence - reporting it as unknown
-    // would blank the row exactly while a startup burst was filling the ring.
+    // nothing has been consumed, and the whole span since start is in flight.
+    // Reporting it as unknown would blank the row exactly while a startup burst
+    // was filling the ring.
     const uint64_t watermark = stats_string_frontier_.load(std::memory_order_relaxed);
     const uint64_t write_cursor = string_queue_->initial_reading_index();
     // An absolute reserve index in both modes, so the span is a plain
     // subtraction. Keeping it absolute is what lets an exactly full ring read as
-    // capacity instead of aliasing to zero, and makes a genuine overrun visible
-    // as a distance past capacity rather than silently folding back into range.
+    // capacity instead of aliasing to zero, and makes an overrun visible as a
+    // distance past capacity rather than silently folding back into range.
     uint64_t behind = write_cursor > watermark ? write_cursor - watermark : 0;
     if (behind > capacity) {
         behind = capacity;
@@ -5437,7 +5749,7 @@ inline LogStats Logger::sample_stats() noexcept {
     const uint64_t depth = produced > consumed ? produced - consumed : 0;
     const uint64_t entry_capacity = log_queue_->size();
     // A shared-memory producer has no writer thread, so read_index_ never advances
-    // and anything derived from it would be a fiction. Report those as zero, the
+    // and anything derived from it would be meaningless. Report those as zero, the
     // same reasoning flush() uses to return early in that mode.
     const bool has_reader = (mode_ != QueueMode::SharedProducer);
 
@@ -5445,8 +5757,8 @@ inline LogStats Logger::sample_stats() noexcept {
     stats.entries_consumed = has_reader ? consumed : 0;
     stats.entry_queue_depth = has_reader ? depth : 0;
     // The report-time reading is a sample too, and is taken after the last tick,
-    // so fold it in - otherwise the "peak" could come out below the value in the
-    // very same row.
+    // so fold it in. Otherwise the "peak" could come out below the value in the
+    // same row.
     stats.entry_queue_depth_max = has_reader ? std::max(stats_depth_max_, depth) : 0;
     stats.entry_queue_capacity = static_cast<uint32_t>(entry_capacity);
     if (has_reader && stats_sample_count_ != 0) {
@@ -5464,7 +5776,9 @@ inline LogStats Logger::sample_stats() noexcept {
     const uint64_t string_capacity = string_queue_->size();
     stats.string_bytes_written = string_queue_->initial_reading_index();
     stats.string_buffer_capacity = static_cast<uint32_t>(string_capacity);
-    stats.entry_loss_count = log_queue_->loss_count();
+    // Plus the entries the writer read but discarded as torn: they too were
+    // overwritten before it could use them, just mid-read rather than before it.
+    stats.entry_loss_count = log_queue_->loss_count() + torn_entry_count_.load(std::memory_order_relaxed);
     stats.string_loss_count = string_queue_->loss_count();
 
     if (has_reader) {
@@ -5508,7 +5822,7 @@ inline LogStats Logger::sample_stats() noexcept {
             std::chrono::steady_clock::now() - stats_last_report_).count();
         stats.interval_sec = elapsed;
         if (elapsed > 0.0) {
-            // Deltas over the MEASURED elapsed time, so a late wake-up shifts when
+            // Deltas over the measured elapsed time, so a late wake-up shifts when
             // a sample lands but never distorts the rate it reports.
             const auto delta = [](uint64_t now_v, uint64_t then_v) noexcept -> double {
                 return now_v > then_v ? static_cast<double>(now_v - then_v) : 0.0;
@@ -5700,6 +6014,15 @@ inline void Logger::init(const std::filesystem::path& log_file, size_t log_queue
 }
 
 inline void Logger::start() {
+    // Every init() builds fresh queues and then comes here, so the writer's view
+    // of the entry ring starts over here too. 64 pages per ring for
+    // entry_page_cursor_, or a page per slot in rings smaller than that: more pages
+    // drop fewer entries early, fewer mean producers raise the cursor less often.
+    torn_entry_count_.store(0, std::memory_order_relaxed);
+    entry_page_cursor_.page.store(0, std::memory_order_relaxed);
+    const uint32_t ring_shift = static_cast<uint32_t>(std::countr_zero(log_queue_->size()));
+    entry_page_shift_ = ring_shift > 6 ? ring_shift - 6 : 0;
+
     // Before running_ and before any thread: open_stats_csv() throws on a file it
     // cannot create, and a throw from here must leave the logger untouched rather
     // than half-started with a live writer thread the failed caller never expects.
@@ -5727,15 +6050,14 @@ inline void Logger::start() {
             string_queue_ ? string_queue_->initial_reading_index() : 0;
         if (mode_ == QueueMode::SharedCollector && collect_backlog_) {
             // A collector replaying a backlog is the one case where the attach
-            // point is NOT a floor. It deliberately rewinds its entry reader
-            // below that point (see below), so the entries it is about to drain
-            // own strings that producers reserved before it ever attached -
-            // strings the attach cursor would declare free from the first
-            // sample, reporting an idle ring throughout the replay. Rewind the
-            // floor exactly the way the reader is rewound, to the oldest
-            // position the ring can still hold: anything older than that has
-            // been overwritten anyway, and what is left really is in flight
-            // until the replay has drained it.
+            // point is not a floor. It rewinds its entry reader below that point
+            // (see below), so the entries it is about to drain own strings that
+            // producers reserved before it attached. The attach cursor would
+            // declare those strings free from the first sample and report an
+            // idle ring throughout the replay. Rewind the floor the same way the
+            // reader is rewound, to the oldest position the ring can still hold:
+            // anything older has been overwritten anyway, and what is left is in
+            // flight until the replay has drained it.
             const uint64_t capacity = string_queue_ ? string_queue_->size() : 0;
             string_floor = string_floor > capacity ? string_floor - capacity : 0;
         }
@@ -5763,9 +6085,9 @@ inline void Logger::start() {
 
         // No wait for the thread to come up: running_ is already true, and the
         // queue is lock-free, so entries logged before the thread is scheduled
-        // simply wait in the ring for it to drain them. The delay that used to
-        // stand here could not have ensured anything anyway - a sleep is not a
-        // handshake - and on Windows it cost ~15.6ms of every init().
+        // simply wait in the ring for it to drain them. A sleep here would not
+        // be a handshake anyway, and on Windows it would add ~15.6ms to every
+        // init().
         writer_thread_ = std::thread([this]() { writer_thread_func(); });
     }
     log(LogLevel::L_INFO, "SlickLogger v{}", SLICK_LOGGER_VERSION);
@@ -5893,7 +6215,7 @@ inline std::unique_ptr<slick::queue<T, Logger::logger_queue_traits>> Logger::ope
 
     try {
         // Create it. Still create-or-attach, so a process that loses the race to
-        // another creator simply attaches instead - and throws if that creator
+        // another creator simply attaches instead, and throws if that creator
         // chose a different items_per_slot.
         return std::make_unique<slick::queue<T, logger_queue_traits>>(size, items_per_slot, name.c_str());
     }
@@ -5960,8 +6282,8 @@ inline void Logger::set_pattern(std::string_view pattern) {
     // Compiled exactly once, here. An invalid pattern throws before any sink has
     // been touched, so a typo cannot leave half the sinks reformatted, and the
     // sinks that do take it then share the one formatter rather than each
-    // compiling the same text over again. The loop itself cannot fail at all -
-    // apply_default_pattern() is noexcept - so the compile is the only step that
+    // compiling the same text over again. The loop itself cannot fail, since
+    // apply_default_pattern() is noexcept, so the compile is the only step that
     // can, and it happens before the first sink is reached.
     const PatternFormatter* compiled = pattern_store_->get(pattern);
     default_pattern_ = compiled;
@@ -6001,8 +6323,8 @@ inline void Logger::release_sinks() {
         }
     }
     // sinkname_index_map_ holds string_view keys that point into the name strings
-    // owned by each sink object - it must be cleared before the sink shared_ptrs
-    // are destroyed so no dangling views remain.
+    // owned by each sink object, so it must be cleared before the sink shared_ptrs
+    // are destroyed or dangling views would remain.
     sinkname_index_map_.clear();
     sinks_.clear();
 }
@@ -6039,7 +6361,7 @@ inline void Logger::init(size_t queue_size, size_t string_buffer_size) {
         throw std::runtime_error("No sink. Sinks should be added first before calling this.");
     }
 
-    // Initialize logger with pre-set sinks - sinks should be added before calling this
+    // Initialize the logger with sinks that were already added; add them before calling this
     // Ensure queue_size is power of 2
     create_local_queues(round_up_to_power_of_2(queue_size),
                         round_up_to_power_of_2(string_buffer_size), kDefaultStringItemsPerSlot);
@@ -6166,32 +6488,29 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
     // the segment maps at a different base address in each attached process.
     const bool use_offsets = (entry_flags_ & kEntryOffsets) != 0;
 
-    LogEntry entry;
-    entry.level = level;
-    entry.timestamp = timestamp;
-    entry.flags = entry_flags_;
-    entry.pid = pid_;
-#if SLICK_LOGGER_ENABLE_THREAD_ID
-    entry.thread_id = detail::current_thread_id();
-#endif
-    std::memcpy(entry.tag, tag_, sizeof(entry.tag));
+    // Everything bound for the string ring is copied there before the entry's
+    // slot is reserved: the statistics frontier relies on a string never being
+    // reserved after the slot that refers to it (see advance_string_frontier()).
+    uint8_t flags = entry_flags_;
+    StringRef file{};
     if (has_source_location(file_name, line)) {
         // A static file name lives in the caller's read-only data, which no other
         // process can address, so shared mode always copies it into the ring.
-        entry.file = (copy_file_name || use_offsets)
+        file = (copy_file_name || use_offsets)
             ? store_string_in_queue(file_name)
             : StringRef{file_name, 0};
-        entry.line = line;
-        entry.flags |= kEntryHasSourceLocation;
+        flags |= kEntryHasSourceLocation;
+    } else {
+        line = 0;
     }
-    entry.sink_index = sink_index;
+    StringRef format_ref;
     if constexpr (IS_STRING_LITERAL(format)) {
         constexpr uint32_t format_length = static_cast<uint32_t>(sizeof(format) - 1);
         if (use_offsets) {
-            entry.format = store_string_in_queue(std::string_view{format, format_length});
+            format_ref = store_string_in_queue(std::string_view{format, format_length});
         } else {
-            entry.format = StringRef{format, format_length};  // String literal - safe to store pointer
-            entry.flags |= kEntryStaticFormat;
+            format_ref = StringRef{format, format_length};  // String literal: safe to store the pointer
+            flags |= kEntryStaticFormat;
         }
     }
     else {
@@ -6199,27 +6518,68 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
         // lifetime extends until the writer thread consumes the entry.
         static_assert(std::is_convertible_v<FormatT, std::string_view>,
                       "Format string type must be a string literal or convertible to std::string_view.");
-        entry.format = store_string_in_queue(
+        format_ref = store_string_in_queue(
             std::string_view{std::forward<FormatT>(format)});
     }
 
+    // Arguments are staged in an array sized for this call, so only the ones it
+    // carries are ever written to the slot.
+    constexpr size_t kMaxArgCount = is_single_format_args_v<Args...> ? SLICK_LOGGER_MAX_ARGS : sizeof...(Args);
+    static_assert(kMaxArgCount <= SLICK_LOGGER_MAX_ARGS, "Too many log arguments");
+    std::array<LogArgument, kMaxArgCount> staged_args;
+    uint8_t arg_count = 0;
     if constexpr (is_single_format_args_v<Args...>) {
-        // Pre-built std::format_args: unpack values into the entry on the
-        // calling thread (format_args holds non-owning references).
-        enqueue_format_args(entry,
+        // Pre-built std::format_args: unpack values on the calling thread
+        // (format_args holds non-owning references).
+        arg_count = enqueue_format_args(staged_args.data(),
             std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...)));
     } else {
-        // Normal path: push individual arguments
-        entry.arg_count = sizeof...(args);
+        arg_count = static_cast<uint8_t>(sizeof...(args));
         size_t arg_idx = 0;
-        static_assert(sizeof...(args) <= SLICK_LOGGER_MAX_ARGS, "Too many log arguments");
-        (enqueue_argument(entry.args[arg_idx++], std::forward<Args>(args)), ...);
+        (enqueue_argument(staged_args[arg_idx++], std::forward<Args>(args)), ...);
     }
+#if SLICK_LOGGER_ENABLE_THREAD_ID
+    const uint32_t thread_id = detail::current_thread_id();
+#else
+    const uint32_t thread_id = 0;
+#endif
 
-
-
-    uint64_t index = log_queue_->reserve();
-    *(*log_queue_)[index] = std::move(entry);
+    // The entry is written straight into its slot, field by field and only as
+    // many arguments as it has, rather than built on the stack and copied whole:
+    // a LogEntry is 327 bytes, most of them argument slots a call rarely fills.
+    const uint64_t index = log_queue_->reserve();
+    if (!use_offsets) {
+        // Announce the page before writing into it; see entry_page_cursor_.
+        const uint64_t page = index >> entry_page_shift_;
+        uint64_t announced = entry_page_cursor_.page.load(std::memory_order_relaxed);
+        while (announced < page &&
+               !entry_page_cursor_.page.compare_exchange_weak(announced, page, std::memory_order_relaxed)) {
+        }
+    }
+    // Orders the reservation and the page above before every write to the slot
+    // below, as seen by the writer thread's acquire fence in snapshot_entry(): a
+    // writer that copies any of these bytes also sees this slot's reuse announced,
+    // and discards the copy.
+    std::atomic_thread_fence(std::memory_order_release);
+    LogEntry& entry = *(*log_queue_)[index];
+    entry.format = format_ref;
+    entry.timestamp = timestamp;
+    entry.file = file;
+    entry.pid = pid_;
+    entry.thread_id = thread_id;
+    entry.line = line;
+    entry.sink_index = sink_index;
+    entry.level = level;
+    entry.flags = flags;
+    entry.arg_count = arg_count;
+    std::memcpy(entry.tag, tag_, sizeof(entry.tag));
+    if constexpr (kMaxArgCount > 0) {
+        // A compile-time size on the usual path, so this is a few plain stores.
+        const size_t arg_bytes = is_single_format_args_v<Args...>
+            ? arg_count * sizeof(LogArgument)
+            : kMaxArgCount * sizeof(LogArgument);
+        std::memcpy(entry.args, staged_args.data(), arg_bytes);
+    }
     log_queue_->publish(index);
     wake_writer();
 }
@@ -6284,7 +6644,7 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
             }
             return;
         default:
-            // larger integral types? - convert to string
+            // larger integral types: convert to string
             arg.type = ArgType::STRING_DYNAMIC;
             arg.value.dynamic_str = store_string_in_queue(std::to_string(value));
             return;
@@ -6337,12 +6697,12 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
         arg.value.dynamic_str = store_string_in_queue(value);
     }
     else if constexpr (std::is_same_v<DecayedT, std::string>) {
-        // Dynamic string - copy to string queue
+        // Dynamic string: copy to the string queue
         arg.type = ArgType::STRING_DYNAMIC;
         arg.value.dynamic_str = store_string_in_queue(value);
     }
     else if constexpr (std::is_same_v<DecayedT, std::string_view>) {
-        // Could be either - need to determine at runtime or copy to be safe       
+        // May view a literal or a temporary, with no way to tell, so copy it       
         arg.type = ArgType::STRING_DYNAMIC;
         arg.value.dynamic_str = store_string_in_queue(value);
     }
@@ -6357,7 +6717,7 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
         arg.value.ptr = const_cast<void*>(static_cast<const volatile void*>(value));
     }
     else {
-        // custom type - convert to string
+        // Custom type: convert to string
         arg.type = ArgType::STRING_DYNAMIC;
         arg.value.dynamic_str = store_string_in_queue(std::to_string(value));
     }
@@ -6367,10 +6727,17 @@ inline StringRef Logger::store_bytes_in_queue(const char* data, size_t size, boo
     // slick-queue packs the reservation size into 16 bits, so an over-long
     // reservation would corrupt the write cursor. Truncate instead.
     uint32_t length = static_cast<uint32_t>(std::min<size_t>(size, kMaxPayloadBytes));
-    // slick-queue rejects a zero-size reservation, so an empty unterminated
-    // payload still claims one byte. That keeps the invariant every reader
-    // depends on - a stored reference always resolves to a real ring slot - at
-    // the cost of one byte in a case that carries no data anyway.
+    const bool use_offsets = (entry_flags_ & kEntryOffsets) != 0;
+    if (length == 0 && !use_offsets) {
+        // Nothing to copy, and a length of 0 sends view_string_ref() scanning for
+        // the NUL, which a lapping producer can overwrite in a ring slot. A
+        // literal's NUL cannot be overwritten.
+        return StringRef{"", 0};
+    }
+    // slick-queue rejects a zero-size reservation, so in shared mode an empty
+    // unterminated payload still claims one byte. That keeps the invariant the
+    // collector depends on (a stored reference always resolves to a real ring
+    // slot) at the cost of one byte in a case that carries no data anyway.
     uint32_t reserved = std::max(1u, length + (terminate ? 1u : 0u));
 
     uint64_t start_index = string_queue_->reserve(reserved);
@@ -6386,7 +6753,7 @@ inline StringRef Logger::store_bytes_in_queue(const char* data, size_t size, boo
     string_queue_->publish(start_index, reserved);
 
     StringRef ref;
-    if (entry_flags_ & kEntryOffsets) {
+    if (use_offsets) {
         // Shared memory: hand out the ring index, which every attached process
         // can resolve against its own mapping.
         ref.offset = start_index;
@@ -6406,13 +6773,13 @@ inline StringRef Logger::store_string_in_queue(std::string_view str) {
 
 inline StringRef Logger::store_binary_in_queue(BinaryView payload) {
     // Binary payloads are not terminated. view_binary() treats the stored length
-    // as authoritative - a payload can contain NUL bytes, so a terminator would
-    // mean nothing to a reader - and skipping it saves a byte of ring space and
+    // as authoritative (a payload can contain NUL bytes, so a terminator would
+    // mean nothing to a reader), and skipping it saves a byte of ring space and
     // a store per binary argument.
     return store_bytes_in_queue(reinterpret_cast<const char*>(payload.data), payload.size, false);
 }
 
-inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
+inline uint8_t Logger::enqueue_format_args(LogArgument* out, std::format_args fa) {
     size_t arg_idx = 0;
     while (arg_idx < SLICK_LOGGER_MAX_ARGS) {
         auto arg = fa.get(arg_idx);
@@ -6424,30 +6791,30 @@ inline void Logger::enqueue_format_args(LogEntry& entry, std::format_args fa) {
             } else if constexpr (std::is_same_v<DT, typename std::basic_format_arg<std::format_context>::handle>) {
                 // Custom type via handle: std::format_context is not publicly
                 // constructible, so store a placeholder instead.
-                enqueue_argument(entry.args[arg_idx], std::string_view{"<handle>"});
+                enqueue_argument(out[arg_idx], std::string_view{"<handle>"});
 #ifdef __SIZEOF_INT128__
             } else if constexpr (std::is_same_v<DT, __int128>) {
-                enqueue_argument(entry.args[arg_idx], static_cast<long long>(v));
+                enqueue_argument(out[arg_idx], static_cast<long long>(v));
             } else if constexpr (std::is_same_v<DT, unsigned __int128>) {
-                enqueue_argument(entry.args[arg_idx], static_cast<unsigned long long>(v));
+                enqueue_argument(out[arg_idx], static_cast<unsigned long long>(v));
 #endif
             } else if constexpr (is_float128_v<DT>) {
-                enqueue_argument(entry.args[arg_idx], static_cast<double>(v));
+                enqueue_argument(out[arg_idx], static_cast<double>(v));
             } else {
-                enqueue_argument(entry.args[arg_idx], std::forward<T>(v));
+                enqueue_argument(out[arg_idx], std::forward<T>(v));
             }
         }, arg);
         if (is_monostate) break;
         ++arg_idx;
     }
-    entry.arg_count = static_cast<uint8_t>(arg_idx);
+    return static_cast<uint8_t>(arg_idx);
 }
 
 inline void Logger::shutdown(bool clear_sinks) {
     if (running_.load(std::memory_order_relaxed)) {
         running_.store(false, std::memory_order_release);
         // The writer thread may be parked. atomic::wait has no timeout, so it
-        // only ever resumes because the token changed - without this the join
+        // only ever resumes because the token changed. Without this the join
         // below would block until something else happened to be logged.
         force_wake_writer();
         if (writer_thread_.joinable()) {
@@ -6467,8 +6834,8 @@ inline void Logger::shutdown(bool clear_sinks) {
     stats_enabled_ = false;
     // Dropped here rather than only in reset(), because shutdown() is what turns
     // statistics off and stats_snapshot() documents a zeroed LogStats for a logger
-    // with them disabled. Left in place, the last snapshot of a finished run stays
-    // readable afterwards, and - since init() shuts down first - would resurface as
+    // with them disabled. Left in place, the last snapshot of a finished run would
+    // stay readable afterwards and, since init() shuts down first, would resurface as
     // live-looking data after a re-init with statistics off, or after an init()
     // that threw out of open_stats_csv(). The statistics thread was joined above,
     // so nothing can publish a new snapshot over this one.
@@ -6486,8 +6853,8 @@ inline void Logger::shutdown(bool clear_sinks) {
     }
     // Destroying a shared queue only unmaps it: since slick-queue 2.3.0 no queue
     // shm_unlink()s its segment, not even the one that created it. Unlinking frees
-    // the NAME while existing mappings stay valid, so a creator that unlinked on
-    // exit would strand every process still attached - newcomers would create a
+    // the name while existing mappings stay valid, so a creator that unlinked on
+    // exit would strand every process still attached: newcomers would create a
     // fresh segment under the same name and their entries would silently vanish.
     // The name therefore persists until removed (see the POSIX cleanup note in the
     // README), and this process's mapping is released here like any other.
@@ -6527,8 +6894,8 @@ inline void Logger::flush() {
     });
 
     // Consuming an entry only hands it to a sink; the sink may still be holding it
-    // in a stream buffer. Ask the writer thread - the only thread allowed to touch
-    // the sinks - to flush, and wait for it to acknowledge this request.
+    // in a stream buffer. Ask the writer thread, the only thread allowed to touch
+    // the sinks, to flush, and wait for it to acknowledge this request.
     const uint64_t generation = flush_request_.fetch_add(1, std::memory_order_acq_rel) + 1;
     force_wake_writer(); // it may be parked, and would not see the request otherwise
     wait_until_ready([&] { return flush_done_.load(std::memory_order_acquire) >= generation; });
@@ -6541,10 +6908,10 @@ inline void Logger::reset() {
     read_index_.store(0, std::memory_order_relaxed);
     log_level_.store(LogLevel::L_TRACE);
     source_location_options_.store(kSourceLocationEnabled, std::memory_order_relaxed);
-    // Cleared for the same reason as log_level_ above. init(config) deliberately
-    // treats an empty config.pattern as "leave the current default alone", so a
-    // pattern surviving reset() would silently reappear on sinks registered by
-    // the next init() - exactly the cross-contamination reset() exists to avoid.
+    // Cleared for the same reason as log_level_ above. init(config) treats an
+    // empty config.pattern as "leave the current default alone", so a pattern
+    // surviving reset() would silently reappear on sinks registered by the next
+    // init(), which is the cross-contamination reset() exists to avoid.
     default_pattern_ = nullptr;
     // Back to system_clock, for the same reason. Only here, never in shutdown():
     // the retired ones may be freed now because reset(), like the rest of this
@@ -6570,7 +6937,7 @@ inline void Logger::reset() {
     // Same reasoning: shutdown() above joined the statistics thread, so nothing
     // else can be touching any of this, and clearing it leaves a reused Logger
     // indistinguishable from a fresh one. The published snapshot is not among
-    // them - shutdown() drops that itself, so it is gone for every caller, not
+    // them: shutdown() drops that itself, so it is gone for every caller, not
     // just the ones that go on to reset().
     stats_previous_ = LogStats{};
     stats_has_previous_ = false;
@@ -6599,10 +6966,14 @@ inline Logger::DrainResult Logger::drain_pending() {
     read_index_.store(cursor, std::memory_order_relaxed);
 
     if (entry_ptr && count) {
-        write_log_entry(entry_ptr, count);
+        // read() leaves the cursor just past what it returned, and every entry is
+        // reserved as exactly one slot.
+        if (snapshot_entry(*entry_ptr, cursor - 1)) {
+            dispatch_entry(entry_scratch_);
+        }
 
         if (stats_enabled_ && string_queue_) {
-            // Placed AFTER the dispatch: the promotion below means "the writer is
+            // Placed after the dispatch: the promotion below means "the writer is
             // done with everything under this position", which is only true once
             // the batch has actually been written.
             advance_string_frontier();
@@ -6638,20 +7009,20 @@ inline Logger::DrainResult Logger::drain_pending() {
 inline void Logger::writer_thread_func() {
     stalled_since_ = {};
 
-    // Sinks are flushed when the queue runs dry rather than after every batch.
-    // Flushing per batch meant one fflush per entry whenever the writer thread
-    // kept up with the producers, which cost far more than formatting the entry.
-    // Draining to empty and then flushing preserves what callers can observe -
-    // once the logger is caught up, everything logged is on disk - while letting
-    // a burst share a single flush.
+    // Sinks are flushed when the queue runs dry, not after every batch. Flushing
+    // per batch would mean one fflush per entry whenever the writer thread keeps
+    // up with the producers, which costs far more than formatting the entry.
+    // Draining to empty and then flushing keeps what callers can observe (once
+    // the logger is caught up, everything logged is on disk) while letting a
+    // burst share a single flush.
     bool sinks_dirty = false;
 
-    // Idle backoff. std::this_thread::sleep_for is deliberately not used here:
-    // Windows' default timer resolution is ~15.6ms, so a "1ms" sleep really
-    // parks the thread for ~15.6ms and puts that much latency between a log call
-    // and the entry reaching its sink. Instead the thread stays hot for a short
-    // burst - covering the gaps in an active logging stream - and then parks on
-    // wake_token_ until a producer, a flush request, or shutdown releases it.
+    // Idle backoff. std::this_thread::sleep_for is not used here: Windows'
+    // default timer resolution is ~15.6ms, so a "1ms" sleep parks the thread for
+    // ~15.6ms and puts that much latency between a log call and the entry
+    // reaching its sink. Instead the thread stays hot for a short burst, which
+    // covers the gaps in an active logging stream, and then parks on wake_token_
+    // until a producer, a flush request, or shutdown releases it.
     static constexpr uint32_t kIdleYieldLimit = 64;
     uint32_t idle_yields = 0;
 
@@ -6734,35 +7105,70 @@ inline void Logger::writer_thread_func() {
 }
 
 inline void Logger::rebase_entry(LogEntry& entry) const noexcept {
-    entry.format.ptr = (*string_queue_)[entry.format.offset];
+    // Every ring copy carries its true length, so 0 can only be an empty string.
+    // It is pointed at a literal rather than at its slot: view_string_ref() takes
+    // length 0 to mean "scan for the NUL", and a producer that laps the ring can
+    // overwrite the one the slot held.
+    const auto resolve = [this](StringRef& ref) noexcept {
+        ref.ptr = ref.length ? (*string_queue_)[ref.offset] : "";
+    };
+    resolve(entry.format);
     if (entry.flags & kEntryHasSourceLocation) {
-        entry.file.ptr = (*string_queue_)[entry.file.offset];
+        resolve(entry.file);
     }
     for (uint8_t i = 0; i < entry.arg_count; ++i) {
         LogArgument& arg = entry.args[i];
         if (arg.type == ArgType::STRING_DYNAMIC || arg.type == ArgType::STRING_LITERAL ||
             arg.type == ArgType::BLOB) {
-            arg.value.dynamic_str.ptr = (*string_queue_)[arg.value.dynamic_str.offset];
+            resolve(arg.value.dynamic_str);
         }
     }
     // The format now sits in this process's ring, whatever the producer claimed.
     entry.flags &= static_cast<uint8_t>(~(kEntryOffsets | kEntryStaticFormat));
 }
 
-inline void Logger::write_log_entry(const LogEntry* entry_ptr, uint32_t count) {
-    for (uint32_t i = 0; i < count; ++i) {
-        const LogEntry& entry = entry_ptr[i];
-        if (entry.flags & kEntryOffsets) {
-            // Came from shared memory: copy it out and turn the ring indices into
-            // addresses valid here, so sinks always see resolved pointers.
-            rebase_scratch_ = entry;
-            rebase_entry(rebase_scratch_);
-            dispatch_entry(rebase_scratch_);
+inline bool Logger::snapshot_entry(const LogEntry& slot, uint64_t index) {
+    // The ring never blocks a producer, so one that has lapped the writer thread
+    // can be rewriting this slot while it is read. Formatting the slot in place
+    // can size a line from one entry and fill it from the next, overrunning the
+    // line buffer. So the header and the arguments it claims are copied out, and
+    // the copy is used only if it provably predates any rewrite.
+    //
+    // Copying memory another thread may be writing is the formal data race every
+    // seqlock reader has; the check below is what decides whether to trust it.
+    // Through void*: LogEntry's member initializers make it non-trivial to GCC,
+    // but its bytes are what the ring holds, and copying them is the point.
+    LogEntry& copy = entry_scratch_;
+    std::memcpy(static_cast<void*>(&copy), static_cast<const void*>(&slot), offsetof(LogEntry, args));
+    // A torn header can claim any count, and nothing may index past args[].
+    copy.arg_count = std::min<uint8_t>(copy.arg_count, SLICK_LOGGER_MAX_ARGS);
+    std::memcpy(copy.args, slot.args, copy.arg_count * sizeof(LogArgument));
+
+    // Pairs with the release fence after reserve() in log_to_sink_with_location():
+    // had the copy read anything a later producer wrote, that producer's
+    // announcement would be visible below. The slot is next used by reservation
+    // index + size(), so the copy is whole while nothing has reached it. In Local
+    // mode the page cursor answers that at page granularity (an entry within a
+    // page of being lapped is dropped a little early) without touching the line
+    // producers reserve on; shared mode has only the reservation cursor itself.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint64_t next_use = index + log_queue_->size();
+    const bool rewritten = mode_ == QueueMode::Local
+        ? entry_page_cursor_.page.load(std::memory_order_relaxed) >= (next_use >> entry_page_shift_)
+        : log_queue_->initial_reading_index() > next_use;
+    if (rewritten) [[unlikely]] {
+        if constexpr (kLossDetectionEnabled) {
+            torn_entry_count_.store(torn_entry_count_.load(std::memory_order_relaxed) + 1,
+                                    std::memory_order_relaxed);
         }
-        else {
-            dispatch_entry(entry);
-        }
+        return false;
     }
+    if (copy.flags & kEntryOffsets) {
+        // Came from shared memory: turn the ring indices into addresses valid
+        // here, so sinks always see resolved pointers.
+        rebase_entry(copy);
+    }
+    return true;
 }
 
 inline void Logger::flush_sinks() {
@@ -6776,7 +7182,7 @@ inline void Logger::flush_sinks() {
 template<typename Predicate>
 inline void Logger::wait_until_ready(Predicate ready) {
     // Long enough to cover a normal drain without sleeping, short enough that a
-    // genuinely slow wait stops burning a core.
+    // slow wait stops burning a core.
     static constexpr uint32_t kCallerYieldLimit = 1024;
     for (uint32_t spins = 0; ; ++spins) {
         if (ready() || !running_.load(std::memory_order_relaxed)) {
@@ -6870,7 +7276,7 @@ inline uint32_t Logger::normalize_items_per_slot(size_t requested, size_t string
     // slick-queue throws on anything but a power of 2 no larger than the ring, and a
     // configuration mistake is better absorbed here than turned into a failed init.
     // Capped at 2^31 before rounding: the largest power of 2 a uint32_t holds, and
-    // anything above it would round to 2^32 - which is 0 once cast, or already 0 in
+    // anything above it would round to 2^32, which is 0 once cast, or already 0 in
     // a 32-bit size_t.
     constexpr size_t kMaxItemsPerSlot = size_t{1} << 31;
     const size_t clamped = std::clamp<size_t>(requested, 1, kMaxItemsPerSlot);
@@ -6920,8 +7326,8 @@ inline void Logger::create_local_queues(size_t log_queue_size, size_t string_buf
 // ---- Sink-targeted logging ----
 //
 // LOG_SINK_<LEVEL>(sink, ...) routes to one sink and, unlike sink->log_<level>(...),
-// checks both the sink's own minimum level and the global level BEFORE the
-// arguments appear in the expansion - so a filtered-out call evaluates nothing.
+// checks both the sink's own minimum level and the global level before the
+// arguments appear in the expansion, so a filtered-out call evaluates nothing.
 // It also attaches the call site, which the direct sink helpers cannot.
 //
 // `sink` may be an ISink reference, a raw pointer, or a smart pointer, and is

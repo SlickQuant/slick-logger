@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
             string_items_per_slot = static_cast<uint32_t>(std::atoll(argv[++i]));
         } else if (arg == "--ready-file" && has_value) {
             // Touched once every entry above is published, so a collector that
-            // must attach to a segment that ALREADY holds a backlog can wait on a
+            // must attach to a segment that already holds a backlog can wait on a
             // fact instead of guessing at a sleep.
             ready_file = argv[++i];
         } else if (arg == "--linger-ms" && has_value) {
@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
     if (!ready_file.empty()) {
         // After the entries, before the linger: everything this producer logs is
         // published by the time the file appears, because a SharedProducer has no
-        // writer thread of its own - LOG_* publishes into the ring inline.
+        // writer thread of its own: LOG_* publishes into the ring inline.
         if (std::FILE* marker = std::fopen(ready_file.c_str(), "wb")) {
             std::fputs("ready\n", marker);
             std::fclose(marker);

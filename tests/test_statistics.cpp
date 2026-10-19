@@ -445,8 +445,8 @@ TEST_F(SlickLoggerStatsTest, StringOccupancyFoundFromDynamicArgs) {
         }
         stats = Logger::instance().stats_snapshot();
         // Regression (CI flake): breaking on string_pct_valid alone was not waiting
-        // for the state this test is about. A drained ring reports a *valid* zero -
-        // see StringOccupancyIsValidZeroWhenDrained - so the loop would exit on a
+        // for the state this test is about. A drained ring reports a *valid* zero
+        // (see StringOccupancyIsValidZeroWhenDrained), so the loop would exit on a
         // report taken between bursts and hand the assertion below the zero it is
         // asserting against. Wait for the occupancy itself.
         if (stats.string_pct_valid && stats.string_inflight_bytes > 0) {
@@ -484,14 +484,14 @@ TEST_F(SlickLoggerStatsTest, StringOccupancyIsValidZeroWhenDrained) {
     Logger::instance().flush();
     const uint64_t drained_at = now_ns();
 
-    // A drained queue means nothing in the string ring is still needed. That is a
-    // real measurement of zero, not an absent one, so it must be reported valid -
-    // otherwise the healthiest state the pipeline has would read as "unknown".
+    // A drained queue means nothing in the string ring is still needed. That zero
+    // is a measurement, so it must be reported valid. Otherwise the healthiest
+    // state the pipeline has would read as "unknown".
     //
     // The sample has to be one taken after the drain: any older one may still
     // describe a queue with entries outstanding, which is a different state and
-    // makes this assertion flaky rather than wrong. Nothing logs after the flush -
-    // the statistics thread never calls log() - so the queue stays drained.
+    // makes this assertion flaky rather than wrong. Nothing logs after the flush
+    // (the statistics thread never calls log()), so the queue stays drained.
     const LogStats stats = wait_for_sample_after(drained_at);
     ASSERT_GE(stats.timestamp_ns, drained_at);
     ASSERT_EQ(stats.entry_queue_depth, 0u);
@@ -577,7 +577,7 @@ TEST_F(SlickLoggerStatsTest, CsvRollsAtMaxSize) {
 TEST_F(SlickLoggerStatsTest, ConcurrentSnapshotsStayConsistent) {
     // Regression: stats_snapshot() used a seqlock over a shared LogStats, so a
     // reader copied the payload while the statistics thread assigned to it and
-    // only afterwards noticed the generation had moved - a data race by the letter
+    // only afterwards noticed the generation had moved, a data race by the letter
     // of the memory model. Published snapshots are immutable now, so a reader can
     // never observe a half-written one.
     //
@@ -686,10 +686,10 @@ class StallingSink : public ISink {
 public:
     StallingSink() : ISink("stalling") {}
     void write(const LogEntry&) override {
-        // Counted on ENTRY, before the stall: a test waiting for the count to reach
+        // Counted on entry, before the stall: a test waiting for the count to reach
         // n knows the writer is inside the nth write() and has therefore finished
-        // everything the previous batch did afterwards - the frontier update
-        // included. That is a happens-after a sleep cannot express.
+        // everything the previous batch did afterwards, the frontier update
+        // included. A sleep cannot express that happens-after.
         writes_.fetch_add(1, std::memory_order_release);
         const int ms = stall_ms_.load(std::memory_order_relaxed);
         if (ms > 0) {
@@ -723,7 +723,7 @@ bool wait_for_writes(const std::shared_ptr<StallingSink>& sink, uint32_t target,
 
 TEST_F(SlickLoggerStatsTest, StringPressureVisibleWhileWriterStallsOnLiteralEntry) {
     // Regression: the writer published the frontier from every entry it claimed,
-    // including entries referencing no string at all - which reset it to "no
+    // including entries referencing no string at all, which reset it to "no
     // anchor". Pin the writer on one literal entry while producers fill the string
     // ring behind it and the stats thread saw outstanding depth but nothing to
     // anchor to, so string_inflight_bytes_max sat at zero while the ring filled.
@@ -744,8 +744,8 @@ TEST_F(SlickLoggerStatsTest, StringPressureVisibleWhileWriterStallsOnLiteralEntr
     LOG_INFO("anchor {}", payload);
     Logger::instance().flush();
 
-    // Pin the writer on a single literal-only entry - the kind that used to wipe
-    // the frontier - for far longer than a reporting interval.
+    // Pin the writer on a single literal-only entry (the kind that used to wipe
+    // the frontier) for far longer than a reporting interval.
     sink->set_stall_ms(400);
     LOG_INFO("literal only, no string ring usage");
     std::this_thread::sleep_for(std::chrono::milliseconds(30)); // let it claim that entry
@@ -770,13 +770,13 @@ TEST_F(SlickLoggerStatsTest, StringPressureVisibleWhileWriterStallsOnLiteralEntr
 }
 
 TEST_F(SlickLoggerStatsTest, StringPressureDecaysWhenDynamicEntriesStop) {
-    // Regression: the published position was the START of the oldest string the
+    // Regression: the published position was the start of the oldest string the
     // writer had consumed, so once its entry was written the metric kept measuring
     // from a string nobody needed any more. Under a continuous literal-only
     // backlog the queue never empties, so the drained-queue reset never fires and
     // the stale value was reported as live pressure indefinitely.
     //
-    // The watermark is the END of the last consumed string now: with no new string
+    // The watermark is now the end of the last consumed string: with no new string
     // reserved since, the write cursor sits exactly on it and the span is zero.
     auto sink = std::make_shared<StallingSink>();
 
@@ -825,11 +825,11 @@ TEST_F(SlickLoggerStatsTest, StringPressureDecaysWhenDynamicEntriesStop) {
 }
 
 TEST_F(SlickLoggerStatsTest, StringPressureVisibleAtExactlyOneWrap) {
-    // Regression: the frontier recorded only the string ring SLOT the writer had
+    // Regression: the frontier recorded only the string ring slot the writer had
     // reached, and the span was that slot subtracted from the write cursor modulo
     // capacity. A slot carries no lap count, so an empty ring and an exactly full
     // one occupy the same one: pin the writer on a valid frontier, have producers
-    // reserve exactly one capacity behind it, and the span folded back to zero -
+    // reserve exactly one capacity behind it, and the span folded back to zero:
     // 0 bytes, 0%, reported as valid, with the entire ring still outstanding.
     // The frontier is an absolute reserve index now, so the span is a plain
     // subtraction that cannot alias.
@@ -859,7 +859,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureVisibleAtExactlyOneWrap) {
 
     // string_bytes_written is the string ring's write cursor, and with the anchor
     // drained the frontier sits on it. Reserving exactly kCapacity from here lands
-    // the cursor back on the frontier's slot - the aliasing case. Split into two
+    // the cursor back on the frontier's slot: the aliasing case. Split into two
     // reservations that meet the ring boundary exactly, because slick-queue pads a
     // reservation that would straddle the end rather than splitting it, and that
     // padding would consume more of the index space than the bytes asked for.
@@ -890,8 +890,8 @@ TEST_F(SlickLoggerStatsTest, StringPressureVisibleAtExactlyOneWrap) {
     ASSERT_TRUE(stats.string_pct_valid);
     // The ring is exactly full: every byte between the frontier and the write
     // cursor is still needed, and one more reservation would overwrite a live
-    // string. Reporting zero here is the worst possible answer - it reads as an
-    // idle ring at the moment the ring is at its limit.
+    // string. Zero would be the worst answer here, since it reads as an idle ring
+    // at the moment the ring is at its limit.
     EXPECT_EQ(stats.string_inflight_bytes, kCapacity)
         << "an exactly full ring aliased to an empty one";
     EXPECT_DOUBLE_EQ(stats.string_pct, 100.0);
@@ -901,14 +901,14 @@ TEST_F(SlickLoggerStatsTest, StringPressureVisibleAtExactlyOneWrap) {
 
 TEST_F(SlickLoggerStatsTest, StringPressureSaturatesWhenProducersLapDuringDispatch) {
     // Regression: the absolute frontier was recovered by lifting the entry's string
-    // POINTER against the write cursor - but the cursor was read after the batch had
+    // pointer against the write cursor, but the cursor was read after the batch had
     // been dispatched. A pointer names a slot, and lifting it picks the lap that
-    // slot belongs to, so a cursor taken after a slow sink has run picks a LATER
+    // slot belongs to, so a cursor taken after a slow sink has run picks a later
     // lap: the frontier slides forward past strings the batch still held and the
     // span collapses to a residual, or to zero on a whole number of laps. The
-    // reading was worst exactly where it mattered - a sink slow enough to let
-    // producers lap the ring reported an idle ring. The cursor is sampled before
-    // the dispatch now, so the span instead grows past capacity and saturates.
+    // reading was worst where it mattered most: a sink slow enough to let
+    // producers lap the ring reported an idle ring. The cursor is now sampled
+    // before the dispatch, so the span instead grows past capacity and saturates.
     //
     // Distinct from StringPressureVisibleAtExactlyOneWrap, where the stalled entry
     // is literal-only and the frontier was already resolved before the stall began.
@@ -929,7 +929,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesWhenProducersLapDuringDispat
 
     const uint32_t banner_writes = sink->writes();
 
-    // Pin the writer INSIDE the dispatch of an entry that carries a string: this
+    // Pin the writer inside the dispatch of an entry that carries a string: this
     // batch's frontier is resolved only once write() returns.
     sink->set_stall_ms(1000);
     const std::string anchor(120, 'a');
@@ -938,7 +938,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesWhenProducersLapDuringDispat
         << "the writer never claimed the anchor";
 
     // Nothing else has reserved yet, so the write cursor is exactly where the
-    // anchor's string ends - the position its frontier must resolve to.
+    // anchor's string ends, which is the position its frontier must resolve to.
     const LogStats anchored = wait_for_sample_after(now_ns(), 2000);
     ASSERT_EQ(anchored.string_buffer_capacity, kCapacity);
     const uint64_t frontier = anchored.string_bytes_written;
@@ -959,8 +959,8 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesWhenProducersLapDuringDispat
     }
 
     // The writer leaves the anchor's write(), resolves the frontier from it, then
-    // blocks on the first flood entry. Entering that second write() is what tells
-    // us the frontier has been published - a sleep could not.
+    // blocks on the first flood entry. Entering that second write() tells us the
+    // frontier has been published, which a sleep could not.
     ASSERT_TRUE(wait_for_writes(sink, banner_writes + 2))
         << "the writer never finished the anchor";
 
@@ -973,7 +973,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesWhenProducersLapDuringDispat
     ASSERT_GT(stats.entry_queue_depth, 0u) << "the writer should still be backed up";
     ASSERT_TRUE(stats.string_pct_valid);
     // Producers have overwritten the whole ring twice over behind a writer that has
-    // consumed one entry of it. Saturated is the only honest reading.
+    // consumed one entry of it. Saturated is the only correct reading.
     EXPECT_EQ(stats.string_inflight_bytes, kCapacity)
         << "the frontier was dragged forward by the lap and reported an idle ring";
     EXPECT_DOUBLE_EQ(stats.string_pct, 100.0);
@@ -984,7 +984,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesWhenProducersLapDuringDispat
 TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedInTheBacklog) {
     // Regression: the lap a string pointer belonged to was chosen as the newest one
     // at or below the write cursor. That is right only while the string is still
-    // resident, and an entry can be lapped before the writer ever reaches it -
+    // resident, and an entry can be lapped before the writer ever reaches it:
     // published early behind a slow sink, then buried by producers while it waited.
     // Its stale slot was lifted onto a recent lap, the frontier jumped forward past
     // strings still outstanding, and the span collapsed to a residual or to zero.
@@ -992,7 +992,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedInTheBacklog
     // earlier lap, the span comes out too large and clamps to capacity: full.
     //
     // slick-queue reserves one entry slot per log call and read() returns a single
-    // reservation, so each entry is dispatched on its own - the entry that gets
+    // reservation, so each entry is dispatched on its own. The entry that gets
     // lapped here is the whole batch, which is why no newer string rescues it.
     constexpr uint32_t kCapacity = 4096;
     auto sink = std::make_shared<StallingSink>();
@@ -1041,7 +1041,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedInTheBacklog
     }
 
     // Writes 2 and 3 are the victim and the entry after it: reaching the third means
-    // the victim was dispatched AND its watermark published.
+    // the victim was dispatched and its watermark published.
     ASSERT_TRUE(wait_for_writes(sink, banner_writes + 3))
         << "the writer never got past the victim";
 
@@ -1063,7 +1063,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedInTheBacklog
 
 TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedBeforeAnyAnchor) {
     // Regression: the lapped-in-the-backlog case above is caught by choosing the
-    // lap from the frontier upwards - but only once a frontier exists. The FIRST
+    // lap from the frontier upwards, but only once a frontier exists. The first
     // entry to be drained with a ring-resident string has none, and that case used
     // to be resolved the discarded way round: the newest lap at or below the write
     // cursor. That is right only while the string is still resident, and startup
@@ -1071,12 +1071,12 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedBeforeAnyAnc
     // samples the cursor for that first batch, the cursor sits whole laps past the
     // entry; on a whole number of laps the lift landed back on the entry's own
     // slot, the frontier was published at the cursor and an overrun ring reported
-    // 0% - with no earlier anchor to correct it, because none had ever existed.
+    // 0%, with no earlier anchor to correct it, because none had ever existed.
     //
     // start()'s banner does reserve from the ring (its version argument is a char
     // array, which enqueue_argument copies), so it normally anchors the run on its
     // own first drain. A min_level that filters the banner out is what leaves the
-    // ring genuinely untouched, and makes the unanchored window reachable without
+    // ring untouched, and makes the unanchored window reachable without
     // racing the writer thread's startup.
     constexpr uint32_t kCapacity = 4096;
     auto sink = std::make_shared<StallingSink>();
@@ -1114,7 +1114,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedBeforeAnyAnc
     ASSERT_LT(victim_end, kCapacity) << "the victim must sit on lap zero";
 
     // Bury it under exactly two laps, so the newest lap at or below the cursor is
-    // the victim's own slot - the aliasing that reported an empty ring. Split so
+    // the victim's own slot, the aliasing that reported an empty ring. Split so
     // no reservation straddles the ring end, which slick-queue pads rather than
     // splits.
     const uint32_t offset = static_cast<uint32_t>(victim_end % kCapacity);
@@ -1127,7 +1127,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedBeforeAnyAnc
         << "the writer left the blocker early; the victim would not be buried";
 
     // Writes 2 and 3 are the victim and the entry behind it: reaching the third
-    // means the victim was dispatched AND its watermark published.
+    // means the victim was dispatched and its watermark published.
     ASSERT_TRUE(wait_for_writes(sink, 3)) << "the writer never got past the victim";
 
     const LogStats stats = wait_for_sample_after(now_ns(), 2000);
@@ -1149,14 +1149,14 @@ TEST_F(SlickLoggerStatsTest, DrainedEntryFreesNothingWhileEntriesStayQueued) {
     // Regression: the frontier was read out of whichever entry the writer drained
     // last. A producer reserves its string bytes while the entry is being built
     // and its entry slot only at the end, so slot order and string order are two
-    // independent races - a producer holding EARLIER string bytes can take a
-    // LATER slot. Freeing the ring up to the drained entry's own string therefore
+    // independent races: a producer holding earlier string bytes can take a
+    // later slot. Freeing the ring up to the drained entry's own string therefore
     // released bytes an entry still queued behind it owned, and the gauge read
     // idle over a ring that was not; worse, the frontier then moved backwards
     // when that entry finally drained.
     //
-    // The frontier comes from a cursor pair now - entry cursor snapshotted first,
-    // then string cursor - and promotes only once the writer has drained past the
+    // The frontier now comes from a cursor pair (entry cursor snapshotted first,
+    // then string cursor) and promotes only once the writer has drained past the
     // entry half. So a drained entry frees nothing while anything published
     // before that snapshot is still queued, whatever order the producers used.
     // That is what this pins: three entries published before the writer gets past
@@ -1181,7 +1181,7 @@ TEST_F(SlickLoggerStatsTest, DrainedEntryFreesNothingWhileEntriesStayQueued) {
     Logger::instance().init(config);
 
     // First entry: the writer claims it, enters write(), and blocks there. Its
-    // frontier step has not run yet - that happens once write() returns.
+    // frontier step has not run yet; that happens once write() returns.
     LOG_WARN("{}", std::string(kPayload, 'a'));
     ASSERT_TRUE(wait_for_writes(sink, 1)) << "the writer never blocked on the first entry";
 
@@ -1193,7 +1193,7 @@ TEST_F(SlickLoggerStatsTest, DrainedEntryFreesNothingWhileEntriesStayQueued) {
     LOG_WARN("{}", std::string(kPayload, 'c'));
     ASSERT_EQ(sink->writes(), 1u) << "the writer left the first entry early";
 
-    // Reaching the second write means the first was dispatched AND its frontier
+    // Reaching the second write means the first was dispatched and its frontier
     // step ran. The third is still queued, so nothing has been confirmed drained.
     ASSERT_TRUE(wait_for_writes(sink, 2)) << "the writer never got past the first entry";
     const LogStats stats = wait_for_sample_after(now_ns(), 2000);

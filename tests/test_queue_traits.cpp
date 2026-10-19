@@ -3,7 +3,8 @@
 //
 // This must be its own executable. The switches select the traits of the queues
 // Logger holds, so a TU built with them linked against one built without them
-// would be two different definitions of Logger - an ODR violation, not a test.
+// would be two different definitions of Logger, which is an ODR violation
+// rather than a test.
 #define SLICK_LOGGER_ENABLE_LOSS_DETECTION 1
 #define SLICK_LOGGER_ENABLE_CPU_RELAX 0
 
@@ -32,7 +33,7 @@ namespace {
 constexpr uint32_t kQueueSize = 1024;
 
 /// Counts what reaches it and, once armed, parks the writer thread inside write()
-/// until released - which is what lets producers lap the queue on purpose.
+/// until released, which lets producers lap the queue on purpose.
 class GateSink : public ISink {
 public:
     void write(const LogEntry&) override {
@@ -141,7 +142,7 @@ TEST_F(QueueTraitsTest, OverwrittenEntriesAreCounted) {
     EXPECT_GE(stats.entries_produced, static_cast<uint64_t>(kFlood) + 1);
     // Everything but the last lap was overwritten before the writer got back to it.
     EXPECT_GE(stats.entry_loss_count, static_cast<uint64_t>(kFlood) - kQueueSize);
-    // Every entry produced was either written or counted as lost - none vanish.
+    // Every entry produced was either written or counted as lost; none vanish.
     EXPECT_EQ(sink->written() + stats.entry_loss_count, stats.entries_produced)
         << "written " << sink->written() << ", lost " << stats.entry_loss_count;
     EXPECT_EQ(stats.string_loss_count, 0u) << "the string ring is never read(), so never counts";

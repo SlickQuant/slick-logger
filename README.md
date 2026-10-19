@@ -9,7 +9,7 @@
 
 ## Overview
 
-slick-logger is a **header-only C++20** logging library for Windows, Linux, and macOS. `LOG_*` calls enqueue entries in a ring buffer; a background writer formats them and sends them to console, file, or custom sinks. It also supports log rotation, binary payloads, and shared-memory logging across processes.
+slick-logger is a **header-only C++20** logging library for Windows, Linux, and macOS. `LOG_*` calls enqueue entries in a ring buffer, and a background writer formats them and sends them to console, file, or custom sinks. It also supports log rotation, binary payloads, and shared-memory logging across processes.
 
 ## Benchmark Highlights
 
@@ -22,7 +22,7 @@ Recorded on an AMD Ryzen 9 5900HX, Windows 11, MSVC 19.44 `/O2`, with log output
 | Three-argument message, 8 producers | **5.10 million calls/sec** |
 | Mean call latency, literal message | **169 ns** |
 
-Call timings exclude the writer's drain and flush time; overloaded queues can overwrite entries. See the [full results, comparisons, and methodology](benchmarks/README.md#results) and [build/run instructions](benchmarks/README.md#building) to reproduce the measurements on your hardware.
+Call timings exclude the writer's drain and flush time, and an overloaded queue can overwrite entries. The benchmark README has the [full results, comparisons, and methodology](benchmarks/README.md#results), plus [build/run instructions](benchmarks/README.md#building) for reproducing the numbers on your own hardware.
 
 ## Navigation
 
@@ -36,22 +36,22 @@ Call timings exclude the writer's drain and flush time; overloaded queues can ov
 
 ## Features
 
-- **High Performance**: Asynchronous logging using the slick-queue ring buffer for minimal latency
-- **Modern Formatting**: Uses C++20 `std::format` for type-aware, efficient string formatting
+- **High Performance**: Asynchronous logging through the slick-queue ring buffer, so the calling thread does as little as possible
+- **Modern Formatting**: Message formatting with C++20 `std::format`
 - **Multi-Sink Architecture**: Log to multiple destinations simultaneously (console, files, custom sinks)
-- **Log Rotation**: Size-based and time-based rotation with configurable retention
-- **Colored Console Output**: ANSI color support with configurable error routing
-- **Customizable Log Pattern**: spdlog-style `set_pattern()` controls the whole line — field order, widths, column alignment, and which span gets colored — globally or per sink
-- **Source Locations by Default**: `LOG_*` macros include the call-site file and line, with runtime controls for basename vs full path
+- **Log Rotation**: Size-based and time-based log rotation with configurable retention
+- **Colored Console Output**: ANSI-colored console output, with warnings and errors optionally routed to stderr
+- **Customizable Log Pattern**: An spdlog-style `set_pattern()` that controls the whole line (field order, widths, column alignment, and which span gets colored), globally or per sink
+- **Source Locations by Default**: `LOG_*` macros record the call-site file and line by default, and a runtime switch turns that off
 - **Runtime Configuration**: Configure sinks, queue sizes, log level, source-location output, line patterns, timestamp formats, and the clock entries are stamped with
-- **Macro Fast Path**: Disabled log levels skip argument evaluation before queueing, globally and per sink
-- **Direct Sink Logging**: Route messages to a named sink or a sink reference when a message should not be broadcast
-- **Binary Payloads**: Log raw bytes and write them to a file verbatim with `BinarySink`, encoding entirely under your control
-- **Shared-Library Redirection**: Route plugin or strategy-library logs into a host application's logger
+- **Macro Fast Path**: Disabled log levels skip argument evaluation before anything is queued, both globally and per sink
+- **Direct Sink Logging**: Messages can go to one named sink, or a sink reference, instead of being broadcast
+- **Binary Payloads**: Raw byte payloads, written to a file verbatim by `BinarySink`, with the encoding left entirely to you
+- **Shared-Library Redirection**: Plugin or strategy libraries can route their logs into the host application's logger
 - **Multi-Process Logging**: Several processes can log into one shared-memory queue drained by a single collector process
 - **Runtime Statistics**: An optional background thread samples throughput, queue fullness and drop counts, and writes them to a CSV
-- **Queue Tuning**: Build-time switches to count lost entries and to control the CAS backoff producers use under contention
-- **Header-Only**: No linking required - just include and use
+- **Queue Tuning**: Build-time switches count lost entries and control the CAS backoff producers use under contention
+- **Header-Only**: so there is nothing to link
 - **Cross-Platform**: Supports Windows, Linux, and macOS
 - **Multi-Threaded**: Safe for concurrent logging from multiple threads
 - **C++20**: Utilizes modern C++ features
@@ -59,14 +59,14 @@ Call timings exclude the writer's drain and flush time; overloaded queues can ov
 
 ## Requirements
 
-- **C++20 compatible compiler** with `std::format` support (GCC 11+, Clang 14+, MSVC 19.29+)
+- A C++20 compiler with `std::format` support (GCC 11+, Clang 14+, MSVC 19.29+)
 - CMake 3.20 or higher (for building examples/tests)
-- slick-queue 2.3.0 or newer (the string ring uses its `items_per_slot` constructor, and multi-process logging relies on its shared-memory support, including 2.3.0's guarantee that a queue never unlinks its segment when destroyed). The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
-- Internet connection for downloading the slick-queue header when it is not already installed
+- slick-queue 2.3.0 or newer. The string ring uses its `items_per_slot` constructor, and multi-process logging relies on its shared-memory support, including the 2.3.0 guarantee that a queue never unlinks its segment when destroyed. The installed CMake package requires this version through `find_dependency`, so an older slick-queue fails at configure time
+- An internet connection to download the slick-queue header when it is not already installed
 
 ## Installation
 
-### Option 1: vcpkg (Recommended)
+### Option 1: vcpkg (recommended)
 
 vcpkg installs slick-logger and its dependencies for you. In classic mode:
 
@@ -99,7 +99,7 @@ add_executable(your_app main.cpp)
 target_link_libraries(your_app PRIVATE slick::logger)
 ```
 
-Configure with the [vcpkg CMake toolchain](https://learn.microsoft.com/en-us/vcpkg/users/buildsystems/cmake-integration), replacing `<path-to-vcpkg>` with your vcpkg installation directory. In manifest mode, this also installs the declared dependencies automatically:
+Configure with the [vcpkg CMake toolchain](https://learn.microsoft.com/en-us/vcpkg/users/buildsystems/cmake-integration), replacing `<path-to-vcpkg>` with your vcpkg installation directory. In manifest mode this also installs the declared dependencies:
 
 ```sh
 cmake -S . -B build "-DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake"
@@ -110,9 +110,9 @@ CI builds and runs this package-consumer example in both classic and manifest mo
 
 ### Option 2: CMake Integration
 
-CMake automatically handles the slick-queue dependency for you.
+CMake handles the slick-queue dependency for you.
 
-#### Using FetchContent (Recommended)
+#### Using FetchContent (recommended)
 ```cmake
 cmake_minimum_required(VERSION 3.20)
 project(your_project)
@@ -181,14 +181,14 @@ add_executable(your_app main.cpp)
 
 ### Option 3: Direct Copy
 
-The simplest route is the archive attached to a [release](https://github.com/SlickQuant/slick-logger/releases): it already bundles `slick/queue.h` and the `slick/shm/` headers alongside `slick/logger.hpp`, so unpacking it and adding `include/` to your include path is all that is needed.
+The simplest route is the archive attached to a [release](https://github.com/SlickQuant/slick-logger/releases). It already bundles `slick/queue.h` and the `slick/shm/` headers alongside `slick/logger.hpp`, so you only have to unpack it and add `include/` to your include path.
 
 To assemble the headers by hand instead, you need both slick-logger and its dependency:
 
 1. Copy the `include/slick/` directory to your project
 2. Download `queue.h` from https://raw.githubusercontent.com/SlickQuant/slick-queue/main/include/slick/queue.h
 3. Place `queue.h` in your include path or alongside the slick-logger headers
-4. Copy the `slick/shm/` headers from [slick-shm](https://github.com/SlickQuant/slick-shm) as well — slick-queue includes them for its shared-memory support
+4. Copy the `slick/shm/` headers from [slick-shm](https://github.com/SlickQuant/slick-shm) as well, since slick-queue includes them for its shared-memory support
 
 Your project structure should look like:
 ```
@@ -247,7 +247,7 @@ LOG_ERROR("request failed: {}", reason);
 LOG_FATAL("unrecoverable error: {}", reason);
 ```
 
-**Prefer the macros over calling `Logger::instance().log(...)` directly.** They test the level *before* the arguments appear in the expansion, so a filtered-out call computes nothing, while a direct call has to evaluate its arguments and only then discovers that the level rejects the message. They also attach the call site: `Logger::log()` passes no file or line, so entries logged that way carry no `file:line`. The direct call remains available for the cases that need it — forwarding a level chosen at runtime, or logging from code that has no call site worth recording.
+**Prefer the macros over calling `Logger::instance().log(...)` directly.** A macro tests the level *before* its arguments appear in the expansion, so a filtered-out call computes nothing. A direct call has to evaluate its arguments first and only then finds out that the level rejects the message. The macros also attach the call site; `Logger::log()` passes no file or line, so entries logged that way carry no `file:line`. The direct call is still there for code that needs it, such as forwarding a level chosen at runtime or logging from code with no call site worth recording.
 
 ```cpp
 using namespace slick::logger;
@@ -267,7 +267,7 @@ auto current_level = Logger::instance().get_level();
 
 The available levels are `L_TRACE`, `L_DEBUG`, `L_INFO`, `L_WARN`, `L_ERROR`, `L_FATAL`, and `L_OFF`. A log call supports up to `SLICK_LOGGER_MAX_ARGS` format arguments; define that macro before including `slick/logger.hpp` if you need a different limit.
 
-To target a single sink, use the `LOG_SINK_*` macros, which apply the same fast path against **both** the global level and that sink's own minimum level:
+To target a single sink, use the `LOG_SINK_*` macros. They apply the same fast path against both the global level and that sink's own minimum level:
 
 ```cpp
 LOG_SINK_TRACE(sink, "order book depth={}", depth);
@@ -280,9 +280,9 @@ LOG_SINK_FATAL(sink, "unrecoverable error: {}", reason);
 
 `sink` may be an `ISink` reference, a raw pointer, or a smart pointer, and is evaluated exactly once. An empty smart pointer, or a sink that has not been added to a logger, makes the call a no-op. See [Logging to Specific Sinks](#logging-to-specific-sinks).
 
-### Source Location Logging
+### Source location logging
 
-Source-location logging is enabled by default for `LOG_*` macros. The output always uses only the basename (e.g. `main.cpp:8`):
+Source-location logging is on by default for `LOG_*` macros. The output only ever uses the basename (e.g. `main.cpp:8`):
 
 ```cpp
 #include <slick/logger.hpp>
@@ -333,7 +333,7 @@ target_compile_definitions(your_app PRIVATE SLICK_LOGGER_ENABLE_SOURCE_LOCATION=
 #include <slick/logger.hpp>
 ```
 
-For bridge code that receives source information from another logging layer, a direct source-location overload is also available. The `const char*` path passed is copied before the entry is queued, so dynamic strings are safe, and the basename is extracted automatically:
+For bridge code that receives source information from another logging layer, there is also a direct source-location overload. It copies the `const char*` path before the entry is queued, so dynamic strings are safe, and it extracts the basename itself:
 
 ```cpp
 std::string path = "C:\\repo\\app\\bridge.cpp";
@@ -344,11 +344,11 @@ slick::logger::Logger::instance().log_with_location(
     "bridged message"); // logged as [bridge.cpp:42]
 ```
 
-Direct sink helpers such as `sink->log_info(...)` route to that sink only and do not automatically attach the caller's source location. Use `LOG_*` macros when you want automatic call-site capture, or `LOG_SINK_*` when you want it *and* a specific sink.
+Direct sink helpers such as `sink->log_info(...)` route to that sink only and do not attach the caller's source location. Use `LOG_*` macros for automatic call-site capture, or `LOG_SINK_*` when you want that *and* a specific sink.
 
 ### String Formatting with std::format
 
-slick-logger uses C++20's `std::format` for type-aware and efficient string formatting:
+slick-logger formats messages with C++20's `std::format`:
 
 ```cpp
 #include <slick/logger.hpp>
@@ -400,42 +400,45 @@ int main() {
 }
 ```
 
-**Numbered placeholders:** `{0}`, `{1}`, ... select an argument by position and
-may carry a format spec (`{1:>8}`). An index past the end of the argument list
-renders as `<MISSING_ARG>` rather than discarding the line. Unlike `std::format`,
-which rejects a format string that mixes explicit indices with bare `{}`, this
-parser tolerates the mix: the automatic counter advances only through bare `{}`
-placeholders, so `"{} {0} {}"` with `(111, 222)` yields `111 111 222`.
+#### Numbered placeholders
 
-**Dynamic width and precision:** a nested field supplies a width or precision
-from an argument — `{:{}}`, `{:.{}f}`, `{:{}.{}f}`, and the positional
-`{0:{1}}`. A nested field takes the argument *after* the one being formatted, so
-`"{:{}}"` formats the first argument to the width given by the second. The
-argument must be a non-negative integer; anything else is a format error. If it
-was not passed at all, that field renders `<MISSING_ARG>` and the rest of the
-line is unaffected.
+`{0}`, `{1}`, ... select an argument by position and may carry a format spec
+(`{1:>8}`). An index past the end of the argument list renders as
+`<MISSING_ARG>` instead of discarding the line. `std::format` rejects a format
+string that mixes explicit indices with bare `{}`, but this parser accepts the
+mix: the automatic counter advances only through bare `{}` placeholders, so
+`"{} {0} {}"` with `(111, 222)` yields `111 111 222`.
 
-**wchar_t arguments:** a `wchar_t` follows the same rule `std::format` applies to
-`char` — it renders as text by default (`{}`, `{:c}`, `{:>4}`), UTF-8 encoded, and
-as a number under a `b`/`B`/`d`/`o`/`x`/`X` presentation type (`{:d}` on `L'A'`
-gives `65`). Because the choice comes from the spec and not the value, a given
-spec means the same thing for every code point. A lone `wchar_t` that is not a
-Unicode scalar value — an unpaired UTF-16 surrogate on Windows — has no character
-to print and falls back to its numeric code point. Wide *strings* are not
-supported; convert them yourself before logging.
+#### Dynamic width and precision
 
-**Benefits of std::format:**
-- **Type-Aware Formatting**: Standard C++ formatting for strings, numbers, pointers, chrono values, and custom formatter-enabled types
-- **Performance**: Highly optimized formatting implementation
-- **Rich Formatting**: Support for width, precision, alignment, and custom formatters
-- **Extensible**: Easy to add custom formatters for user-defined types
-- **Standard**: Part of C++20 standard library, no external dependencies
+A nested field supplies a width or precision from an argument: `{:{}}`,
+`{:.{}f}`, `{:{}.{}f}`, and the positional `{0:{1}}`. A nested field takes the
+argument *after* the one being formatted, so `"{:{}}"` formats the first
+argument to the width given by the second. The argument must be a non-negative
+integer; anything else is a format error. If it was not passed at all, that
+field renders `<MISSING_ARG>` and the rest of the line is unaffected.
 
-> **Caveat — format string must be a true string literal (or otherwise outlive processing):** slick-logger detects "safe to store pointer" format strings by checking whether the argument's type is `const char(&)[N]` — the type category string literals have. This is only a heuristic: any other `const char[N]` lvalue (e.g. a `const char` array **class member**, or a local `const char buf[N]`) has the exact same type and will be misidentified as a literal too. In that case only the pointer is queued, not a copy of the contents, so if the array is mutated or destroyed before the writer thread consumes the log entry, the logged output is corrupted or reads freed memory. (Mutating it *after* it has been logged is safe for the message parse cache: a cached parse is checked against the text on every line; see [Deferred Formatting](#deferred-formatting).) Only pass genuine string literals this way; for a `const char` array member variable, pass it as `std::string_view{member}` (or another type convertible to `std::string_view`) instead, so its contents are copied into the queue.
+#### wchar_t arguments
+
+A `wchar_t` follows the rule `std::format` applies to `char`. It renders as
+UTF-8 text by default (`{}`, `{:c}`, `{:>4}`) and as a number under a
+`b`/`B`/`d`/`o`/`x`/`X` presentation type (`{:d}` on `L'A'` gives `65`). The
+spec decides, not the value, so a given spec means the same thing for every
+code point. A lone `wchar_t` that is not a Unicode scalar value, such as an
+unpaired UTF-16 surrogate on Windows, has no character to print and falls back
+to its numeric code point. Wide *strings* are not supported; convert them
+yourself before logging.
+
+`std::format` handles strings, numbers, pointers, chrono values, and any type
+with a `std::formatter` specialization, including width, precision, and
+alignment, and you can add formatters for your own types. It is part of the
+C++20 standard library, so it adds no dependency.
+
+> **Caveat:** the format string must be a string literal, or otherwise outlive processing. slick-logger decides that a format string is safe to store as a pointer by checking whether the argument's type is `const char(&)[N]`, the type string literals have. That is a heuristic. Any other `const char[N]` lvalue (e.g. a `const char` array class member, or a local `const char buf[N]`) has exactly the same type and is treated as a literal too. Then only the pointer is queued, not a copy of the contents, so if the array is changed or destroyed before the writer thread consumes the entry, the output is corrupted or reads freed memory. (Changing it *after* it has been logged is safe for the message parse cache, which checks a cached parse against the text on every line; see [Deferred Formatting](#deferred-formatting).) Pass only string literals this way. For a `const char` array member, pass `std::string_view{member}` (or another type convertible to `std::string_view`) so its contents are copied into the queue.
 
 ### Passing std::format_args
 
-You can pass a pre-built `std::format_args` object as the single argument to any log call. This lets you capture format arguments once and reuse them, or forward a pre-built arg pack from another function:
+You can pass a pre-built `std::format_args` object as the only argument to any log call. That lets you capture format arguments once and reuse them, or forward an argument pack built by another function:
 
 ```cpp
 int count = 42;
@@ -450,11 +453,11 @@ LOG_INFO("count={} price={:.2f} name={}", args);
 LOG_DEBUG("x={} y={}", std::make_format_args(x, y));
 ```
 
-> **Note:** `std::make_format_args` requires all arguments to be lvalues. Pass temporary values via a named variable.
+> **Note:** `std::make_format_args` requires all arguments to be lvalues. Pass temporary values through a named variable.
 
-> **Limitation:** Custom formatter types (types requiring a `std::formatter` specialization, represented as `handle` inside `std::format_args`) are not supported. They will be logged as `<handle>`. Use the normal variadic log call for custom-formatted types.
+> **Limitation:** types that need their own `std::formatter` specialization (stored as `handle` inside `std::format_args`) are not supported this way and are logged as `<handle>`. Use the normal variadic log call for them.
 
-### Multi-Sink Usage
+### Multi-sink usage
 
 ```cpp
 #include <slick/logger.hpp>
@@ -485,9 +488,9 @@ int main() {
 }
 ```
 
-### Logging to Specific Sinks
+### Logging to specific sinks
 
-You can log messages to specific sinks by name or get a reference to a sink. Each sink also supports its own minimum log level filtering:
+You can log to a sink by name or through a reference to it. Each sink also filters by its own minimum log level:
 
 ```cpp
 #include <slick/logger.hpp>
@@ -536,14 +539,9 @@ int main() {
 }
 ```
 
-**Sink-Level Log Filtering:**
-- Each sink has its own `min_level` setting independent of the global logger level
-- Messages are filtered twice: first by global logger level, then by sink-specific level
-- Use `sink->set_min_level(LogLevel::L_WARN)` to control what each sink accepts
-- This allows different sinks to have different verbosity levels
-- Raising a sink's `min_level` also drops entries that are already queued but not yet written, because the level is re-checked when the writer thread dispatches. Call `Logger::instance().flush()` first if those entries must survive.
+Each sink has its own `min_level`, independent of the global logger level, so messages are filtered twice: first by the global level, then by the sink's. Use `sink->set_min_level(LogLevel::L_WARN)` to control what each sink accepts, which lets different sinks run at different verbosity. Raising a sink's `min_level` also drops entries that are already queued but not yet written, because the writer thread re-checks the level when it dispatches. Call `Logger::instance().flush()` first if those entries must survive.
 
-**Prefer the `LOG_SINK_*` macros over `sink->log_*(...)`.** The direct helpers must evaluate their arguments before the call can decide to drop the message; the macros check the sink's level first, so nothing is computed for a filtered-out call. They also attach the call site, which the direct helpers cannot:
+Prefer the `LOG_SINK_*` macros over `sink->log_*(...)`. The direct helpers must evaluate their arguments before the call can decide to drop the message, while the macros check the sink's level first, so a filtered-out call computes nothing. The macros also attach the call site, which the direct helpers cannot:
 
 ```cpp
 auto audit = Logger::instance().get_sink("audit");
@@ -557,7 +555,7 @@ audit->log_info("{}", build_expensive_report());       // evaluated, then droppe
 
 ### Dedicated Sinks
 
-Dedicated sinks only receive messages logged directly to them, not broadcast messages from LOG_* macros:
+Dedicated sinks only receive messages logged directly to them, not broadcast messages from `LOG_*` macros:
 
 ```cpp
 #include <slick/logger.hpp>
@@ -599,11 +597,7 @@ int main() {
 }
 ```
 
-**Use Cases for Dedicated Sinks:**
-- **Audit Logging**: Critical security events that should only go to specific files
-- **Performance Monitoring**: Metrics that shouldn't clutter main application logs
-- **Error Isolation**: Separate error streams for different components
-- **Compliance**: Regulatory requirements for certain log types
+Typical uses are audit logs for security events that belong only in specific files, metrics that shouldn't clutter the main application log, separate error streams per component, and log types with regulatory requirements.
 
 ### Advanced Configuration
 
@@ -693,7 +687,7 @@ Useful controls:
 - `init(path, log_queue_size, string_buffer_size)`: create a default file sink and start logging
 - `init(config)`: initialize from `LogConfig`
 - `init(queue_size, string_buffer_size)`: start with sinks that were already added
-- `flush()`: wait for queued entries to be written **and flushed to their sinks**, while keeping the logger running
+- `flush()`: wait for queued entries to be written and flushed to their sinks, while keeping the logger running
 - `shutdown(clear_sinks = true)`: flush, stop the writer thread, and optionally clear sinks
 - `reset()`: return the singleton to an uninitialized state; mainly intended for tests
 - `set_level()` / `get_level()`: update or read the global level filter
@@ -706,26 +700,26 @@ Only two sink settings may change while the logger is running: `set_min_level()`
 
 #### When entries reach disk
 
-The writer thread flushes its sinks once it has drained the queue, not after every entry, so a burst of logging shares a single flush instead of paying a write syscall per line. In practice this means:
+The writer thread flushes its sinks once it has drained the queue, not after every entry, so a burst of logging shares a single flush instead of paying a write syscall per line. In practice:
 
 - Once the logger is caught up, everything logged so far is on disk.
 - While a backlog is still draining, recent entries may still be sitting in a sink's buffer.
-- `flush()` returns only after the writer thread has written **and** flushed every entry queued before the call, so use it whenever you need a guarantee at a specific point (before unloading a plugin, before inspecting the log file, at a checkpoint).
+- `flush()` returns only after the writer thread has written and flushed every entry queued before the call. Use it whenever you need that guarantee at a specific point: before unloading a plugin, before inspecting the log file, or at a checkpoint.
 - `shutdown()` drains and flushes before the writer thread exits.
 
-`ConsoleSink` follows the same rule: it ends each line with `'\n'` rather than `std::endl`, and `std::cout`/`std::cerr` are flushed with the other sinks once the queue drains. When stdout is redirected to a file or a pipe (CI logs, `docker logs`, process supervisors), a burst therefore reaches the capturing process once the writer catches up rather than line by line. `std::cerr` is unbuffered by default, so warnings and errors routed there by `use_stderr_for_errors` still appear immediately.
+`ConsoleSink` follows the same rule. It ends each line with `'\n'` rather than `std::endl`, and `std::cout`/`std::cerr` are flushed with the other sinks once the queue drains. When stdout is redirected to a file or a pipe (CI logs, `docker logs`, process supervisors), a burst reaches the capturing process once the writer catches up, not line by line. `std::cerr` is unbuffered by default, so warnings and errors routed there by `use_stderr_for_errors` still appear immediately.
 
 A custom sink's `flush()` is only ever called on the writer thread, so it does not need its own locking against `write()`.
 
-An idle writer thread parks rather than polling on a timer, so an entry logged into an otherwise idle logger reaches its sink in tens of microseconds instead of waiting out a scheduler tick. Producers only signal a wake-up when the writer is actually parked, so this costs an atomic load and a predictable branch on the logging path. In `QueueMode::SharedCollector` the collector polls instead, because a producer in another process cannot signal it.
+An idle writer thread parks instead of polling on a timer, so an entry logged into an otherwise idle logger reaches its sink in tens of microseconds rather than waiting out a scheduler tick. Producers only signal a wake-up when the writer is actually parked, which costs the logging path an atomic load and a predictable branch. In `QueueMode::SharedCollector` the collector polls instead, because a producer in another process cannot signal it.
 
 ### Runtime Statistics
 
-Both internal rings are lossy: if producers outrun the writer thread, older entries are overwritten. Statistics make that visible before it costs you a log line. A background thread samples the queues and publishes throughput, fullness and drop counts, both as a live snapshot and as rows in a CSV.
+Both internal rings are lossy: if producers outrun the writer thread, older entries are overwritten. Statistics show that happening before it costs you a log line. A background thread samples the queues and publishes throughput, fullness and drop counts, both as a live snapshot and as rows in a CSV.
 
-It is opt-in, and **your logging threads pay nothing either way**: most figures are derived from cursors the queues already maintain, so no counter is touched when you call `LOG_*`, enabled or not. (Measured: the difference in enqueue throughput between statistics on and off was smaller than the run-to-run spread of repeating the same configuration, so it could not be resolved either way.)
+It is opt-in, and your logging threads pay nothing either way. Most figures come from cursors the queues already maintain, so calling `LOG_*` touches no counter, enabled or not. (Measured: the difference in enqueue throughput between statistics on and off was smaller than the run-to-run spread of the same configuration, so it could not be resolved either way.)
 
-There is one cost, and it is on the *writer* thread rather than yours. String-ring occupancy needs a position that only the writer can read safely, so with statistics enabled it reads the two ring reservation cursors once per drained batch and compares one of them against its own read cursor. Two cursor reads per *batch*, not per entry, and it never inspects entry contents to do it - but not zero, and not something this README will put a number on.
+The one cost lands on the *writer* thread. String-ring occupancy needs a position that only the writer can read safely, so with statistics enabled it reads the two ring reservation cursors once per drained batch and compares one of them against its own read cursor. That is two cursor reads per *batch*, not per entry, and it never inspects entry contents. The cost is small, but it is not zero.
 
 ```cpp
 using namespace slick::logger;
@@ -747,35 +741,41 @@ if (stats.entry_queue_pct_max > 80.0) {
 }
 ```
 
-#### Two cadences, and why peaks matter
+#### Sampling and reporting intervals
 
-Throughput and drop counts are cumulative counters, so they are exact whenever they are read. Queue fullness is not: it is an instantaneous gauge, and a burst that drives the queue to 90% and drains again in 200 ms is simply invisible to a once-per-second read.
+Throughput and drop counts are cumulative counters, so they are exact whenever they are read. Queue fullness is an instantaneous gauge, so a burst that drives the queue to 90% and drains again within 200 ms is invisible to a once-per-second read.
 
-So the thread samples the gauges every `stats_sample_interval_ms` and reports the **peak** across each `stats_interval_ms` window:
+The thread therefore samples the gauges every `stats_sample_interval_ms` and reports the peak across each `stats_interval_ms` window:
 
 | Field | Meaning |
 | --- | --- |
 | `entry_queue_pct` / `string_pct` | a single point sample, taken when the row was written |
-| `entry_queue_pct_max` / `string_pct_max` | the peak across the whole interval - **this is the field to alert on** |
+| `entry_queue_pct_max` / `string_pct_max` | the peak across the whole interval; alert on this field |
 | `sample_count` | how many ticks fed those peaks, so you can see the fidelity behind them |
 
 The sample interval is also how quickly the thread notices shutdown, so a long reporting interval never delays `shutdown()` by more than one tick. It is clamped into `[1, stats_interval_ms]`.
 
 #### What is measured
 
-- **Throughput** - `produced_per_sec` is messages entering the queue, `consumed_per_sec` is messages leaving it. In steady state the two match; `consumed` lagging `produced` is what makes the depth grow. Both are computed over the *measured* elapsed time, so a late wake-up on a loaded machine never distorts them.
-- **Entry queue fullness** - `entry_queue_depth` is how far the writer thread is behind the producers, against `entry_queue_capacity`.
-- **String ring occupancy** - `string_inflight_bytes` is the span between the frontier - the position below which the ring is provably free - and the producers' write cursor. The logger never calls `read()` on the string ring, so there is no read cursor to subtract, and the frontier is deliberately *not* read out of the entries the writer drains. It cannot be: a producer reserves its string bytes while it builds the entry and its entry slot only at the end, so slot order and string order are two independent races and neither implies the other. A producer holding earlier string bytes can take a later slot, so freeing the ring up to a drained entry's own string releases bytes an entry still queued behind it owns - the gauge reads idle over a ring that is not, and the frontier then lurches backwards when that entry finally drains.
+- Throughput: `produced_per_sec` is messages entering the queue, and `consumed_per_sec` is messages leaving it. In steady state the two match; `consumed` lagging `produced` is what makes the depth grow. Both are computed over the *measured* elapsed time, so a late wake-up on a loaded machine never distorts them.
+- Entry queue fullness: `entry_queue_depth` is how far the writer thread is behind the producers, against `entry_queue_capacity`.
+- String ring occupancy: `string_inflight_bytes` is the span between the frontier (the position below which the ring is provably free) and the producers' write cursor. The logger never calls `read()` on the string ring, so there is no read cursor to subtract, and the frontier is *not* read out of the entries the writer drains. It cannot be. A producer reserves its string bytes while it builds the entry, and its entry slot only at the end, so slot order and string order are two independent races and neither implies the other. A producer holding earlier string bytes can take a later slot. Freeing the ring up to a drained entry's own string would release bytes that an entry still queued behind it owns: the gauge would read idle over a busy ring, and the frontier would jump backwards when that entry finally drained.
 
-  Instead the writer snapshots the entry reservation cursor and *then* the string reservation cursor, and promotes the string half only once its own read cursor has passed the entry half. The order is the proof: every slot below the snapshot had already been taken, and a string is always reserved before its slot, so every one of those strings was reserved before the string cursor was read. When the writer has drained past the entry half, the whole ring below the string half is free - whatever order the producers published in. Between promotions the frontier simply stays put, which is the conservative direction: the span grows and the gauge reads fuller, which is exactly what a writer falling behind means. The frontier is an absolute reserve index, not a position within the ring, so a ring filled to exactly its capacity reads as `capacity` / `100%` instead of aliasing back to zero, and a genuine overrun shows as a distance past capacity that is then clamped. It is seeded at `start()` with the ring cursor as it stands, so there is always a floor to measure from: before the first promotion nothing has been confirmed drained, and the whole span since start really is in flight. A collector replaying a backlog is the exception: `collect_backlog` rewinds its entry reader below the point it attached, so the entries it is about to drain own strings reserved before it existed, and the attach cursor would call every one of them free for the whole replay. Its floor is rewound the same way the reader is - to the oldest position the ring can still hold - so the replay is reported as the in-flight backlog it is. `string_pct_valid` covers the whole row, point value and peak alike; with a string ring present a measurement is always available, and a fully drained queue is reported as a valid zero. The cost is two cursor reads per drained batch on the writer thread - it never inspects entry contents for this - and nothing at all on the producing thread.
+  Instead the writer snapshots the entry reservation cursor and *then* the string reservation cursor, and promotes the string half only once its own read cursor has passed the entry half. The order is the proof. Every slot below the snapshot had already been taken, and a string is always reserved before its slot, so every one of those strings was reserved before the string cursor was read. Once the writer has drained past the entry half, the whole ring below the string half is free, whatever order the producers published in. Between promotions the frontier stays put, which errs on the safe side: the span grows and the gauge reads fuller, which is what a writer falling behind looks like.
 
-  One window stays invisible: a producer that has reserved string bytes but has not yet taken an entry slot appears in neither ordering, so if it is preempted there its bytes are unaccounted for until it publishes. Closing that would mean having producers announce reservations before publishing, which is not worth what it would cost the logging path.
-- **String ring pressure** - `string_bytes_per_sec`, `string_turnover_pct` and `string_wraps_per_sec` describe how fast the ring is being recycled. Like `string_inflight_bytes` and `string_bytes_written`, they count ring footprint: each string is included rounded up to `string_items_per_slot`, because that is the space it actually occupies. `string_turnover_pct` is a *rate*, not an occupancy: 100 means the ring turned over exactly once during the interval.
-- **Loss** - `entry_loss_count` is entries a producer overwrote before the writer could read them. Counting is opt-in: build with `SLICK_LOGGER_ENABLE_LOSS_DETECTION` (see [Queue Tuning](#queue-tuning)); otherwise it always reads `0`, and `kLossDetectionEnabled` tells the two cases apart. It is counted by the process that reads the queue, so in shared-memory mode the collector has the figure and a producer reads `0`. `string_loss_count` is structurally always `0`: slick-queue counts losses inside `read()`, and the logger never calls it on the string ring.
+  The frontier is an absolute reserve index, not a position within the ring, so a ring filled to exactly its capacity reads as `capacity` / `100%` instead of aliasing back to zero, and an overrun shows as a distance past capacity that is then clamped. It is seeded at `start()` with the ring cursor as it stands, so there is always a floor to measure from: before the first promotion nothing has been confirmed drained, and the whole span since start is in flight.
+
+  A collector replaying a backlog is the exception. `collect_backlog` rewinds its entry reader below the point where it attached, so the entries it is about to drain own strings reserved before it existed, and the attach cursor would call every one of them free for the whole replay. Its floor is rewound the same way as the reader, to the oldest position the ring can still hold, so the replay is reported as the in-flight backlog it is.
+
+  `string_pct_valid` covers the whole row, point value and peak alike. With a string ring present a measurement is always available, and a fully drained queue reports a valid zero. The cost is two cursor reads per drained batch on the writer thread (it never inspects entry contents for this) and nothing on the producing thread.
+
+  One window stays invisible: a producer that has reserved string bytes but not yet taken an entry slot appears in neither ordering, so if it is preempted there, its bytes are unaccounted for until it publishes. Closing that gap would mean having producers announce reservations before publishing, which is not worth what it would cost the logging path.
+- String ring pressure: `string_bytes_per_sec`, `string_turnover_pct` and `string_wraps_per_sec` describe how fast the ring is recycled. Like `string_inflight_bytes` and `string_bytes_written`, they count ring footprint: each string counts as its size rounded up to `string_items_per_slot`, because that is the space it occupies. `string_turnover_pct` is a *rate*, not an occupancy: 100 means the ring turned over exactly once during the interval.
+- Loss: `entry_loss_count` is entries a producer overwrote before the writer could read them, including any it overwrote while the writer was copying one out, which the writer then discards instead of logging it torn. Counting is opt-in: build with `SLICK_LOGGER_ENABLE_LOSS_DETECTION` (see [Queue Tuning](#queue-tuning)). Otherwise it always reads `0`, and `kLossDetectionEnabled` tells the two cases apart. The process that reads the queue does the counting, so in shared-memory mode the collector has the figure and a producer reads `0`. `string_loss_count` is always `0` by construction: slick-queue counts losses inside `read()`, and the logger never calls it on the string ring.
 
 #### The CSV
 
-Opened fresh (truncated) on `init()` with a header row, one row appended per interval, and rolled to `<stem>.1.csv` when `stats_max_file_size` is reached. Columns, in order:
+The file is opened fresh (truncated) on `init()` with a header row. One row is appended per interval, and the file rolls over to `<stem>.1.csv` when it reaches `stats_max_file_size`. Columns, in order:
 
 ```
 timestamp,interval_sec,sample_count,
@@ -788,15 +788,15 @@ string_bytes_written,string_bytes_per_sec,string_turnover_pct,
 string_wraps_per_sec,entry_loss_count,string_loss_count
 ```
 
-Leave `stats_file` empty to run the thread for `stats_snapshot()` alone and write no file. A CSV that cannot be created makes `init()` throw, exactly as an unopenable sink does; a write failure afterwards is reported once to `stderr` and never takes the process down.
+Leave `stats_file` empty to run the thread for `stats_snapshot()` alone and write no file. A CSV that cannot be created makes `init()` throw, the same as a sink that cannot be opened. A write failure afterwards is reported once to `stderr` and never takes the process down.
 
 #### Notes
 
-- The statistics thread never touches a sink and never calls `log()`, so it cannot perturb what it measures. Sinks remain owned exclusively by the writer thread. It never reads the entry ring either - only cursors and the frontier the writer publishes.
-- `stats_snapshot()` returns a copy of an immutable published sample, so it is safe to call concurrently from any number of threads and no reader can observe a half-written one. It is not guaranteed wait-free: the sample lives in a `std::atomic<std::shared_ptr>`, which is lock-free only where the implementation says so (MSVC uses an internal lock), so a caller may briefly contend with the once-per-interval publish. It never touches the logging path.
-- `shutdown()` drops the last published sample along with the statistics thread, so `stats_snapshot()` reads as a zeroed `LogStats` once the logger is stopped - and stays zeroed through a re-`init()` with `enable_stats` off, or one that throws because the CSV cannot be created. Read the closing numbers *before* shutting down if you need them.
+- The statistics thread never touches a sink and never calls `log()`, so it cannot disturb what it measures. Sinks stay owned by the writer thread alone. The statistics thread never reads the entry ring either, only cursors and the frontier the writer publishes.
+- `stats_snapshot()` returns a copy of an immutable published sample, so any number of threads can call it at once and no reader can see a half-written one. It is not guaranteed wait-free: the sample lives in a `std::atomic<std::shared_ptr>`, which is lock-free only where the implementation says so (MSVC uses an internal lock), so a caller may briefly contend with the once-per-interval publish. It never touches the logging path.
+- `shutdown()` drops the last published sample along with the statistics thread, so `stats_snapshot()` reads as a zeroed `LogStats` once the logger is stopped. It stays zeroed through a re-`init()` with `enable_stats` off, or one that throws because the CSV cannot be created. Read the closing numbers *before* shutting down if you need them.
 - If the CSV cannot be created, `init()` throws before anything starts, leaving the logger stopped rather than half-initialized.
-- In `QueueMode::SharedProducer` there is no local writer thread, so `entries_consumed`, the depth fields and `consumed_per_sec` are reported as `0` - only the collector process can observe consumption. Produced counts and string-ring rates are still real.
+- In `QueueMode::SharedProducer` there is no local writer thread, so `entries_consumed`, the depth fields and `consumed_per_sec` are reported as `0`; only the collector process can observe consumption. Produced counts and string-ring rates are still real.
 
 ### Log Pattern Formatting
 
@@ -860,13 +860,13 @@ Logger::instance().init(config);
 
 #### Width and alignment
 
-A flag takes an optional minimum width, and a leading `-` left-aligns it. This is what makes columns line up:
+A flag takes an optional minimum width, and a leading `-` left-aligns it. That is how columns line up:
 
 ```cpp
 Logger::instance().set_pattern("%-5l %-24@ %v");
 ```
 
-A field wider than its width is never truncated, and widths are capped at 64. A width on `%%` is rejected — `%-5%` is far more likely a mistyped flag letter than a deliberately padded percent sign.
+A field wider than its width is never truncated, and widths are capped at 64. A width on `%%` is rejected, because `%-5%` is far more likely a mistyped flag letter than a percent sign someone meant to pad.
 
 #### Coloring part of a line
 
@@ -876,27 +876,27 @@ Without `%^`, a color-enabled `ConsoleSink` colors the whole line, as it always 
 Logger::instance().set_pattern("%T.%e %^%-5l%$ %v");   // only the level is colored
 ```
 
-The markers are inert on non-console sinks, so the same pattern can be shared between a console sink and a file sink without leaking escape codes into the file.
+The markers do nothing on non-console sinks, so the same pattern can be shared between a console sink and a file sink without leaking escape codes into the file.
 
-A `%^` with no matching `%$` colors through to the end of the line and is closed there. spdlog leaves it open, which tints everything the terminal prints afterwards; slick-logger closes it, since "color from here on" can only sensibly mean "for the rest of this line".
+A `%^` with no matching `%$` colors through to the end of the line and is closed there. spdlog leaves it open, which tints everything the terminal prints afterwards. slick-logger closes it, since "color from here on" can only sensibly mean "for the rest of this line".
 
 #### Notes
 
-- An unknown or unsupported flag throws `std::invalid_argument` from `set_pattern()`, naming the flag, and the sink keeps the layout it already had. Nothing renders as silently empty.
-- `%!` (function name), `%g` (full source path), and the elapsed-time flags `%o %i %u %O` are not supported — slick-logger does not capture that data.
-- `%n` maps to the **sink** name: slick-logger has one logger, not a registry of named loggers.
+- An unknown or unsupported flag makes `set_pattern()` throw `std::invalid_argument` naming the flag, and the sink keeps the layout it already had. No flag silently renders as empty.
+- `%!` (function name), `%g` (full source path), and the elapsed-time flags `%o %i %u %O` are not supported, because slick-logger does not capture that data.
+- `%n` maps to the sink name: slick-logger has one logger, not a registry of named loggers.
 - `%t` needs `SLICK_LOGGER_ENABLE_THREAD_ID`, which is on by default. See [Thread Id Capture](#thread-id-capture).
 - An empty pattern means "use the built-in layout", not "emit an empty line".
-- `set_pattern()` is safe to call while logging is in flight, but not concurrently with itself — it is a configuration call.
-- `ISink::pattern()` reports the layout actually in force on that sink, which is not always the string last passed to it: once `set_pattern("")` has cleared a per-sink override, it reads back the logger-wide pattern the sink has fallen back to. `Logger::pattern()` reports the logger-wide default itself, and is empty when there is none.
+- `set_pattern()` is safe to call while logging is in flight, but not concurrently with itself; it is a configuration call.
+- `ISink::pattern()` reports the layout in force on that sink, which is not always the string last passed to it: once `set_pattern("")` has cleared a per-sink override, it reads back the logger-wide pattern the sink has fallen back to. `Logger::pattern()` reports the logger-wide default itself, and is empty when there is none.
 
 #### Performance
 
-A pattern is parsed exactly once, inside `set_pattern()`, into a flat list of ops. Rendering walks that list on the writer thread and appends into a buffer the sink reuses, so a line costs no parsing and no allocation beyond the message itself. Date and time flags slice the broken-down time that is computed once per whole second and cached, and the weekday/month names come from static tables — there is no `strftime`, no `put_time` and no locale anywhere on this path. Runs of adjacent date/time flags are fused at compile time, so `%Y-%m-%d %H:%M:%S` becomes a single `memcpy` rather than twelve appends, and a `.%e`, `.%f` or `.%F` right after one joins it. Every literal run is folded into the op that follows it, so `[%l] %v` renders as two ops, not four.
+A pattern is parsed once, inside `set_pattern()`, into a flat list of ops. Rendering walks that list on the writer thread and appends into a buffer the sink reuses, so a line costs no parsing and no allocation beyond the message itself. Date and time flags slice a broken-down time that is computed once per whole second and cached, and the weekday/month names come from static tables. Nothing on this path calls `strftime`, `put_time` or the locale. Runs of adjacent date/time flags are fused at compile time, so `%Y-%m-%d %H:%M:%S` becomes a single `memcpy` instead of twelve appends, and a `.%e`, `.%f` or `.%F` right after one joins it. Every literal run is folded into the op that follows it, so `[%l] %v` renders as two ops, not four.
 
-The line is then sized once, to an upper bound computed from the pattern and the entry, and every op copies its text straight through a cursor into that space — no capacity check, no `std::string::append` call and no out-of-line dispatch per piece. The built-in layout is written through the same code, which is also why it no longer formats numbers through `std::to_string`.
+The line is then sized once, to an upper bound computed from the pattern and the entry, and every op copies its text straight through a cursor into that space, with no capacity check, no `std::string::append` call and no out-of-line dispatch per piece. The built-in layout is written through the same code, which is also why it no longer formats numbers through `std::to_string`.
 
-Measured on Windows/MSVC `/O2` (Ryzen 9 5900HX), minimum of 21 interleaved rounds, rendering one line through `ISink::format_log_entry()` — an entry with a source location and a message without arguments, no I/O:
+Measured on Windows/MSVC `/O2` (Ryzen 9 5900HX), minimum of 21 interleaved rounds, rendering one line through `ISink::format_log_entry()` (an entry with a source location and a message without arguments, no I/O):
 
 | Line layout | 2.1.0 ns/line | 2.2.0 ns/line | change |
 | --- | --- | --- | --- |
@@ -907,24 +907,24 @@ Measured on Windows/MSVC `/O2` (Ryzen 9 5900HX), minimum of 21 interleaved round
 | `%T.%e %^%-5l%$ %-20@ %v` | 346 | 264 | -24% |
 | `[%l] %v` | 181 | 166 | -8% |
 
-A spelled-out pattern now renders within about 15% of the built-in layout, where 2.1.0 was about 30% slower. The rest of each row is the message itself, which costs the same whatever the layout: timing only the layout step, with the message already formatted, `%Y-%m-%d %H:%M:%S.%f [%l] [%@] %v` takes 91 ns against 90 ns for the built-in layout (2.1.0: 197 ns against 114 ns). On an entry with arguments, `std::format` dominates the line, and the layout accounts for only a few percent of it. On the producing thread, stamping the thread id (added in 2.0.0) took the `LOG_*` call itself from 96.6 to 97.8 ns.
+A spelled-out pattern now renders within about 15% of the built-in layout, where 2.1.0 was about 30% slower. The rest of each row is the message itself, which costs the same whatever the layout. Timing only the layout step, with the message already formatted, `%Y-%m-%d %H:%M:%S.%f [%l] [%@] %v` takes 91 ns against 90 ns for the built-in layout (2.1.0: 197 ns against 114 ns). On an entry with arguments, `std::format` dominates the line, and the layout accounts for only a few percent of it. On the producing thread, stamping the thread id (added in 2.0.0) took the `LOG_*` call itself from 96.6 to 97.8 ns.
 
-A pattern also pays only for the fields it actually renders:
+A pattern also pays only for the fields it renders:
 
-- **The message.** A pattern that renders neither the message nor a level skips the `std::format` pass altogether, which is the dominant cost of a line with arguments. On an entry with two arguments, `%T|%@` renders in **94 ns** against **705 ns** for `%T|%@|%l` — adding a level flag brings the message pass back, because a message that fails to format is reported at `ERROR` and that is only known by attempting it.
-- **The broken-down time.** Only a calendar field (`%Y`, `%H`, `%T`, `%c`, `%a` …) needs one. `%e`, `%f`, `%F` and `%E` are arithmetic on the entry's own timestamp, so a pattern built from those alone never consults the per-second cache at all.
+- The message. A pattern that renders neither the message nor a level skips the `std::format` pass altogether, and that pass is most of the cost of a line with arguments. On an entry with two arguments, `%T|%@` renders in 94 ns against 705 ns for `%T|%@|%l`. Adding a level flag brings the message pass back, because a message that fails to format is reported at `ERROR`, and that is only known by trying.
+- The broken-down time. Only a calendar field (`%Y`, `%H`, `%T`, `%c`, `%a` …) needs one. `%e`, `%f`, `%F` and `%E` are arithmetic on the entry's own timestamp, so a pattern built from those alone never consults the per-second cache.
 
-Width costs something either way, but right alignment costs more: `%-8l` appends its padding after a field that is already at the end of the line, while `%8l` has to put the padding in front of it. Measured at roughly 10ns per right-aligned field. Prefer left alignment where the column order allows it.
+Width costs something either way, but right alignment costs more: `%-8l` appends its padding after a field that is already at the end of the line, while `%8l` has to put the padding in front of it. That measured at roughly 10ns per right-aligned field, so prefer left alignment where the column order allows it.
 
-`%q` delegates to the sink's `TimestampFormatter`, which appends its predefined formats straight into the same buffer — the row above shows what that costs. The exception is `Format::CUSTOM`, which carries the `strftime` cost described below; spell the date out with pattern flags instead of using a custom format string on a hot path.
+`%q` delegates to the sink's `TimestampFormatter`, which appends its predefined formats straight into the same buffer; the `%q|%v` row above shows what that costs. The exception is `Format::CUSTOM`, which carries the `strftime` cost described below. On a hot path, spell the date out with pattern flags instead of using a custom format string.
 
-### Thread Id Capture
+### Thread id capture
 
-`%t` renders the id of the thread that made the `LOG_*` call, not the writer thread that formatted it. The id is the real OS thread id — what a debugger, `top -H` or ETW shows — resolved once per thread and stamped into each entry with a single thread-local read.
+`%t` renders the id of the thread that made the `LOG_*` call, not the writer thread that formatted it. The id is the real OS thread id, the one a debugger, `top -H` or ETW shows. It is resolved once per thread and stamped into each entry with a single thread-local read.
 
-This adds a `uint32_t` to `LogEntry`, and that field is reserved in **every** build — the option costs the capture, never the layout. So processes sharing a segment need not agree on the setting: a producer built with it off simply publishes entries carrying thread id 0, and a collector reads them exactly as it reads anyone else's.
+This adds a `uint32_t` to `LogEntry`, and that field is reserved in every build: the option costs the capture, never the layout. Processes sharing a segment therefore need not agree on the setting. A producer built with it off publishes entries carrying thread id 0, and a collector reads them like anyone else's.
 
-To drop the per-call capture — one thread-local read on the producing thread — at the cost of `%t`:
+To drop the per-call capture (one thread-local read on the producing thread) at the cost of `%t`:
 
 ```bash
 cmake -S . -B build -DSLICK_LOGGER_ENABLE_THREAD_ID=OFF
@@ -947,11 +947,11 @@ cmake -S . -B build -DSLICK_LOGGER_ENABLE_LOSS_DETECTION=ON -DSLICK_LOGGER_ENABL
 
 A project consuming the installed package can set the same variables before `find_package(slick-logger)`.
 
-Both switches change the type of the queues `Logger` holds, so **every translation unit, and every shared library sharing a logger through `Logger::set_instance()`, must be built with the same values** — the same rule as `SLICK_LOGGER_MAX_ARGS`. Separate processes sharing a segment need not agree: neither switch changes the shared-memory layout.
+Both switches change the type of the queues `Logger` holds, so every translation unit, and every shared library sharing a logger through `Logger::set_instance()`, must be built with the same values. `SLICK_LOGGER_MAX_ARGS` has the same rule. Separate processes sharing a segment need not agree, since neither switch changes the shared-memory layout.
 
-### Timestamp Formatting
+### Timestamp formatting
 
-The pattern flags above cover date and time directly, so most users will not need this. `TimestampFormatter` remains the way to change the timestamp used by the **built-in layout** (and by `%+` and `%q`).
+The pattern flags above cover date and time directly, so most users will not need this. `TimestampFormatter` is still how you change the timestamp used by the built-in layout (and by `%+` and `%q`).
 
 Every built-in sink supports the default microsecond timestamp format, a predefined timestamp format enum, or a custom `strftime`-style format string:
 
@@ -975,17 +975,17 @@ Available predefined formats:
 - `TimestampFormatter::Format::TIME_ONLY`
 - `TimestampFormatter::Format::CUSTOM`
 
-The predefined formats are rendered by writing digits straight into a stack buffer, on top of a broken-down time that is computed once per whole second and cached. A burst of entries within the same second therefore costs no `localtime` call at all. The cache is `thread_local`, so a `TimestampFormatter` may be shared between threads, and every sink on the writer thread shares one `localtime` call per second.
+The predefined formats are rendered by writing digits straight into a stack buffer, on top of a broken-down time that is computed once per whole second and cached, so a burst of entries within the same second costs no `localtime` call at all. The cache is `thread_local`, so a `TimestampFormatter` may be shared between threads, and every sink on the writer thread shares one `localtime` call per second.
 
-`format_timestamp()` returns a `std::string`; `append_timestamp(out, timestamp_ns)` appends to a string you already own, which is what the log line itself uses so that no timestamp allocates. `max_length()` gives the bound to `reserve()` for.
+`format_timestamp()` returns a `std::string`. `append_timestamp(out, timestamp_ns)` appends to a string you already own; the log line itself uses it, so no timestamp allocates. `max_length()` gives the bound to `reserve()` for.
 
-`Format::CUSTOM` takes any `strftime` format string, plus one extension: `%f` expands to the microseconds within the second, with no leading zeros. A timestamp at 45.001200 seconds renders `%S.%f` as `45.1200`, not `45.001200` — reach for the zero-padded `%f` **pattern** flag above when you need six digits. Every `%f` in the format is expanded, and `%%f` is a literal `%f`. The format is split at those flags once, when it is set, so rendering parses nothing and allocates nothing.
+`Format::CUSTOM` takes any `strftime` format string, plus one extension: `%f` expands to the microseconds within the second, with no leading zeros. A timestamp at 45.001200 seconds renders `%S.%f` as `45.1200`, not `45.001200`; use the zero-padded `%f` pattern flag above when you need six digits. Every `%f` in the format is expanded, and `%%f` is a literal `%f`. The format is split at those flags once, when it is set, so rendering parses nothing and allocates nothing.
 
-`strftime` itself is the floor, and it is why `Format::CUSTOM` still measures more than an order of magnitude slower per entry than the predefined formats. Measured on Windows/MSVC `/O2`, minimum of many runs, appending one timestamp to a buffer already sized for it: **25 ns** for `WITH_MICROSECONDS` against **590 ns** for `"%Y-%m-%d %H:%M:%S.%f"`. Prefer a predefined format, or the pattern flags above, on a hot logging path.
+`strftime` itself sets the floor, which is why `Format::CUSTOM` still measures more than an order of magnitude slower per entry than the predefined formats. Measured on Windows/MSVC `/O2`, minimum of many runs, appending one timestamp to a buffer already sized for it: 25 ns for `WITH_MICROSECONDS` against 590 ns for `"%Y-%m-%d %H:%M:%S.%f"`. On a hot logging path, prefer a predefined format or the pattern flags above.
 
-### Custom Timestamper
+### Custom timestamper
 
-`TimestampFormatter` and the pattern flags decide how a time is *printed*. The timestamper decides which time is *recorded*: it is read once per entry, on the logging thread, and stored in `LogEntry::timestamp`. It defaults to `std::chrono::system_clock`. Replace it to stamp entries with a cheaper clock (a calibrated TSC), a simulated one (a backtest replaying historical events), or a fixed one in tests.
+`TimestampFormatter` and the pattern flags decide how a time is *printed*. The timestamper decides which time is *recorded*: it is read once per entry, on the logging thread, and stored in `LogEntry::timestamp`. It defaults to `std::chrono::system_clock`. Replace it to stamp entries with a cheaper clock (the built-in [`TscTimestamper`](#built-in-tsc-timestamper)), a simulated one (a backtest replaying historical events), or a fixed one in tests.
 
 ```cpp
 using namespace slick::logger;
@@ -1017,22 +1017,50 @@ Logger::instance().set_timestamper(nullptr);
 
 The contract:
 
-- **`now()` returns nanoseconds since the Unix epoch**, which is what `LogEntry::timestamp` holds and what the formatters render. A clock on another epoch still works, but prints the wrong date: `steady_clock` counts from boot, so its lines show 1970, and `utc_clock` counts leap seconds, so its lines run ahead of the wall clock.
-- **It must be thread-safe.** Every logging thread calls it concurrently, and so does the statistics thread: `LogStats::timestamp_ns` comes from the same timestamper, so statistics rows line up with the log.
-- **It must not throw.** `now()` is `noexcept`; a wrapped callable that throws terminates the program.
-- **It is on the hot path**, so its cost is added to every log call. On Windows/MSVC `/O2` (minimum of 40 rounds), reading `system_clock` costs about **52 ns**, a timestamper returning a stored value about **3.5 ns**, and the default path's dispatch adds under 1 ns to `system_clock` itself.
+- `now()` returns nanoseconds since the Unix epoch, which is what `LogEntry::timestamp` holds and what the formatters render. A clock on another epoch still works but prints the wrong date: `steady_clock` counts from boot, so its lines show 1970, and `utc_clock` counts leap seconds, so its lines run ahead of the wall clock.
+- It must be thread-safe. Every logging thread calls it concurrently, and so does the statistics thread: `LogStats::timestamp_ns` comes from the same timestamper, so statistics rows line up with the log.
+- It must not throw. `now()` is `noexcept`, so a wrapped callable that throws terminates the program.
+- It is on the hot path, so its cost is added to every log call. On Windows/MSVC `/O2` (minimum of 40 rounds), reading `system_clock` costs about 52 ns, a timestamper returning a stored value about 3.5 ns, and the default path's dispatch adds under 1 ns to `system_clock` itself.
 
 `set_timestamper()` is safe while the logger is running. Logging threads read the timestamper through one atomic pointer, so a swap takes no lock and blocks no one. A thread caught mid-call finishes that one entry on the previous timestamper, which is why a replaced timestamper is kept alive until `reset()` instead of being destroyed on the spot. As with `set_pattern()`, call it from one thread at a time.
 
-The timestamper survives `shutdown()`, and `init(config)` with a null `config.timestamper` keeps the current one, the same rule as an empty `config.pattern`; `reset()` restores `system_clock`. In shared-memory mode each producer process stamps its entries with its own timestamper. `DailyFileSink` still picks the date in its file name from the wall clock.
+The timestamper survives `shutdown()`, and `init(config)` with a null `config.timestamper` keeps the current one, the same rule as an empty `config.pattern`. `reset()` restores `system_clock`. In shared-memory mode each producer process stamps its entries with its own timestamper. `DailyFileSink` still picks the date in its file name from the wall clock.
 
-### Sharing the Logger Across Shared Libraries (Plugin / Strategy Pattern)
+#### Built-in TSC timestamper
 
-Because slick-logger is header-only, each binary (EXE or `.dll`/`.so`) that includes `logger.hpp` gets its own `Logger` instance. This means `LOG_*` calls inside a dynamically-loaded plugin will not appear in the host application's log file by default.
+`TscTimestamper` reads the CPU's cycle counter (the time stamp counter on x86-64, the generic timer on ARM64) instead of asking the OS for the time, and turns ticks into nanoseconds since the Unix epoch with one multiply. Entries keep full nanosecond resolution.
 
-Use `Logger::set_instance()` to redirect a plugin's `LOG_*` calls to the host's logger:
+```cpp
+// Construct it before the hot path starts: the constructor calibrates for ~10 ms.
+Logger::instance().set_timestamper(std::make_shared<slick::logger::TscTimestamper>());
 
-**Host application** — pass its logger to the plugin after loading:
+// Or choose the calibration time and how often it re-anchors to the wall clock
+auto tsc = std::make_shared<slick::logger::TscTimestamper>(std::chrono::milliseconds(20),  // calibration
+                                                           std::chrono::seconds(1));       // re-anchor interval
+```
+
+Measured on the Ryzen 9 5900HX / Windows 11 / MSVC `/O2` machine from the [benchmark highlights](#benchmark-highlights):
+
+| | `system_clock` | `TscTimestamper` |
+| --- | ---: | ---: |
+| `now()` through the timestamper interface | 58 ns | **25 ns** |
+| `LOG_INFO` with 4 arguments, null sink (min of 15 rounds) | 136 ns | **107 ns** |
+| Worst distance from `system_clock` over 5 s | - | 581 ns in the first second, 66 ns after the first re-anchor |
+
+How it stays on the wall clock:
+
+- Calibration: the constructor sleeps for `calibration` and measures the counter's rate against `steady_clock`.
+- Re-anchoring: the first `now()` past each `resync_interval` re-anchors to `system_clock` and re-measures the rate over everything since construction, so it gets more precise the longer it runs. Readers never wait for it, because a re-anchor writes a second anchor and switches to it.
+- Never backwards: drift found at a re-anchor is slewed away over the next interval rather than stepped, so stamps from one thread never decrease. Only a wall-clock jump larger than a slew can absorb (more than 0.1% of the interval, such as someone setting the clock) is followed by a step, as `system_clock` itself would show it.
+- Fallback: where the counter cannot stand in for a clock (x86 without the invariant-TSC CPUID bit, which some virtual machines clear, or a platform with no counter), `uses_cycle_counter()` returns false and `now()` is plain `system_clock`. The counter must also agree across cores, which it does on current x86 and ARM systems. On ARM64 its rate is set by the platform and can be much coarser: 24 MHz on Apple silicon, so ~42 ns steps.
+
+### Sharing the logger across shared libraries (plugin / strategy pattern)
+
+Because slick-logger is header-only, each binary (EXE or `.dll`/`.so`) that includes `logger.hpp` gets its own `Logger` instance. By default, `LOG_*` calls inside a dynamically loaded plugin therefore do not reach the host application's log file.
+
+Use `Logger::set_instance()` to redirect a plugin's `LOG_*` calls to the host's logger.
+
+The host application passes its logger to the plugin after loading it:
 
 ```cpp
 // host/main.cpp
@@ -1050,7 +1078,7 @@ void load_strategy(void* handle) {
 }
 ```
 
-**Plugin / strategy shared library** — expose a C-linkage init function:
+The plugin or strategy library exposes a C-linkage init function:
 
 ```cpp
 // strategy/strategy.cpp
@@ -1068,20 +1096,20 @@ extern "C" void strategy_shutdown() {
 }
 ```
 
-> **Why `extern "C"`?** C linkage prevents name-mangling differences between compilers, ensuring `get_symbol`/`GetProcAddress`/`dlsym` can reliably locate the function.
+> **Why `extern "C"`?** C linkage avoids name-mangling differences between compilers, so `get_symbol`/`GetProcAddress`/`dlsym` can reliably find the function.
 
-> **Thread-safety:** `set_instance()` uses `std::atomic` with acquire-release ordering. Call it once during plugin initialization, before any logging threads in the plugin start.
+> **Thread safety:** `set_instance()` uses `std::atomic` with acquire-release ordering. Call it once during plugin initialization, before any logging threads in the plugin start.
 
-> **Unload ordering — important:** `LOG_*` with string literals stores a raw pointer to the format string, which lives in the plugin's code segment. The host must call `Logger::instance().flush()` **before** calling `FreeLibrary`/`dlclose`. `flush()` blocks until the writer thread has consumed all queued entries, then returns with the logger still running so host logging can continue normally. Using `shutdown()` instead would stop the logger entirely.
+> **Unload ordering:** `LOG_*` with string literals stores a raw pointer to the format string, which lives in the plugin's code segment. The host must call `Logger::instance().flush()` before calling `FreeLibrary`/`dlclose`. `flush()` blocks until the writer thread has consumed all queued entries, then returns with the logger still running, so host logging continues normally. `shutdown()` would stop the logger entirely.
 
-> **Multiple plugins:** Each shared library (`.dll`/`.so`) holds its own copy of `override_instance_`. All plugins can independently call `set_instance()` with the same host logger — the host logger's lock-free queue is designed for concurrent producers.
+> **Multiple plugins:** each shared library (`.dll`/`.so`) holds its own copy of `override_instance_`. Every plugin can call `set_instance()` with the same host logger on its own, since the host logger's lock-free queue is designed for concurrent producers.
 
 > **Same version on both sides:** a plugin's `LOG_*` calls are compiled into the plugin but operate on the host's `Logger` object, so the plugin and the host must be built from the same slick-logger version, with the same `SLICK_LOGGER_MAX_ARGS`, `SLICK_LOGGER_TAG_SIZE`, `SLICK_LOGGER_ENABLE_THREAD_ID`, `SLICK_LOGGER_ENABLE_LOSS_DETECTION` and `SLICK_LOGGER_ENABLE_CPU_RELAX`. A mismatch in the `Logger` layout is not detected; it is undefined behavior. The host's settings, such as its level, pattern and [timestamper](#custom-timestamper), apply to the plugin's entries too.
 
 ### Multi-Process Logging (Shared Memory)
 
-Several processes can log into a single shared-memory ring buffer that one **collector**
-process drains. The collector owns the sinks and the writer thread; **producer** processes
+Several processes can log into a single shared-memory ring buffer that one collector
+process drains. The collector owns the sinks and the writer thread; producer processes
 own neither and only enqueue entries.
 
 ```
@@ -1092,7 +1120,7 @@ Process C ──┘                                                   └──�
 
 #### Collector
 
-The collector needs at least one sink, exactly like a single-process logger:
+The collector needs at least one sink, like a single-process logger:
 
 ```cpp
 #include <slick/logger.hpp>
@@ -1111,7 +1139,7 @@ Logger::instance().shutdown();   // drains queued entries, then closes the sinks
 
 #### Producer
 
-A producer must **not** define sinks — `init()` throws if it does, since the collector owns them:
+A producer must not define sinks. `init()` throws if it does, since the collector owns them:
 
 ```cpp
 LogConfig config;
@@ -1137,16 +1165,16 @@ Multi-process entries carry the producing process id and optional tag, right aft
 2026-08-28 16:37:53.683942 [INFO] [72176:app2] [main.cpp:81] work item 1 of 4
 ```
 
-Single-process (`QueueMode::Local`) output is unchanged — local entries carry no process id,
+Single-process (`QueueMode::Local`) output is unchanged. Local entries carry no process id,
 so nothing extra is printed.
 
 #### Standalone collector executable
 
-Rather than embedding a collector, you can run the bundled one. Prebuilt binaries for Linux,
+Instead of embedding a collector, you can run the bundled one. Prebuilt binaries for Linux,
 macOS, and Windows are attached to each [release](https://github.com/SlickQuant/slick-logger/releases)
 as `slick-log-collector-<version>-<platform>`.
 
-To build it from source instead — it is **not built by default**:
+To build it from source instead (it is not built by default):
 
 ```bash
 cmake -S . -B build -DBUILD_SLICK_LOGGER_COLLECTOR=ON
@@ -1179,8 +1207,8 @@ It stops on Ctrl-C (`SIGINT`/`SIGTERM`), draining whatever is still queued befor
 #### Startup order and sizing
 
 Startup order does not matter. Whichever process starts first creates the segments and fixes
-their capacity from its `log_queue_size` / `string_buffer_size` / `string_items_per_slot`; every
-later process attaches and **inherits** those settings, so mismatched settings between processes
+their capacity from its `log_queue_size` / `string_buffer_size` / `string_items_per_slot`. Every
+later process attaches and inherits those settings, so mismatched settings between processes
 are harmless.
 
 A collector that attaches to a segment already holding entries replays whatever is still
@@ -1190,34 +1218,34 @@ instance already wrote.
 
 #### Constraints
 
-- **All processes must use the same slick-logger version, the same `SLICK_LOGGER_MAX_ARGS`,
-  and the same architecture.** `sizeof(LogEntry)` is recorded in the shared-memory header, so a
-  mismatch throws at attach time rather than corrupting data. A string segment created with
+- All processes must use the same slick-logger version, the same `SLICK_LOGGER_MAX_ARGS`,
+  and the same architecture. `sizeof(LogEntry)` is recorded in the shared-memory header, so a
+  mismatch throws at attach time instead of corrupting data. A string segment created with
   `string_items_per_slot` other than `1` is also refused by slick-logger builds on slick-queue 2.0
   or older, which cannot read that layout. `SLICK_LOGGER_ENABLE_THREAD_ID`,
-  `SLICK_LOGGER_ENABLE_LOSS_DETECTION` and `SLICK_LOGGER_ENABLE_CPU_RELAX` do **not** need to
-  match: none of them changes the segment layout.
-- **The ring is lossy with no backpressure.** A collector that cannot keep up loses entries, and
+  `SLICK_LOGGER_ENABLE_LOSS_DETECTION` and `SLICK_LOGGER_ENABLE_CPU_RELAX` do not need to
+  match, because none of them changes the segment layout.
+- The ring is lossy, with no backpressure. A collector that cannot keep up loses entries, and
   string data can be overwritten before the entry referencing it is read. Size
   `string_buffer_size` generously for high-volume logging, and build the collector with
   `SLICK_LOGGER_ENABLE_LOSS_DETECTION` to count lost entries.
-- **Pointer arguments** (`ArgType::PTR`) print addresses that are only meaningful inside the
+- Pointer arguments (`ArgType::PTR`) print addresses that only mean something inside the
   producing process.
-- **Each process stamps its own entries.** A producer's entries carry the time from *its*
+- Each process stamps its own entries. A producer's entries carry the time from *its*
   [timestamper](#custom-timestamper), not the collector's, so give every process a clock on the
   same epoch.
-- **Sink indices** used by `log_to_sink()` and `ISink::log()` are resolved against the
+- Sink indices used by `log_to_sink()` and `ISink::log()` are resolved against the
   *collector's* sink list.
-- **A producer killed between reserve and publish** leaves a hole. The collector abandons it
-  after `stalled_entry_timeout_ms` and logs a warning, rather than stalling forever.
-- **Every attached collector sees every entry** — the ring is a broadcast. Running two collectors
-  on one segment writes each entry twice.
-- **`process_tag` is truncated to 15 bytes**, on a UTF-8 character boundary so a multi-byte tag is
+- A producer killed between reserve and publish leaves a hole. The collector abandons it
+  after `stalled_entry_timeout_ms` and logs a warning instead of stalling forever.
+- Every attached collector sees every entry, because the ring is a broadcast. Running two
+  collectors on one segment writes each entry twice.
+- `process_tag` is truncated to 15 bytes, on a UTF-8 character boundary so a multi-byte tag is
   never cut mid-sequence.
-- **POSIX cleanup is manual, by design.** slick-logger never `shm_unlink`s a segment. Unlinking
+- POSIX cleanup is manual, by design. slick-logger never `shm_unlink`s a segment. Unlinking
   frees the *name* while existing mappings stay valid, so whichever process did it would strand
   everyone still attached: newcomers would create a fresh segment under the same name and their
-  entries would silently vanish. Since any process may create the segment, none of them can know
+  entries would silently vanish. Any process may create the segment, so none of them can know
   it is the last user. Segments therefore persist in `/dev/shm/` until removed:
 
   ```bash
@@ -1226,51 +1254,37 @@ instance already wrote.
 
   Remove them only when no participant is running. A stale segment from a previous run is
   attached to rather than recreated, and `collect_backlog` will replay whatever entries it still
-  holds — clear it between unrelated runs, or set `collect_backlog = false`. On Windows the
-  mapping is refcounted by the kernel and disappears once the last handle closes, so nothing
-  needs cleaning up.
+  holds, so clear it between unrelated runs or set `collect_backlog = false`. On Windows the
+  kernel refcounts the mapping and removes it once the last handle closes, so there is nothing
+  to clean up.
 
 See `examples/multi_process_example.cpp` for a runnable version of both roles.
 
-## Sink Types
+## Sink types
 
 ### ConsoleSink
-Outputs to stdout/stderr with optional ANSI color support:
-- **Colors**: Configurable color coding by log level
-- **Error Routing**: WARN/ERROR/FATAL can go to stderr
-- **Cross-Platform**: Works on Windows, Linux, macOS
 
-### FileSink  
-Basic file logging:
-- **Append Mode**: Writes to specified file
-- **Thread-Safe**: Single writer thread handles all file operations
-- **Auto-Creation**: Creates directories if they don't exist
+Writes to stdout/stderr, with optional ANSI colors per log level. WARN/ERROR/FATAL can go to stderr. Works on Windows, Linux, and macOS.
+
+### FileSink
+
+Basic file logging. It appends to the given file and creates missing directories. All file operations happen on the single writer thread, so it is thread-safe.
 
 ### RotatingFileSink
-Size-based log rotation:
-- **Max File Size**: Configurable size limit (default: 10MB)
-- **File Retention**: Keep last N files, auto-delete oldest
-- **Naming**: `log.txt` → `log_1.txt` → `log_2.txt` etc.
-- **Atomic Rotation**: Thread-safe file rotation
+
+Size-based log rotation. The size limit is configurable (default 10MB), only the last N files are kept and the oldest is deleted, and files are named `log.txt`, then `log_1.txt`, `log_2.txt`, and so on. Rotation is thread-safe.
 
 ### DailyFileSink
-Date-based log rotation:
-- **Daily Files**: Creates new file each day
-- **Date Format**: `filename_YYYY-MM-DD.log`
-- **Automatic**: Switches files at midnight
-- **Retention**: Configurable cleanup of old files
+
+Date-based log rotation. It starts a new file each day, switching at midnight, names files `filename_YYYY-MM-DD.log`, and can clean up old files.
 
 ### BinarySink
-Raw byte capture — see [Binary Logging](#binary-logging):
-- **Verbatim**: Writes binary payloads byte for byte, adding nothing of its own
-- **Your Encoding**: No header, no framing, no separators; the file's format is whatever you wrote into it
-- **Binary Mode**: Opened with `std::ios::binary`, so `0x0A` bytes survive on Windows
-- **Extensible**: Override `write_payload()` to add framing
-- **Dedicated by Default**: Only receives entries addressed to it
 
-## Binary Logging
+Raw byte capture; see [Binary Logging](#binary-logging). It writes binary payloads byte for byte and adds nothing of its own (no header, framing or separators), so the file's format is whatever you wrote into it. The file is opened with `std::ios::binary`, so `0x0A` bytes survive on Windows. Override `write_payload()` to add framing. The sink is dedicated by default, so it only receives entries addressed to it.
 
-`BinarySink` writes raw bytes to a file exactly as given, so an application can capture packets, wire messages, or serialized records through the same asynchronous queue as its text logs — without a second I/O path and without formatting on the writer thread.
+## Binary logging
+
+`BinarySink` writes raw bytes to a file exactly as given, so an application can capture packets, wire messages, or serialized records through the same asynchronous queue as its text logs, with no second I/O path and no formatting on the writer thread.
 
 Wrap bytes in `as_binary()` and log them like any other argument:
 
@@ -1308,7 +1322,9 @@ int main() {
 
 `add_binary_sink()` returns the sink so it can go straight into `LOG_SINK_*`.
 
-**What lands in the file.** Only the binary payloads. Timestamp, level, format string and non-binary arguments are all ignored — the file is exactly the concatenation of what you encoded. Entries with no binary argument write nothing. This means the file has **no framing of its own**: if you need to walk it back record by record, encode that yourself, or override `write_payload()`:
+#### What lands in the file
+
+Only the binary payloads. Timestamp, level, format string and non-binary arguments are all ignored, and the file is exactly the concatenation of what you encoded. Entries with no binary argument write nothing. The file has no framing of its own, so if you need to walk it back record by record, encode that yourself or override `write_payload()`:
 
 ```cpp
 class LengthPrefixedBinarySink : public BinarySink {
@@ -1323,9 +1339,13 @@ protected:
 };
 ```
 
-**Text sinks render payloads as hex**, so the same call can feed a binary capture and a readable log. `{}` gives lowercase hex, `{:X}` uppercase, and `{:.N}` renders at most N bytes; the default cap is 64 bytes, after which the total byte count is appended (`0a1bff...(100 bytes)`).
+#### Text sinks
 
-**Payloads larger than 64KB.** A single payload is capped at `slick::logger::kMaxPayloadBytes` (65534) and truncated beyond it, because slick-queue packs its reservation size into 16 bits. To log more, pass the buffer as several arguments of **one** log call:
+Text sinks render payloads as hex, so the same call can feed a binary capture and a readable log. `{}` gives lowercase hex, `{:X}` uppercase, and `{:.N}` renders at most N bytes. The default cap is 64 bytes, after which the total byte count is appended (`0a1bff...(100 bytes)`).
+
+#### Payloads larger than 64KB
+
+A single payload is capped at `slick::logger::kMaxPayloadBytes` (65534) and truncated beyond it, because slick-queue packs its reservation size into 16 bits. To log more, pass the buffer as several arguments of a single log call:
 
 ```cpp
 constexpr auto kCap = kMaxPayloadBytes;
@@ -1337,11 +1357,12 @@ LOG_SINK_INFO(capture, "{}{}{}",
 
 `BinarySink` writes an entry's payloads back to back with nothing between them, so the file is byte-identical to the unsplit buffer.
 
-Do **not** spread the chunks over separate log calls. The queue is multi-producer, so another thread's entry can land between them and interleave the two payloads in the file. One entry is the unit of atomicity, which caps a single payload at `SLICK_LOGGER_MAX_ARGS * kMaxPayloadBytes` (~1.28 MB by default; raise `SLICK_LOGGER_MAX_ARGS` for more).
+Do not spread the chunks over separate log calls. The queue is multi-producer, so another thread's entry can land between them and interleave the two payloads in the file. One entry is the unit of atomicity, which caps a single payload at `SLICK_LOGGER_MAX_ARGS * kMaxPayloadBytes` (~1.28 MB by default; raise `SLICK_LOGGER_MAX_ARGS` for more).
 
-**Notes:**
+#### Notes
+
 - The bytes are copied into the string ring while the log call runs, so the source buffer only has to outlive that call.
-- `as_binary()` over a range copies the element bytes as-is, padding included.
+- `as_binary()` over a range copies the element bytes as they are, padding included.
 - Binary payloads cross process boundaries like any other argument, so a shared-memory collector can own the `BinarySink`.
 - A `BinarySink` is dedicated by default, so broadcast `LOG_*` entries do not reach it. Call `set_dedicated(false)` to change that.
 
@@ -1359,16 +1380,16 @@ config.rotation_hour = std::chrono::hours(0); // midnight for daily rotation
 
 ## Log Levels
 
-- **TRACE**: Detailed debug information
-- **DEBUG**: General debug information  
-- **INFO**: Informational messages
-- **WARN**: Warning messages
-- **ERROR**: Error messages
-- **FATAL**: Fatal error messages
+- `TRACE`: detailed debug information
+- `DEBUG`: general debug information
+- `INFO`: informational messages
+- `WARN`: warnings
+- `ERROR`: errors
+- `FATAL`: fatal errors
 
 ## Architecture
 
-The logger uses a **multi-producer, single-consumer** ring buffer (slick-queue) with a **multi-sink architecture**:
+The logger uses a multi-producer, single-consumer ring buffer (slick-queue) that feeds any number of sinks:
 
 ```
 [Thread 1] ──┐
@@ -1379,7 +1400,7 @@ The logger uses a **multi-producer, single-consumer** ring buffer (slick-queue) 
                                                           └──► BinarySink
 ```
 
-The same structure spans processes when the queue is placed in shared memory — the producers
+The same structure spans processes when the queue is placed in shared memory: the producers
 become other processes and the writer thread lives in the collector. See
 [Multi-Process Logging](#multi-process-logging-shared-memory).
 
@@ -1389,27 +1410,27 @@ become other processes and the writer thread lives in the collector. See
 [Process C] ──┘
 ```
 
-### Key Design Principles
+### Design Principles
 
-1. **Single Writer Thread**: One dedicated thread handles all sink operations
-2. **Lock-Free Logging**: Caller threads never block on I/O operations  
-3. **Flexible Sinks**: Easy to add custom sink implementations
-4. **Atomic Operations**: Thread-safe queue and sink management
-5. **Position-Independent Entries**: In shared-memory mode, string references are ring indices rather than addresses, so an entry stays meaningful in any attached process
+1. One dedicated writer thread handles all sink operations.
+2. Caller threads never block on I/O.
+3. Custom sinks are easy to add.
+4. Queue and sink management are thread-safe, built on atomic operations.
+5. In shared-memory mode, string references are ring indices instead of addresses, so an entry stays valid in any attached process.
 
 ### Deferred Formatting
 
-For optimal performance, the logger defers string formatting to the background thread:
+The logger defers string formatting to the background thread:
 
-1. **Caller Thread**: Captures the format pointer, source location, thread id, and owned copies of any dynamic string data
-2. **Lock-Free Queue**: Stores a compact `LogEntry` in the ring buffer with minimal caller-side work
-3. **Writer Thread**: Formats the message *and the line layout*, then writes to all matching sinks. The message is formatted at most once per entry, however many sinks render it, and only if one of them needs it
+1. The caller thread captures the format pointer, source location, thread id, and owned copies of any dynamic string data, then writes the `LogEntry` straight into its ring slot. It writes the header and only the arguments the call has, not all `SLICK_LOGGER_MAX_ARGS` of them.
+2. The lock-free queue holds the entries. A producer never waits for space.
+3. The writer thread copies each entry out of its slot before using it, so a producer that has lapped the ring can never change an entry while a sink is formatting it. A copy the writer cannot prove predates such a rewrite is discarded and counted as lost. The writer then formats the message *and the line layout*, and writes to all matching sinks. The message is formatted at most once per entry, however many sinks render it, and only if one of them needs it.
 
-This approach moves potentially expensive formatting and I/O operations off the critical path, making logging calls extremely fast and suitable for high-frequency logging scenarios.
+Formatting and I/O are the expensive parts, and this keeps both off the calling thread, so log calls stay cheap enough for high-frequency logging.
 
-Message format strings get the same treatment. A `LOG_*` format is a string literal, so the writer thread parses its `{}` fields the first time it sees one and replays that parse for every later line: no brace scan and no per-field spec rebuilt, leaving only the arguments themselves to format. The parse is keyed by the literal's address, length and argument count and checked against a copy of its text, so a plugin reloaded with different text at the same address is parsed again rather than misread. Runtime (non-literal) format strings live in a reused ring slot and are parsed per line.
+Message format strings get the same treatment. A `LOG_*` format is a string literal, so the writer thread parses its `{}` fields the first time it sees one and replays that parse for every later line. Nothing scans for braces or rebuilds a per-field spec again, which leaves only the arguments themselves to format. The parse is keyed by the literal's address, length and argument count, and checked against a copy of its text, so a plugin reloaded with different text at the same address is parsed again instead of misread. Runtime (non-literal) format strings live in a reused ring slot and are parsed per line.
 
-The parse also tells which fields are a bare `{}` (or `{1}` once its index is dropped), and those skip `std::format` altogether: integers and floating point go through `std::to_chars` — the shortest round-trip form, which is exactly how `std::format` defines `{}` — pointers become `0x`-prefixed hex, and text is appended as it is. Values whose `{}` rendering is not a plain conversion (infinity, NaN, a null string, binary payloads) still go through `std::format`, and the output is identical either way; it is tested value for value against `std::format` on MSVC, GCC and Clang. Measured on Windows/MSVC `/O2`, minimum of 21 in-process runs, formatting the message alone:
+The parse also records which fields are a bare `{}` (or `{1}` once its index is dropped), and those skip `std::format` altogether. Integers and floating point go through `std::to_chars` in the shortest round-trip form, which is exactly how `std::format` defines `{}`. Pointers become `0x`-prefixed hex, and text is appended as it is. Values whose `{}` rendering is not a plain conversion (infinity, NaN, a null string, binary payloads) still go through `std::format`, and the output is identical either way; it is tested value for value against `std::format` on MSVC, GCC and Clang. Measured on Windows/MSVC `/O2`, minimum of 21 in-process runs, formatting the message alone:
 
 | Message | Parsed every line | Cached parse + bare `{}` fast path |
 |---|---|---|
@@ -1419,32 +1440,23 @@ The parse also tells which fields are a bare `{}` (or `{1}` once its index is dr
 
 Fields with a spec (`{:.2f}`, `{:>8}`) still cost a `std::format` call each, so prefer `{}` on a hot path when the default rendering will do.
 
-Line patterns follow the same principle: `set_pattern()` parses the pattern once, at configuration time, into a flat list of ops. The caller thread never sees it, and the writer thread renders it by walking that list into a buffer each sink reuses — no parsing and, in steady state, no allocation per line. See [Log Pattern Formatting](#log-pattern-formatting).
+Line patterns follow the same principle: `set_pattern()` parses the pattern once, at configuration time, into a flat list of ops. The caller thread never sees it, and the writer thread renders it by walking that list into a buffer each sink reuses, with no parsing and, in steady state, no allocation per line. See [Log Pattern Formatting](#log-pattern-formatting).
 
 ### Multi-Sink Benefits
 
-- **Simultaneous Output**: Log to console + multiple files at once
-- **Different Retention**: Each sink can have its own rotation policy
-- **Performance**: Single writer thread efficiently handles all sinks
-- **Flexibility**: Mix and match sink types as needed
+One log call can reach the console and several files at once. Each sink can have its own rotation policy, sink types can be mixed freely, and a single writer thread serves them all.
 
 ## Integration
 
-slick-queue is downloaded automatically during the build process from https://github.com/SlickQuant/slick-queue.
+slick-queue is downloaded automatically during the build from https://github.com/SlickQuant/slick-queue.
 
 ## Header-Only Benefits
 
-Being a header-only library provides several advantages:
-
-- **Zero Linking**: No need to link against library files
-- **Easy Integration**: Just include the headers in your project
-- **Template Optimization**: Compiler can better optimize template instantiations
-- **No Binary Dependencies**: No need to distribute or manage .lib/.a files
-- **Immediate Usage**: Start logging with a single `#include <slick/logger.hpp>`
+There is nothing to link and no `.lib`/`.a` files to distribute or manage. Add the headers to your project and start logging with a single `#include <slick/logger.hpp>`. The compiler also sees every template instantiation, which gives it more room to optimize.
 
 ## Custom Sinks
 
-Creating custom sinks is straightforward - just inherit from `ISink`:
+A custom sink is a class derived from `ISink`:
 
 ```cpp
 class JsonSink : public slick::logger::ISink {
@@ -1478,13 +1490,15 @@ public:
 Logger::instance().add_sink(std::make_shared<JsonSink>("app.json"));
 ```
 
-A sink that writes to a file can inherit `FileSinkBase` instead, which supplies the stream, its buffer, directory creation, and `flush()`. That is what `FileSink` and `BinarySink` are built on.
+A sink that writes to a file can inherit `FileSinkBase` instead, which supplies the stream, its buffer, directory creation, and `flush()`. `FileSink` and `BinarySink` are built on it.
 
-`formatted_message()` returns the message body and whether it formatted cleanly (`false` means it is the `[FORMAT_ERROR: ...]` text). While the logger dispatches an entry, the message is formatted **once** and shared by every sink that asks for it — the first sink to ask pays for `std::format`, the rest reuse the result, and a sink that never asks costs nothing. The returned `std::string_view` is valid until the next call on that sink or the next entry; `format_log_message()` returns the same thing as an owned `std::string` if you need to keep it.
+The `LogEntry` that `write()` receives is the writer thread's own copy of the entry, never the ring slot, so nothing changes it during the call, however far producers have run ahead. The writer reuses that copy for the next entry, so keep a copy rather than the reference.
+
+`formatted_message()` returns the message body and whether it formatted cleanly (`false` means it is the `[FORMAT_ERROR: ...]` text). While the logger dispatches an entry, the message is formatted once and shared by every sink that asks for it. The first sink to ask pays for `std::format`, the rest reuse the result, and a sink that never asks costs nothing. The returned `std::string_view` is valid until the next call on that sink or the next entry; `format_log_message()` returns the same thing as an owned `std::string` if you need to keep it.
 
 ### Rendering a whole line from a custom sink
 
-`formatted_message()` gives you just the message body. If you want the full line — timestamp, level, source location, and whatever pattern the user configured — call the protected `format_log_entry()` instead. It is the same code `ConsoleSink` and `FileSink` use, so a custom sink honors `set_pattern()` for free:
+`formatted_message()` gives you just the message body. For the full line (timestamp, level, source location, and whatever pattern the user configured), call the protected `format_log_entry()` instead. `ConsoleSink` and `FileSink` use the same code, so a custom sink honors `set_pattern()` for free:
 
 ```cpp
 class SyslogSink : public slick::logger::ISink {
@@ -1500,8 +1514,8 @@ public:
 
 Two things to know:
 
-- The returned `std::string_view` points into a buffer the sink reuses, and is only valid until the next `format_log_entry()` call on that sink. Reusing the buffer is what keeps the line assembly allocation-free — copy the view if you need to keep it.
-- Pass the optional colour arguments only if your sink writes to a terminal. Omitting them means `%^`/`%$` render as nothing, so a pattern shared with a console sink will not leak escape codes into your output. The first argument is a *function* from level to escape sequence rather than a ready-made string, because an entry whose message cannot be formatted is reported at `ERROR`, and that is only known once rendering has begun:
+- The returned `std::string_view` points into a buffer the sink reuses, and is only valid until the next `format_log_entry()` call on that sink. Reusing the buffer keeps line assembly allocation-free, so copy the view if you need to keep it.
+- Pass the optional colour arguments only if your sink writes to a terminal. Without them `%^`/`%$` render as nothing, so a pattern shared with a console sink will not leak escape codes into your output. The first argument is a *function* from level to escape sequence rather than a ready-made string, because an entry whose message cannot be formatted is reported at `ERROR`, and that is only known once rendering has begun:
 
 ```cpp
 void write(const slick::logger::LogEntry& entry) override {
@@ -1513,16 +1527,16 @@ static std::string_view my_color_for(slick::logger::LogLevel level) noexcept { .
 
 ## Examples
 
-The repository includes comprehensive examples:
+The repository includes these examples:
 
-- **`logger_example.exe`**: Basic usage with console + file output
-- **`multi_sink_example.exe`**: Demonstrates all sink types, rotation, and custom sinks
-- **`timestamp_example.exe`**: Demonstrates predefined and custom timestamp formats, and a custom timestamper
-- **`multi_process_example.exe`**: Collector and producer roles logging across process boundaries
-- **`binary_sink_example.exe`**: Raw binary capture, custom framing, and the `LOG_SINK_*` fast path
-- **`statistics_example.exe`**: Live throughput, queue-fullness peaks, and the statistics CSV under load
+- `logger_example.exe`: basic usage with console and file output
+- `multi_sink_example.exe`: all sink types, rotation, and custom sinks
+- `timestamp_example.exe`: predefined and custom timestamp formats, and a custom timestamper
+- `multi_process_example.exe`: collector and producer roles logging across process boundaries
+- `binary_sink_example.exe`: raw binary capture, custom framing, and the `LOG_SINK_*` fast path
+- `statistics_example.exe`: live throughput, queue-fullness peaks, and the statistics CSV under load
 
-## Building Examples/Tests  
+## Building examples/tests
 
 If you want to build the provided examples and tests:
 

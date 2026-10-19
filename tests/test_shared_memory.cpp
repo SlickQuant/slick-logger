@@ -251,10 +251,11 @@ TEST_F(SharedMemoryTest, ProducerMayStartBeforeCollector) {
 }
 
 // A producer that created the segment and then exits must not take the segment
-// with it. On POSIX slick-queue's destructor shm_unlink()s a segment its owner
-// created, which frees the name while the collector's mapping stays valid: later
-// producers would then create a different segment under the same name and their
-// entries would never reach the still-attached collector.
+// with it. On POSIX, slick-queue before 2.3.0 shm_unlink()ed a segment its owner
+// created when the queue was destroyed, which frees the name while the
+// collector's mapping stays valid: later producers would then create a different
+// segment under the same name and their entries would never reach the
+// still-attached collector.
 TEST_F(SharedMemoryTest, SegmentSurvivesTheProducerThatCreatedIt) {
     const auto log_path = temp_log("test_shm_creator_exit.log");
     const auto segment = unique_segment_name("slt_ce_");
@@ -680,12 +681,12 @@ private:
 } // namespace
 
 // Regression: a collector replaying a backlog rewinds its entry reader below the
-// point it attached, but the string frontier was seeded AT that point. Every
+// point it attached, but the string frontier was seeded at that point. Every
 // string those replayed entries own was reserved before the collector attached,
 // so it sat below the frontier and read as free from the very first sample: a
 // collector attaching to a segment stuffed with undrained entries reported an
-// idle string ring for the whole replay - precisely when that ring is at its
-// fullest. The floor is rewound with the reader now.
+// idle string ring for the whole replay, just when that ring is at its fullest.
+// The floor is now rewound with the reader.
 TEST_F(SharedMemoryTest, BacklogReplayReportsTheStringsItHasNotDrainedYet) {
     const auto log_path = temp_log("test_shm_backlog_stats.log");
     const auto segment = unique_segment_name("slt_bs_");
@@ -693,14 +694,14 @@ TEST_F(SharedMemoryTest, BacklogReplayReportsTheStringsItHasNotDrainedYet) {
 
     // A real producer process fills the segment first and then lingers, so the
     // segment is still there for the collector to attach to. Everything it logs
-    // is published - and undrained - before the collector exists.
+    // is published, and still undrained, before the collector exists.
     const auto ready_marker = temp_log("test_shm_backlog_ready.marker");
     std::thread producer([&] {
         run_producer("--name " + segment + " --tag pre --count " + std::to_string(kProduced) +
                      " --queue-size 1024 --string-buffer-size 65536 --linger-ms 3000"
                      " --ready-file " + ready_marker.string());
     });
-    // A sleep would only make the backlog PROBABLE: lose the race and the
+    // A sleep would only make the backlog probable: lose the race and the
     // collector creates the segment itself, there is no backlog to replay, and
     // the test silently stops testing anything. Wait for the producer to say it
     // has published instead.
@@ -727,16 +728,16 @@ TEST_F(SharedMemoryTest, BacklogReplayReportsTheStringsItHasNotDrainedYet) {
 
     // read() hands back the whole published backlog as one run, so read_index_
     // jumps to the end of it before the first sink write and the queue reads as
-    // drained for the entire dispatch - which short-circuits the occupancy to a
+    // drained for the entire dispatch, which short-circuits the occupancy to a
     // valid zero whatever the frontier says. A few live entries behind the
-    // replay keep the queue genuinely non-empty, so the frontier is what is
+    // replay keep the queue non-empty, so the frontier is what is
     // being measured here. They are logged before the sample, so the write
     // cursor is static by the time it is read.
     for (int i = 0; i < 3; ++i) {
         LOG_INFO("live entry {} behind the replay", i);
     }
 
-    // Demand a sample published AFTER those entries: the first report can land
+    // Demand a sample published after those entries: the first report can land
     // within a few ms of init(), long before any of this, and asserting on it
     // would be asserting on the state before the test set it up.
     const uint64_t logged_at = static_cast<uint64_t>(
@@ -763,7 +764,7 @@ TEST_F(SharedMemoryTest, BacklogReplayReportsTheStringsItHasNotDrainedYet) {
     // The producer stopped before the collector attached and the collector logs
     // nothing but its own banner, so the write cursor is static here. This
     // collector has consumed almost none of it, so essentially the whole ring is
-    // in flight for it - the seeded-at-attach frontier called all of it free.
+    // in flight for it, where the seeded-at-attach frontier called all of it free.
     EXPECT_EQ(stats.string_inflight_bytes, stats.string_bytes_written)
         << "the replayed backlog's strings were reported free from the first sample";
 

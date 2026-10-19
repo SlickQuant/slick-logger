@@ -394,7 +394,7 @@ TEST_F(SlickLoggerTest, NoArgumentsFormatting) {
     
     slick::logger::Logger::instance().init("test_no_args.log", 1024);
     
-    // Test strings with curly braces but no arguments - should be logged as-is
+    // Strings with curly braces but no arguments should be logged as-is
     LOG_INFO("No args: This {has} {curly} {braces}");
     LOG_INFO("WebSocket message: {\"type\":\"message\",\"data\":{\"id\":123}}");
     LOG_INFO("C++ code snippet: if (condition) { return {}; }");
@@ -542,7 +542,7 @@ TEST_F(SlickLoggerTest, DynamicWidthAndPrecision) {
     LOG_INFO("zero both: [{:{}.{}f}]", 3.14159, 0, 0);
 
     // A nested field naming an argument that was never passed costs that field,
-    // not the line - the same treatment a bare {} past the end already gets.
+    // not the line, which is how a bare {} past the end is already treated.
     LOG_INFO("missing width: [{:{}}] then {}", 42);
     LOG_INFO("missing manual: [{0:{9}}]", 42, 8);
 
@@ -614,9 +614,9 @@ TEST_F(SlickLoggerTest, DynamicWidthRejectsUnusableArgument) {
 }
 
 // Regression test: wchar_t arguments render their value instead of <UNKNOWN>.
-// Which *kind* of value is chosen by the format spec, exactly as std::format
-// does for char - text by default, a number under b/B/d/o/x/X - so that a given
-// spec does not change meaning with the code point.
+// The format spec picks which *kind* of value, exactly as std::format does for
+// char (text by default, a number under b/B/d/o/x/X), so that a given spec does
+// not change meaning with the code point.
 TEST_F(SlickLoggerTest, WCharArgument) {
     std::filesystem::remove("test_wchar.log");
 
@@ -658,7 +658,7 @@ TEST_F(SlickLoggerTest, WCharArgument) {
     EXPECT_TRUE(file_contents.find("wchar hex: 41") != std::string::npos);
     EXPECT_TRUE(file_contents.find("wchar as char: A") != std::string::npos);
     EXPECT_TRUE(file_contents.find("wide chars: [\xc3\xa9] [\xe4\xb8\xad]") != std::string::npos);
-    // Padding an ASCII code point is unambiguous - one column, so three spaces -
+    // Padding an ASCII code point is unambiguous (one column, so three spaces),
     // and it lands on the right, the way a character argument aligns rather than
     // the way a number does.
     EXPECT_TRUE(file_contents.find("ascii padded: [A   ]") != std::string::npos);
@@ -668,9 +668,9 @@ TEST_F(SlickLoggerTest, WCharArgument) {
     // compute differently: libstdc++ 13 charges U+00E9 its two UTF-8 code units
     // where MSVC and libstdc++ 14 charge it one display column, so "{:4}" pads
     // it with two spaces on one and three on the other. That is not this
-    // library's behavior to pin down - slick-logger
-    // hands the spec and a UTF-8 string_view to std::vformat and does no padding
-    // of its own. What is asserted here is what slick-logger does decide: the
+    // library's behavior to pin down: slick-logger hands the spec and a UTF-8
+    // string_view to std::vformat and does no padding of its own. What is
+    // asserted here is what slick-logger does decide: the
     // argument arrives as UTF-8 text, padded on the right like a character, and
     // becomes a number under an integer presentation type.
     EXPECT_TRUE(file_contents.find("wide padded: [\xc3\xa9 ") != std::string::npos);
@@ -963,11 +963,11 @@ TEST_F(SlickLoggerTest, SetInstanceChangesActiveLogger) {
     // Capture the default (library-local) logger pointer before any redirect.
     slick::logger::Logger* local = &slick::logger::Logger::instance();
 
-    // Redirect to itself — pointer must still equal local.
+    // Redirect to itself: the pointer must still equal local.
     slick::logger::Logger::set_instance(local);
     EXPECT_EQ(&slick::logger::Logger::instance(), local);
 
-    // Redirect to nullptr — clear_instance_override restores local.
+    // Redirect to nullptr: clear_instance_override restores local.
     slick::logger::Logger::clear_instance_override();
     EXPECT_EQ(&slick::logger::Logger::instance(), local);
 }
@@ -993,7 +993,7 @@ TEST_F(SlickLoggerTest, SetInstanceRedirectsLogsToHostLogger) {
     // and differentiate by adding a dedicated plugin sink.
     //
     // Added before init(): the writer thread reads the sink list without
-    // synchronization, so add_sink() on a running logger races with it - the
+    // synchronization, so add_sink() on a running logger races with it: the
     // push_back can reallocate the vector under the writer's dispatch loop.
     auto plugin_sink = std::make_shared<slick::logger::FileSink>("test_set_instance_plugin.log", "plugin_sink");
     plugin_sink->set_dedicated(true); // dedicated: only receives direct writes, not LOG_* broadcasts
@@ -1033,7 +1033,7 @@ TEST_F(SlickLoggerTest, SetInstanceRedirectsLogsToHostLogger) {
         plugin_contents += line + "\n";
 
     EXPECT_NE(plugin_contents.find("direct to plugin sink"), std::string::npos);
-    // Broadcast LOG_* messages must NOT appear in plugin.log (dedicated sink ignores them).
+    // Broadcast LOG_* messages must not appear in plugin.log (dedicated sink ignores them).
     EXPECT_EQ(plugin_contents.find("plugin message one"), std::string::npos);
     EXPECT_EQ(plugin_contents.find("plugin message two"), std::string::npos);
 }
@@ -1047,7 +1047,7 @@ TEST_F(SlickLoggerTest, ClearInstanceOverrideRestoresLocalLogger) {
     // "Host" file sink added to the local instance.
     slick::logger::Logger::instance().add_file_sink("test_set_instance_host.log", "host_sink");
 
-    // "Plugin-local" dedicated sink — receives only direct writes, not LOG_*.
+    // "Plugin-local" dedicated sink: receives only direct writes, not LOG_*.
     auto plugin_sink = std::make_shared<slick::logger::FileSink>("test_set_instance_plugin.log", "plugin_sink");
     plugin_sink->set_dedicated(true);
     slick::logger::Logger::instance().add_sink(plugin_sink);
@@ -1119,9 +1119,9 @@ TEST_F(SlickLoggerTest, MultipleProducersAfterSetInstance) {
 }
 
 
-// Sinks are no longer flushed after every batch; the writer thread flushes when
-// it has drained the queue, and on request. These tests pin the guarantees that
-// callers can actually observe.
+// The writer thread flushes sinks when it has drained the queue, and on
+// request, rather than after every batch. These tests pin the guarantees that
+// callers can observe.
 
 TEST_F(SlickLoggerTest, FlushMakesEntriesVisibleOnDisk) {
     std::filesystem::remove("test_flush_visible.log");
@@ -1207,8 +1207,8 @@ TEST_F(SlickLoggerTest, ParkedWriterIsAlwaysWokenByANewEntry) {
     // between the writer deciding to park and actually parking, so the gap
     // before each entry is swept across that boundary rather than fixed.
     //
-    // Sleeping cannot produce those gaps - Windows rounds any sleep request up
-    // to ~15.6ms - so the gap is busy-waited.
+    // Sleeping cannot produce those gaps (Windows rounds any sleep request up
+    // to ~15.6ms), so the gap is busy-waited.
     auto spin_for = [](double microseconds) {
         const auto start = std::chrono::steady_clock::now();
         while (std::chrono::duration<double, std::micro>(
@@ -1279,6 +1279,97 @@ TEST_F(SlickLoggerTest, ShutdownAndFlushCompleteWhileWriterIsParked) {
     auto shutdown_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
     EXPECT_LT(shutdown_ms, 1000) << "shutdown() did not wake the parked writer";
+}
+
+// Holds the writer thread inside write() for the first "victim {}" entry until
+// the test lets it go, so producers can lap the ring while a sink still holds
+// that entry. Records whether the entry changed underneath it.
+class HoldingSink : public slick::logger::ISink {
+public:
+    HoldingSink() : ISink("holding") {}
+
+    void write(const slick::logger::LogEntry& entry) override {
+        if (held_ || entry.format.length != 9 ||
+            std::string_view(entry.format_ptr(), 9) != "victim {}") {
+            return;
+        }
+        held_ = true;
+        slick::logger::LogEntry before;
+        std::memcpy(&before, &entry, sizeof(before));
+        reached_.store(true, std::memory_order_release);
+        while (!release_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        changed_ = std::memcmp(&before, &entry, sizeof(before)) != 0;
+        message_ = std::string(formatted_message(entry).first);
+    }
+    void flush() override {}
+
+    bool held_ = false;
+    std::atomic<bool> reached_{false};
+    std::atomic<bool> release_{false};
+    bool changed_ = false;
+    std::string message_;
+};
+
+TEST_F(SlickLoggerTest, SinkEntryStaysIntactWhileProducersLapTheRing) {
+    // The ring never blocks a producer, so one that outruns the writer thread
+    // overwrites slots, including the one the writer is formatting. Formatting
+    // it in place sized a line from one entry and filled it from another, and
+    // overran the heap. Sinks must instead get an entry nothing else writes to.
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    auto sink = std::make_shared<HoldingSink>();
+    logger.add_sink(sink);
+    constexpr int kQueueSize = 64;
+    logger.init(kQueueSize, 1 << 16);
+
+    LOG_INFO("victim {}", 42);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!sink->reached_.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    ASSERT_TRUE(sink->reached_.load(std::memory_order_acquire)) << "writer never reached the victim entry";
+
+    // Four laps, from another call site with another level and argument count,
+    // so every field of the held slot is rewritten.
+    for (int i = 0; i < kQueueSize * 4; ++i) {
+        LOG_WARN("lapping entry {} of {} at {}", i, kQueueSize * 4, 2.5);
+    }
+    sink->release_.store(true, std::memory_order_release);
+    logger.flush();
+
+    EXPECT_FALSE(sink->changed_) << "the entry handed to the sink was rewritten while it held it";
+    EXPECT_EQ(sink->message_, "victim 42");
+    logger.shutdown();
+}
+
+TEST_F(SlickLoggerTest, ReinitWithSmallerRingDeliversEveryEntry) {
+    // The writer tells a rewritten slot from an intact one by how far producers
+    // have got through the ring. That progress belongs to one ring: carried into
+    // the next init(), from any of its overloads, it made the writer discard
+    // every entry of a smaller ring as already overwritten.
+    auto& logger = slick::logger::Logger::instance();
+    logger.reset();
+    logger.add_sink(std::make_shared<CountingSink>());
+    logger.init(1 << 16);
+    for (int i = 0; i < (1 << 18); ++i) {
+        LOG_INFO("advance {}", i);
+    }
+    logger.flush();
+    logger.shutdown();
+
+    auto sink = std::make_shared<CountingSink>();
+    logger.reset();
+    logger.add_sink(sink);
+    logger.init(64);
+    for (int i = 0; i < 10; ++i) {
+        LOG_INFO("after reinit {}", i);
+        logger.flush(); // one at a time, so the small ring never overflows
+    }
+    EXPECT_EQ(sink->writes_.load(std::memory_order_acquire), 11); // the banner and ten entries
+    logger.shutdown();
 }
 
 // A sink that is slow to write, so the writer thread is still mid-batch when a
@@ -1556,7 +1647,7 @@ TEST_F(SlickLoggerTest, SinkMacroOnUnregisteredSinkDoesNotBroadcast) {
 
 TEST_F(SlickLoggerTest, ClearSinksDetachesHandlesFromReusedSlots) {
     // A handle kept across clear_sinks() must not address the slot a later
-    // add_sink() reuses - both sinks would otherwise sit at index 0.
+    // add_sink() reuses; both sinks would otherwise sit at index 0.
     slick::logger::Logger::instance().clear_sinks();
     slick::logger::Logger::instance().add_file_sink("test_sink_orphan.log", "old");
 
@@ -1693,7 +1784,7 @@ TEST(MessageFormatCache, CachedParseRendersExactlyAsAFreshOne) {
     // A static format is parsed once and replayed from the cache; anything else
     // is parsed per line. The two must never disagree, including on the corner
     // cases of the field grammar, so each case is rendered uncached, then
-    // cached twice - the first parses and stores, the second replays.
+    // cached twice: the first parses and stores, the second replays.
     struct Case {
         const char* format;
         void (*add_args)(LogEntry&);

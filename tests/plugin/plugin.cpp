@@ -16,10 +16,10 @@ extern "C" {
  * Redirects this library's Logger::instance() to the host's logger so that
  * all LOG_* calls from this library appear in the host's log file.
  *
- * IMPORTANT — unload ordering:
+ * Unload ordering matters:
  * LOG_* with string literals stores a raw pointer to the format string, which
  * lives in this library's code segment. The host must call
- * Logger::instance().flush() BEFORE calling FreeLibrary/dlclose to ensure the
+ * Logger::instance().flush() before calling FreeLibrary/dlclose, so that the
  * writer thread has consumed all queued entries. Unlike shutdown(), flush()
  * leaves the logger running so the host can continue logging after the call.
  */

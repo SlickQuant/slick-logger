@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <slick/logger.hpp>
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <fstream>
 #include <regex>
 #include <thread>
@@ -348,7 +350,7 @@ TEST_F(TimestampTest, AppendTimestampAppendsExactlyWhatFormatTimestampReturns) {
 // A CUSTOM format is split at every %f once, when it is set, so the render path
 // never parses the format string again. These pin what that split has to preserve.
 TEST_F(TimestampTest, CustomFormatMicrosecondsAreUnpadded) {
-    // %f in a CUSTOM format means "microseconds, no leading zeros" - unlike the
+    // %f in a CUSTOM format means "microseconds, no leading zeros", unlike the
     // %f pattern flag, which is zero-padded to six digits.
     struct Case { uint64_t sub_ns; const char* micros; };
     const Case cases[] = {
@@ -722,5 +724,114 @@ TEST_F(TimestamperTest, SwapWhileLoggingIsSafe) {
     ASSERT_EQ(sink->stamps().size(), static_cast<size_t>(kThreads * kPerThread + 1));
     for (const uint64_t stamp : sink->stamps()) {
         EXPECT_TRUE(stamp == kA || stamp == kB) << stamp;
+    }
+}
+
+// ------------------------------------------------------------- TscTimestamper
+
+namespace {
+
+// Far wider than the timestamper's own error, which is a few microseconds at
+// most: this only has to tolerate a loaded CI machine descheduling the test
+// between its two clock reads.
+constexpr int64_t kWallClockTolerance = 2'000'000; // 2 ms
+
+/// The signed gap between a TscTimestamper reading and the wall clock, taken
+/// between two system_clock reads so the gap excludes the time spent reading.
+int64_t gap_to_wall_clock(TscTimestamper& tsc, uint64_t& stamp) {
+    const uint64_t before = system_now_ns();
+    stamp = tsc.now();
+    const uint64_t after = system_now_ns();
+    if (stamp < before) return static_cast<int64_t>(stamp - before);
+    if (stamp > after) return static_cast<int64_t>(stamp - after);
+    return 0;
+}
+
+} // namespace
+
+TEST(TscTimestamperTest, TracksTheWallClock) {
+    TscTimestamper tsc;
+    if (!tsc.uses_cycle_counter()) {
+        GTEST_SKIP() << "no invariant cycle counter here (a VM?); now() is system_clock";
+    }
+    uint64_t previous = 0;
+    for (int i = 0; i < 2000; ++i) {
+        uint64_t stamp = 0;
+        const int64_t gap = gap_to_wall_clock(tsc, stamp);
+        EXPECT_LE(std::abs(gap), kWallClockTolerance) << "sample " << i;
+        EXPECT_GE(stamp, previous) << "sample " << i;
+        previous = stamp;
+        if (i % 100 == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
+
+TEST(TscTimestamperTest, ReanchorsWithoutGoingBackwards) {
+    // A 20 ms interval re-anchors a dozen times in this test. Each one slews the
+    // drift away rather than stepping, so one thread's stamps never decrease.
+    TscTimestamper tsc(std::chrono::milliseconds(2), std::chrono::milliseconds(20));
+    if (!tsc.uses_cycle_counter()) {
+        GTEST_SKIP() << "no invariant cycle counter here; now() is system_clock";
+    }
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    uint64_t previous = 0;
+    int samples = 0;
+    while (std::chrono::steady_clock::now() < end) {
+        uint64_t stamp = 0;
+        const int64_t gap = gap_to_wall_clock(tsc, stamp);
+        EXPECT_LE(std::abs(gap), kWallClockTolerance) << "sample " << samples;
+        ASSERT_GE(stamp, previous) << "went backwards at sample " << samples;
+        previous = stamp;
+        ++samples;
+    }
+    EXPECT_GT(samples, 1000);
+}
+
+TEST(TscTimestamperTest, ConcurrentReadersDuringReanchors) {
+    // A 1 ms interval puts many threads past it at once, all racing to re-anchor
+    // while the rest keep reading the anchor being replaced.
+    TscTimestamper tsc(std::chrono::milliseconds(2), std::chrono::milliseconds(1));
+    constexpr int kThreads = 4;
+    std::atomic<int64_t> worst_gap{0};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < kThreads; ++t) {
+        readers.emplace_back([&] {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+            int64_t worst = 0;
+            while (std::chrono::steady_clock::now() < end) {
+                uint64_t stamp = 0;
+                worst = std::max(worst, std::abs(gap_to_wall_clock(tsc, stamp)));
+            }
+            int64_t seen = worst_gap.load();
+            while (seen < worst && !worst_gap.compare_exchange_weak(seen, worst)) {
+            }
+        });
+    }
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    EXPECT_LE(worst_gap.load(), kWallClockTolerance);
+}
+
+TEST_F(TimestamperTest, TscTimestamperStampsEntries) {
+    auto tsc = std::make_shared<TscTimestamper>();
+    Logger::instance().set_timestamper(tsc);
+    const uint64_t before = system_now_ns();
+    auto sink = start();
+    for (int i = 0; i < 100; ++i) {
+        LOG_INFO("tsc {}", i);
+    }
+    Logger::instance().flush();
+    const uint64_t after = system_now_ns();
+
+    // One producing thread, so the stamps arrive in the order they were taken.
+    ASSERT_EQ(sink->stamps().size(), 101u); // the init() banner and the messages
+    uint64_t previous = 0;
+    for (const uint64_t stamp : sink->stamps()) {
+        EXPECT_GE(stamp + kWallClockTolerance, before);
+        EXPECT_LE(stamp, after + kWallClockTolerance);
+        EXPECT_GE(stamp, previous);
+        previous = stamp;
     }
 }

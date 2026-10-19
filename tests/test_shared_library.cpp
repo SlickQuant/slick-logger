@@ -77,12 +77,12 @@ TEST_F(SharedLibraryTest, PluginLogsRouteToHostLogger) {
     const int plugin_probe_line = plugin_probe();
     plugin_shutdown();
 
-    // Drain the host logger's queue BEFORE unloading the plugin.
+    // Drain the host logger's queue before unloading the plugin.
     // LOG_* with string literals stores a raw pointer to the format string,
     // which lives in the plugin's code segment. flush() blocks until the writer
     // thread has consumed all queued entries, so close_lib() can safely unmap
     // the plugin's memory without leaving dangling format-string pointers.
-    // The host logger keeps running — logging can continue after this call.
+    // The host logger keeps running, so logging can continue after this call.
     slick::logger::Logger::instance().flush();
 
     close_lib(handle);
