@@ -2007,10 +2007,11 @@ protected:
     static constexpr size_t kStreamBufferSize = detail::kStreamBufferSize;
 
     std::filesystem::path file_path_;
-    std::ofstream file_stream_;
     /// Backing store for file_stream_'s buffer. Held by the sink so it outlives
-    /// every open/close cycle; pubsetbuf() does not take ownership.
+    /// every open/close cycle; pubsetbuf() does not take ownership. Declared before
+    /// file_stream_ so it is destroyed after it: ~ofstream flushes from this buffer.
     std::vector<char> stream_buffer_;
+    std::ofstream file_stream_;
     /// Lines rendered by write_line() and not yet handed to file_stream_.
     std::string write_cache_;
     size_t write_cache_size_ = kDefaultWriteCacheSize;
@@ -3417,8 +3418,9 @@ private:
     /// did. A row with neither reports unknown rather than a misleading zero.
     uint64_t stats_string_last_ = 0;
     bool stats_string_seen_ = false;
-    std::ofstream stats_stream_;
+    // Buffer before stream, so ~ofstream never flushes from a freed buffer.
     std::vector<char> stats_stream_buffer_;
+    std::ofstream stats_stream_;
     size_t stats_bytes_written_ = 0;
     /// Cumulative counters as of the previous report, for the rate deltas.
     LogStats stats_previous_{};

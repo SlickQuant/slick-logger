@@ -1458,7 +1458,7 @@ TEST_F(SinkTest, FileSinkWritesItsCacheWhenDestroyed) {
         // One short line is nowhere near the cache size, so it has not been
         // handed to the file yet.
         EXPECT_TRUE(read_file_bytes("cache_destroy.log").empty());
-    }
+    } // under ASan: ~ofstream must flush before stream_buffer_ is freed
     EXPECT_NE(read_file_bytes("cache_destroy.log").find("cached until destruction"), std::string::npos);
     std::filesystem::remove("cache_destroy.log");
 }
