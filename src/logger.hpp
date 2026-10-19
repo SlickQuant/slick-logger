@@ -1785,6 +1785,12 @@ protected:
                                       ColorFn color_for = nullptr,
                                       std::string_view color_end = {});
 
+    /// format_log_entry(), appending the line to @p out rather than to this
+    /// sink's buffer - for a sink that batches lines, so a line is rendered
+    /// where it is going instead of copied there. Writer thread only.
+    void append_log_entry(std::string& out, const LogEntry& entry,
+                          ColorFn color_for = nullptr, std::string_view color_end = {});
+
 private:
     friend class Logger;
     /**
@@ -1876,6 +1882,14 @@ inline ISink* sink_ptr(const std::unique_ptr<T, D>& sink) noexcept { return sink
 /// Size of the explicit stream buffer open_buffered_stream() installs.
 inline constexpr size_t kStreamBufferSize = 64 * 1024;
 
+/// What a text-mode stream turns '\n' into here. Text sinks write binary streams
+/// and add it themselves, so files come out the same as text mode would make them.
+#ifdef _WIN32
+inline constexpr std::string_view kLineEnding = "\r\n";
+#else
+inline constexpr std::string_view kLineEnding = "\n";
+#endif
+
 inline void open_buffered_stream(std::ofstream& stream, std::vector<char>& buffer,
                                  const std::filesystem::path& path,
                                  std::ios::openmode mode, size_t buffer_size) {
@@ -1923,15 +1937,32 @@ private:
 /**
  * @brief Shared file-stream plumbing for sinks that write to a file
  *
- * Owns the stream, its explicit buffer, and the path. Says nothing about what
- * goes into the file, which is what lets FileSink (text) and BinarySink (raw
- * bytes) share it.
+ * Owns the stream, its explicit buffer, the path, and the write cache text
+ * sinks batch their lines in (see write_line()). Says nothing about what goes
+ * into the file, which is what lets FileSink (text) and BinarySink (raw bytes)
+ * share it. A subclass writing file_stream_ directly should call write_cached()
+ * first if it also uses write_line(), or its bytes land ahead of cached lines.
  */
 class FileSinkBase : public ISink {
 public:
+    /// Hands whatever is still in the write cache to the file.
+    ~FileSinkBase() override;
+
     std::string file_path() const { return file_path_.string(); }
 
+    /// Hands the write cache to the file, then flushes the stream.
     void flush() override;
+
+    /// Bytes a text sink collects before handing them to the file in one write,
+    /// kDefaultWriteCacheSize unless changed. Smaller keeps less unwritten during
+    /// a long burst; 0 writes every line as it comes. Set it before the sink is
+    /// added to a running logger: the writer thread is what fills the cache.
+    void set_write_cache_size(size_t bytes) noexcept { write_cache_size_ = bytes; }
+    size_t write_cache_size() const noexcept { return write_cache_size_; }
+
+    /// See set_write_cache_size(). 256 KiB: measured on Windows, 64 KiB made a
+    /// line 20-30% slower, and 1 MiB made it 2-13% faster for four times the memory.
+    static constexpr size_t kDefaultWriteCacheSize = 256 * 1024;
 
 protected:
     /**
@@ -1949,6 +1980,27 @@ protected:
      */
     void open_stream(const std::filesystem::path& path, std::ios::openmode mode);
 
+    /// Hand the write cache to the file, then close the stream. What rotation
+    /// calls, so cached lines land in the file they were written for.
+    void close_stream();
+
+    /**
+     * @brief Render @p entry as a line into the write cache
+     * @return The bytes it adds to the file, line ending included
+     *
+     * The line is formatted straight into the cache and ended with kLineEnding,
+     * and the cache goes to the stream in one write once it reaches
+     * write_cache_size(). Per line that is a few copies instead of two stream
+     * insertions; on MSVC each of those also made the CRT scan the text to turn
+     * '\n' into "\r\n", which cost more than formatting the line. So text sinks
+     * open their streams binary and translate here, newlines inside a message
+     * included, which leaves the file what text mode would have made it.
+     */
+    size_t write_line(const LogEntry& entry);
+
+    /// Hand everything in the write cache to the stream.
+    void write_cached();
+
     /// Size of the explicit stream buffer installed by open_stream().
     static constexpr size_t kStreamBufferSize = detail::kStreamBufferSize;
 
@@ -1957,6 +2009,9 @@ protected:
     /// Backing store for file_stream_'s buffer. Held by the sink so it outlives
     /// every open/close cycle; pubsetbuf() does not take ownership.
     std::vector<char> stream_buffer_;
+    /// Lines rendered by write_line() and not yet handed to file_stream_.
+    std::string write_cache_;
+    size_t write_cache_size_ = kDefaultWriteCacheSize;
 };
 
 class FileSink : public FileSinkBase {
@@ -1968,6 +2023,12 @@ public:
     explicit FileSink(const std::filesystem::path& file_path, const std::string& custom_timestamp_format, std::string&& name = "");
 
     void write(const LogEntry& entry) override;
+
+protected:
+    /// Binary, because write_line() writes the platform line ending itself.
+    static constexpr std::ios::openmode kAppendMode = std::ios::binary | std::ios::app;
+    /// What a rotation opens its new file with.
+    static constexpr std::ios::openmode kTruncateMode = std::ios::binary | std::ios::out | std::ios::trunc;
 };
 
 class RotatingFileSink : public FileSink {
@@ -5096,6 +5157,13 @@ inline void ISink::set_timestamp_format(const std::string& custom_format) {
 inline std::string_view ISink::format_log_entry(const LogEntry& entry,
                                                 ColorFn color_for,
                                                 std::string_view color_end) {
+    format_buffer_.clear();
+    append_log_entry(format_buffer_, entry, color_for, color_end);
+    return format_buffer_;
+}
+
+inline void ISink::append_log_entry(std::string& out, const LogEntry& entry,
+                                    ColorFn color_for, std::string_view color_end) {
     const PatternFormatter* active = active_pattern_.load(std::memory_order_acquire);
 
     // The message comes first because a format error overrides the level that
@@ -5115,7 +5183,6 @@ inline std::string_view ISink::format_log_entry(const LogEntry& entry,
     const std::string_view level_name = to_string(level);
     const std::string_view color_start = color_for ? color_for(level) : std::string_view{};
 
-    format_buffer_.clear();
     if (active) {
         PatternFormatter::Context ctx;
         ctx.message = message;
@@ -5125,9 +5192,9 @@ inline std::string_view ISink::format_log_entry(const LogEntry& entry,
         ctx.timestamp = &timestamp_formatter_;
         ctx.color_start = color_start;
         ctx.color_end = color_end;
-        active->format(format_buffer_, entry, ctx);
+        active->format(out, entry, ctx);
     } else {
-        detail::line_writer writer(format_buffer_,
+        detail::line_writer writer(out,
                                    color_start.size() + color_end.size()
                                    + default_layout_bound(entry, timestamp_formatter_, level_name,
                                                           message, source_file_length(entry)));
@@ -5136,7 +5203,6 @@ inline std::string_view ISink::format_log_entry(const LogEntry& entry,
         writer.put(color_end);
         writer.finish();
     }
-    return format_buffer_;
 }
 
 inline ConsoleSink::ConsoleSink(bool use_colors, bool use_stderr_for_errors,
@@ -5201,28 +5267,80 @@ inline FileSinkBase::FileSinkBase(const std::filesystem::path& file_path, std::i
     }
 }
 
+inline FileSinkBase::~FileSinkBase() {
+    write_cached();
+}
+
 inline void FileSinkBase::flush() {
+    write_cached();
     if (file_stream_) {
         file_stream_.flush();
     }
 }
 
+inline void FileSinkBase::close_stream() {
+    write_cached();
+    file_stream_.close();
+}
+
+inline void FileSinkBase::write_cached() {
+    if (!write_cache_.empty()) {
+        // A failed stream drops the batch, as it would have dropped each line.
+        file_stream_.write(write_cache_.data(), static_cast<std::streamsize>(write_cache_.size()));
+        write_cache_.clear();
+    }
+}
+
+inline size_t FileSinkBase::write_line(const LogEntry& entry) {
+    if (write_cache_.capacity() < write_cache_size_) [[unlikely]] {
+        // Once, with room for the line that crosses the threshold, so filling
+        // the cache never reallocates it.
+        write_cache_.reserve(write_cache_size_ + write_cache_size_ / 8 + 4096);
+    }
+    const size_t start = write_cache_.size();
+    try {
+        append_log_entry(write_cache_, entry);
+    } catch (...) {
+        write_cache_.resize(start); // never let half a line reach the file
+        throw;
+    }
+    if constexpr (detail::kLineEnding.size() > 1) {
+        // What text mode did to a message with newlines in it.
+        if (std::memchr(write_cache_.data() + start, '\n', write_cache_.size() - start)) [[unlikely]] {
+            const std::string line = write_cache_.substr(start);
+            write_cache_.resize(start);
+            for (const char c : line) {
+                if (c == '\n') {
+                    write_cache_.append(detail::kLineEnding);
+                } else {
+                    write_cache_.push_back(c);
+                }
+            }
+        }
+    }
+    write_cache_.append(detail::kLineEnding);
+    const size_t added = write_cache_.size() - start;
+    if (write_cache_.size() >= write_cache_size_) {
+        write_cached();
+    }
+    return added;
+}
+
 inline FileSink::FileSink(const std::filesystem::path& file_path,
                           TimestampFormatter::Format timestamp_format, std::string&& name)
-    : FileSinkBase(file_path, std::ios::app, std::move(name)) {
+    : FileSinkBase(file_path, kAppendMode, std::move(name)) {
     set_timestamp_format(timestamp_format);
 }
 
 inline FileSink::FileSink(const std::filesystem::path& file_path,
                           const std::string& custom_timestamp_format, std::string&& name)
-    : FileSinkBase(file_path, std::ios::app, std::move(name)) {
+    : FileSinkBase(file_path, kAppendMode, std::move(name)) {
     set_timestamp_format(custom_timestamp_format);
 }
 
 inline void FileSink::write(const LogEntry& entry) {
     if (file_stream_) {
-        const std::string_view formatted = format_log_entry(entry);
-        file_stream_ << formatted << "\n";
+        write_line(entry);
     }
 }
 
@@ -5244,11 +5362,9 @@ inline RotatingFileSink::RotatingFileSink(const std::filesystem::path& base_path
 
 inline void RotatingFileSink::write(const LogEntry& entry) {
     check_rotation();
-    
+
     if (file_stream_) {
-        const std::string_view formatted = format_log_entry(entry);
-        file_stream_ << formatted << "\n";
-        current_file_size_ += formatted.size() + 1; // +1 for newline
+        current_file_size_ += write_line(entry);
     }
 }
 
@@ -5259,8 +5375,8 @@ inline void RotatingFileSink::check_rotation() {
 }
 
 inline void RotatingFileSink::rotate_files() {
-    file_stream_.close();
-    
+    close_stream();
+
     // Remove the oldest file if it exists
     auto oldest_file = get_rotated_filename(config_.max_files - 1);
     if (std::filesystem::exists(oldest_file)) {
@@ -5278,7 +5394,7 @@ inline void RotatingFileSink::rotate_files() {
     }
     
     // Create new current file
-    open_stream(base_path_, std::ios::out | std::ios::trunc);
+    open_stream(base_path_, kTruncateMode);
     current_file_size_ = 0;
 }
 
@@ -5309,7 +5425,7 @@ inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, cons
 
             // If the existing file is from a previous day, rotate it
             if (file_date != current_date_) {
-                file_stream_.close();
+                close_stream();
 
                 // Check if dated file already exists, if so rotate all files for that date
                 std::filesystem::path dated_file = get_dated_filename(file_date);
@@ -5329,7 +5445,7 @@ inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, cons
                 }
 
                 // Reopen file for today
-                open_stream(base_path_, std::ios::out | std::ios::trunc);
+                open_stream(base_path_, kTruncateMode);
                 if (!file_stream_) {
                     throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
                 }
@@ -5370,7 +5486,7 @@ inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, cons
 
             // If the existing file is from a previous day, rotate it
             if (file_date != current_date_) {
-                file_stream_.close();
+                close_stream();
 
                 // Check if dated file already exists, if so rotate all files for that date
                 std::filesystem::path dated_file = get_dated_filename(file_date);
@@ -5390,7 +5506,7 @@ inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, cons
                 }
 
                 // Reopen file for today
-                open_stream(base_path_, std::ios::out | std::ios::trunc);
+                open_stream(base_path_, kTruncateMode);
                 if (!file_stream_) {
                     throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
                 }
@@ -5411,9 +5527,7 @@ inline void DailyFileSink::write(const LogEntry& entry) {
     check_rotation();
 
     if (file_stream_) {
-        const std::string_view formatted = format_log_entry(entry);
-        file_stream_ << formatted << "\n";
-        current_file_size_ += formatted.size() + 1; // +1 for newline
+        current_file_size_ += write_line(entry);
     }
 }
 
@@ -5423,7 +5537,7 @@ inline void DailyFileSink::check_rotation() {
     // Check for date-based rotation
     if (today != current_date_) {
         // Close current file
-        file_stream_.close();
+        close_stream();
 
         // Rename current base file to dated filename (e.g., daily.log -> daily_2025-08-24.log)
         std::filesystem::path old_dated_file = get_dated_filename(current_date_);
@@ -5440,7 +5554,7 @@ inline void DailyFileSink::check_rotation() {
         }
 
         // Reopen base file for new day's logs
-        open_stream(base_path_, std::ios::out | std::ios::trunc); // Start fresh for new day
+        open_stream(base_path_, kTruncateMode); // Start fresh for new day
         if (!file_stream_) {
             throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
         }
@@ -5494,7 +5608,7 @@ inline void DailyFileSink::rotate_files_for_date(const std::string& date) {
 }
 
 inline void DailyFileSink::rotate_daily_files() {
-    file_stream_.close();
+    close_stream();
 
     // Rotate all existing files for the current date (if any)
     std::filesystem::path dated_file = get_dated_filename(current_date_);
@@ -5520,7 +5634,7 @@ inline void DailyFileSink::rotate_daily_files() {
     }
 
     // Create new current file
-    open_stream(base_path_, std::ios::out | std::ios::trunc);
+    open_stream(base_path_, kTruncateMode);
     if (!file_stream_) {
         throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
     }

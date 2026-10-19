@@ -1270,6 +1270,15 @@ Writes to stdout/stderr, with optional ANSI colors per log level. WARN/ERROR/FAT
 
 Basic file logging. It appends to the given file and creates missing directories. All file operations happen on the single writer thread, so it is thread-safe.
 
+Lines are formatted straight into a write cache (256 KiB by default) that goes to the file in one write when it fills, and whenever the writer thread catches up with the queue or `flush()` is called - so an idle logger has everything on disk, as before. On Windows it also writes `\r\n` itself instead of leaving the translation to a text-mode stream, which on MSVC cost more than formatting the line. The file comes out byte for byte as before. Measured on Windows/MSVC `/O2`, 1,000,000 entries drained by the writer thread:
+
+| Line | Before | With the write cache |
+| --- | ---: | ---: |
+| No arguments | 1,046 ns | **298 ns** |
+| Four arguments | 1,731 ns | **518 ns** |
+
+`set_write_cache_size(bytes)` trades that against how much a long burst holds unwritten: `0` hands each line to the file as it comes. Call it before adding the sink. `RotatingFileSink` and `DailyFileSink` share the cache and write it out before each rotation, so a line always lands in the file it was written for.
+
 ### RotatingFileSink
 
 Size-based log rotation. The size limit is configurable (default 10MB), only the last N files are kept and the oldest is deleted, and files are named `log.txt`, then `log_1.txt`, `log_2.txt`, and so on. Rotation is thread-safe.
@@ -1490,7 +1499,7 @@ public:
 Logger::instance().add_sink(std::make_shared<JsonSink>("app.json"));
 ```
 
-A sink that writes to a file can inherit `FileSinkBase` instead, which supplies the stream, its buffer, directory creation, and `flush()`. `FileSink` and `BinarySink` are built on it.
+A sink that writes to a file can inherit `FileSinkBase` instead, which supplies the stream, its buffer, directory creation, and `flush()`. `FileSink` and `BinarySink` are built on it. A text sink can also batch its lines through the base's write cache: `write_line(entry)` renders the entry into the cache, ends it with the platform line ending, and returns the bytes it added. For that the stream must be opened in binary mode, as `FileSink` does. A subclass that also writes `file_stream_` directly should call `write_cached()` first, so its bytes do not land ahead of lines still in the cache.
 
 The `LogEntry` that `write()` receives is the writer thread's own copy of the entry, never the ring slot, so nothing changes it during the call, however far producers have run ahead. The writer reuses that copy for the next entry, so keep a copy rather than the reference.
 

@@ -1403,6 +1403,158 @@ TEST_F(SinkTest, FailedFormatReplacesAPartialMessage) {
     EXPECT_EQ(out, "prefix:plain");
 }
 
+// ------------------------------------------------------------ write cache
+
+namespace {
+
+std::string read_file_bytes(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+size_t count_of(const std::string& text, std::string_view needle) {
+    size_t count = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) {
+        ++count;
+    }
+    return count;
+}
+
+} // namespace
+
+TEST_F(SinkTest, FileSinkEndsLinesAsTextModeWould) {
+    // Text sinks write a binary stream and end each line themselves. On Windows
+    // every newline must still come out as CR LF - a newline inside a message
+    // too, as text mode made it - and a CR may appear nowhere else.
+    std::filesystem::remove("cache_lines.log");
+    auto& logger = slick::logger::Logger::instance();
+    logger.clear_sinks();
+    logger.add_file_sink("cache_lines.log");
+    logger.init(1024);
+    LOG_INFO("first line");
+    LOG_INFO("two{}halves", "\n");
+    logger.reset();
+
+    const std::string bytes = read_file_bytes("cache_lines.log");
+    EXPECT_EQ(count_of(bytes, "\n"), 4u) << bytes; // banner, first, inside the second, its end
+#ifdef _WIN32
+    EXPECT_EQ(count_of(bytes, "\r\n"), 4u) << bytes;
+    EXPECT_EQ(count_of(bytes, "\r"), 4u) << bytes;
+#else
+    EXPECT_EQ(count_of(bytes, "\r"), 0u) << bytes;
+#endif
+    std::filesystem::remove("cache_lines.log");
+}
+
+TEST_F(SinkTest, FileSinkWritesItsCacheWhenDestroyed) {
+    std::filesystem::remove("cache_destroy.log");
+    {
+        slick::logger::FileSink sink("cache_destroy.log");
+        slick::logger::LogEntry entry;
+        entry.format = slick::logger::StringRef{"cached until destruction", 24};
+        entry.timestamp = 0;
+        entry.level = slick::logger::LogLevel::L_INFO;
+        sink.write(entry);
+        // One short line is nowhere near the cache size, so it has not been
+        // handed to the file yet.
+        EXPECT_TRUE(read_file_bytes("cache_destroy.log").empty());
+    }
+    EXPECT_NE(read_file_bytes("cache_destroy.log").find("cached until destruction"), std::string::npos);
+    std::filesystem::remove("cache_destroy.log");
+}
+
+TEST_F(SinkTest, FileSinkKeepsLineOrderAcrossCacheWrites) {
+    // A cache of 0 writes every line as it comes; 100 bytes writes about every
+    // line too, from a cache that keeps being refilled. Either way the file
+    // must hold every line, whole and in order.
+    for (const size_t cache_size : {size_t{0}, size_t{100}}) {
+        std::filesystem::remove("cache_order.log");
+        auto sink = std::make_shared<slick::logger::FileSink>("cache_order.log");
+        sink->set_write_cache_size(cache_size);
+        auto& logger = slick::logger::Logger::instance();
+        logger.clear_sinks();
+        logger.add_sink(sink);
+        logger.init(4096);
+        constexpr int kLines = 2000;
+        for (int i = 0; i < kLines; ++i) {
+            LOG_INFO("ordered {}", i);
+        }
+        logger.reset();
+        sink.reset();
+
+        int expected = 0;
+        {
+            std::ifstream in("cache_order.log");
+            std::string line;
+            std::getline(in, line); // the version banner
+            while (std::getline(in, line)) {
+                const std::string want = "ordered " + std::to_string(expected);
+                ASSERT_GE(line.size(), want.size()) << "cache " << cache_size << ": " << line;
+                ASSERT_EQ(line.compare(line.size() - want.size(), want.size(), want), 0)
+                    << "cache " << cache_size << ": " << line;
+                ++expected;
+            }
+        }
+        EXPECT_EQ(expected, kLines) << "cache " << cache_size;
+        std::filesystem::remove("cache_order.log");
+    }
+}
+
+TEST_F(SinkTest, RotatingFileSinkKeepsCachedLinesInTheirFile) {
+    // Lines still in the write cache when a file fills up belong to that file:
+    // rotation has to write them out before it closes it, or every rotated file
+    // comes out empty and its lines open the next one.
+    const auto remove_all_files = [] {
+        std::filesystem::remove("rotating_cache.log");
+        for (int i = 1; i < 20; ++i) {
+            std::filesystem::remove("rotating_cache_" + std::to_string(i) + ".log");
+        }
+    };
+    remove_all_files();
+    slick::logger::RotationConfig config;
+    config.max_file_size = 1000;
+    config.max_files = 20;
+    auto& logger = slick::logger::Logger::instance();
+    logger.clear_sinks();
+    logger.add_rotating_file_sink("rotating_cache.log", config);
+    logger.init(1024);
+    constexpr int kLines = 60;
+    for (int i = 0; i < kLines; ++i) {
+        LOG_INFO("rotation keeps line {} where it was written", i);
+    }
+    logger.reset();
+
+    // Oldest first: the highest index, down to the live file.
+    std::vector<std::filesystem::path> files;
+    for (int i = 19; i >= 1; --i) {
+        const std::filesystem::path rotated = "rotating_cache_" + std::to_string(i) + ".log";
+        if (std::filesystem::exists(rotated)) {
+            files.push_back(rotated);
+        }
+    }
+    ASSERT_GE(files.size(), 3u) << "expected several rotations";
+    for (const auto& rotated : files) {
+        // A file is rotated once it reaches max_file_size, so each is at least that big.
+        EXPECT_GE(std::filesystem::file_size(rotated), config.max_file_size) << rotated;
+    }
+    files.push_back("rotating_cache.log");
+
+    int expected = 0;
+    for (const auto& path : files) {
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.find("rotation keeps line") == std::string::npos) {
+                continue; // the version banner
+            }
+            EXPECT_NE(line.find("line " + std::to_string(expected) + " where"), std::string::npos) << line;
+            ++expected;
+        }
+    }
+    EXPECT_EQ(expected, kLines);
+    remove_all_files();
+}
+
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
