@@ -41,6 +41,8 @@
 #include <filesystem>
 #include <cassert>
 #include <memory>
+#include <new>
+#include <optional>
 #include <functional>
 #include <iostream>
 #include <fstream>
@@ -2555,6 +2557,257 @@ inline bool TscTimestamper::resync() noexcept {
     resyncing_.store(false, std::memory_order_release);
     return true;
 }
+
+namespace detail {
+
+/**
+ * @brief A single-producer, single-consumer ring of variable-length records
+ *
+ * One logging thread writes it and the writer thread reads it. A record becomes
+ * visible with one release store of the write position, and its space goes back
+ * to the producer with one release store of the read position. try_reserve()
+ * only hands out space the reader has released. When there isn't enough, it
+ * fails and the caller drops the record. So the reader never sees a record that
+ * is being rewritten, and record sizes are safe to keep inside the records. One
+ * producer per ring also means two writers never overlap.
+ *
+ * The object is the whole ring: these three cache lines, then capacity() bytes
+ * of data. It stores positions and no pointers, so it works at any address it
+ * is mapped at, shared memory included. Build one with create() over memory you
+ * own or allocate() on the heap, and read it through a ring_reader.
+ *
+ * A record is an 8-byte header holding its total size, then its payload,
+ * rounded up to 8 bytes. A record that does not fit before the end of the data
+ * leaves a wrap marker there and starts the next lap at offset 0, so a payload
+ * is always contiguous.
+ */
+class producer_ring {
+public:
+    static constexpr uint32_t kLayoutVersion = 1;
+    static constexpr uint32_t kRecordAlign = 8;
+    static constexpr uint32_t kRecordHeader = 8;
+    /// Size field value meaning the rest of this lap is unused.
+    static constexpr uint32_t kWrapMarker = 0xFFFFFFFFu;
+
+    struct deleter {
+        void operator()(producer_ring* ring) const noexcept;
+    };
+    using pointer = std::unique_ptr<producer_ring, deleter>;
+
+    /// Bytes a ring with @p capacity bytes of data occupies.
+    static constexpr size_t block_size(uint64_t capacity) noexcept {
+        return sizeof(producer_ring) + static_cast<size_t>(capacity);
+    }
+
+    /// Whether @p capacity can be used: a power of 2, at least 64 bytes.
+    static constexpr bool valid_capacity(uint64_t capacity) noexcept {
+        return capacity >= 64 && std::has_single_bit(capacity);
+    }
+
+    /**
+     * @brief Build an empty ring in @p memory
+     * @param memory block_size(capacity) bytes, 64-byte aligned
+     * @param capacity Data bytes; see valid_capacity()
+     */
+    static producer_ring* create(void* memory, uint64_t capacity) noexcept {
+        assert(valid_capacity(capacity));
+        assert(reinterpret_cast<uintptr_t>(memory) % alignof(producer_ring) == 0);
+        return ::new (memory) producer_ring(capacity);
+    }
+
+    /// A heap ring with every page pre-touched, so the first lap doesn't page
+    /// fault on the logging thread.
+    static pointer allocate(uint64_t capacity) {
+        void* memory = ::operator new(block_size(capacity), std::align_val_t{alignof(producer_ring)});
+        pointer ring{create(memory, capacity)};
+        std::memset(ring->data(), 0, static_cast<size_t>(capacity));
+        return ring;
+    }
+
+    uint64_t capacity() const noexcept { return capacity_; }
+
+    /// The largest payload one record can carry. A record is at most half the
+    /// ring, so it and the end-of-lap space it may skip always fit in an empty ring.
+    uint32_t max_payload() const noexcept {
+        return static_cast<uint32_t>(std::min<uint64_t>(capacity_ / 2, UINT32_MAX - kRecordAlign)) - kRecordHeader;
+    }
+
+    // ---- producer side: one thread ----
+
+    /**
+     * @brief Space for one record's payload, or null if the ring is full
+     * @param payload At most max_payload() bytes
+     * @return Where to write the payload, 8-byte aligned. Nothing is visible to
+     *         the reader until publish(). Null means taking the space would
+     *         overwrite records the reader has not released. The refusal is
+     *         counted in drops() and the caller drops the record.
+     */
+    uint8_t* try_reserve(uint32_t payload) noexcept {
+        assert(payload <= max_payload());
+        const uint64_t size = (uint64_t{kRecordHeader} + payload + (kRecordAlign - 1)) & ~uint64_t{kRecordAlign - 1};
+        const uint64_t pos = write_pos_.load(std::memory_order_relaxed); // only this thread writes it
+        const uint64_t offset = pos & mask_;
+        const uint64_t to_end = capacity_ - offset;
+        const uint64_t skip = size <= to_end ? 0 : to_end;
+        const uint64_t end = pos + skip + size;
+        if (end - cached_read_pos_ > capacity_) [[unlikely]] {
+            // The only load of the reader's line, so in steady state it never leaves the reader's core.
+            cached_read_pos_ = read_pos_.load(std::memory_order_acquire);
+            if (end - cached_read_pos_ > capacity_) {
+                drops_.store(drops_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                return nullptr;
+            }
+        }
+        uint8_t* const base = data();
+        if (skip != 0) {
+            store_u32(base + offset, kWrapMarker);
+        }
+        const uint64_t start = (pos + skip) & mask_;
+        store_u32(base + start, static_cast<uint32_t>(size));
+        pending_end_ = end;
+        return base + start + kRecordHeader;
+    }
+
+    /// Make the record try_reserve() handed out visible to the reader.
+    void publish() noexcept { write_pos_.store(pending_end_, std::memory_order_release); }
+
+    /// Records try_reserve() refused because the ring was full.
+    uint64_t drops() const noexcept { return drops_.load(std::memory_order_relaxed); }
+
+    // ---- either side ----
+
+    /// Total bytes published so far.
+    uint64_t written() const noexcept { return write_pos_.load(std::memory_order_acquire); }
+    /// Total bytes the reader has handed back so far.
+    uint64_t released() const noexcept { return read_pos_.load(std::memory_order_acquire); }
+
+private:
+    friend class ring_reader;
+
+    explicit producer_ring(uint64_t capacity) noexcept : capacity_(capacity), mask_(capacity - 1) {}
+
+    uint8_t* data() noexcept { return reinterpret_cast<uint8_t*>(this) + sizeof(producer_ring); }
+    const uint8_t* data() const noexcept { return reinterpret_cast<const uint8_t*>(this) + sizeof(producer_ring); }
+
+    static void store_u32(uint8_t* at, uint32_t value) noexcept { std::memcpy(at, &value, sizeof(value)); }
+    static uint32_t load_u32(const uint8_t* at) noexcept {
+        uint32_t value;
+        std::memcpy(&value, at, sizeof(value));
+        return value;
+    }
+
+    // Read-only once built.
+    alignas(64) uint32_t layout_version_ = kLayoutVersion;
+    uint64_t capacity_;
+    uint64_t mask_;
+    // Producer-owned: the reader only ever loads write_pos_.
+    alignas(64) std::atomic<uint64_t> write_pos_{0};
+    uint64_t pending_end_ = 0;      // what publish() moves write_pos_ to
+    uint64_t cached_read_pos_ = 0;  // the last read_pos_ the producer looked at
+    std::atomic<uint64_t> drops_{0};
+    // Reader-owned: the producer only loads it, and only when the ring looks full.
+    alignas(64) std::atomic<uint64_t> read_pos_{0};
+};
+
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+              "producer_ring must be lock-free: it is meant to be shared between processes");
+static_assert(std::is_standard_layout_v<producer_ring> && sizeof(producer_ring) % 64 == 0,
+              "producer_ring is a block layout: its data must start on a cache line");
+
+inline void producer_ring::deleter::operator()(producer_ring* ring) const noexcept {
+    ring->~producer_ring();
+    ::operator delete(ring, std::align_val_t{alignof(producer_ring)});
+}
+
+/**
+ * @brief The reading side of one producer_ring
+ *
+ * It lives outside the ring because its cursor is the reader's private state.
+ * The producer never needs it and learns about free space only through
+ * release(). Reading goes in batches. refresh() loads the write position once,
+ * and every record up to it can be read without touching the producer's line
+ * again. Nothing goes back to the producer until release(), so records stay
+ * valid while they are in use.
+ */
+class ring_reader {
+public:
+    ring_reader() noexcept = default;
+    explicit ring_reader(producer_ring& ring) noexcept
+        : ring_(&ring), cursor_(ring.released()), batch_end_(cursor_) {}
+
+    producer_ring* ring() const noexcept { return ring_; }
+
+    /// Take in everything published since the last refresh(). Returns whether
+    /// there is anything to read.
+    bool refresh() noexcept {
+        batch_end_ = ring_->write_pos_.load(std::memory_order_acquire);
+        return cursor_ != batch_end_;
+    }
+
+    /**
+     * @brief The next record's payload in this batch, or nothing when none is left
+     *
+     * The payload is the reserved size rounded up to 8 bytes, so a record that
+     * needs an exact length has to carry it. Wrap markers are skipped. Each size
+     * is checked before use: it must cover the header, be a multiple of 8, and
+     * fit inside both the batch and the lap. A size that fails is counted in
+     * corrupt() and ends the batch at the write position.
+     */
+    std::optional<std::span<const uint8_t>> peek() noexcept {
+        const uint64_t capacity = ring_->capacity_;
+        const uint8_t* const base = ring_->data();
+        while (cursor_ != batch_end_) {
+            const uint64_t offset = cursor_ & ring_->mask_;
+            const uint64_t left = batch_end_ - cursor_;
+            const uint32_t size = producer_ring::load_u32(base + offset);
+            if (size == producer_ring::kWrapMarker) {
+                const uint64_t to_end = capacity - offset;
+                if (to_end > left) {
+                    break;
+                }
+                cursor_ += to_end;
+                continue;
+            }
+            if (size < producer_ring::kRecordHeader || size % producer_ring::kRecordAlign != 0 ||
+                size > left || size > capacity - offset) {
+                break;
+            }
+            current_size_ = size;
+            return std::span<const uint8_t>{base + offset + producer_ring::kRecordHeader,
+                                            size - producer_ring::kRecordHeader};
+        }
+        if (cursor_ != batch_end_) [[unlikely]] {
+            ++corrupt_;
+            cursor_ = batch_end_;
+        }
+        return std::nullopt;
+    }
+
+    /// Step past the record peek() returned. It stays readable until release().
+    void pop() noexcept {
+        assert(current_size_ != 0);
+        cursor_ += current_size_;
+        current_size_ = 0;
+    }
+
+    /// Hand every popped record's space back to the producer.
+    void release() noexcept { ring_->read_pos_.store(cursor_, std::memory_order_release); }
+
+    /// Whether everything the producer had published at refresh() has been popped.
+    bool batch_done() const noexcept { return cursor_ == batch_end_; }
+
+    /// Batches cut short by an impossible record size.
+    uint64_t corrupt() const noexcept { return corrupt_; }
+
+private:
+    producer_ring* ring_ = nullptr;
+    uint64_t cursor_ = 0;
+    uint64_t batch_end_ = 0;
+    uint32_t current_size_ = 0;
+    uint64_t corrupt_ = 0;
+};
+
+} // namespace detail
 
 /**
  * @brief Configuration struct for initializing the logger

@@ -41,6 +41,11 @@ if(BUILD_SLICK_LOGGER_TESTING)
     target_link_libraries(slick_logger_statistics_tests slick::logger GTest::gtest_main)
     add_test(NAME slick_logger_statistics_tests COMMAND slick_logger_statistics_tests)
 
+    add_executable(slick_logger_producer_ring_tests test_producer_ring.cpp)
+    target_include_directories(slick_logger_producer_ring_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(slick_logger_producer_ring_tests slick::logger GTest::gtest_main)
+    add_test(NAME slick_logger_producer_ring_tests COMMAND slick_logger_producer_ring_tests)
+
     # Compiles the statistics publish against the no-P0718 branch of
     # detail::atomic_shared_ptr on every platform, not just the ones (libc++)
     # that select it. Its own executable on purpose: the macro changes the type
