@@ -46,6 +46,27 @@ if(BUILD_SLICK_LOGGER_TESTING)
     target_link_libraries(slick_logger_producer_ring_tests slick::logger GTest::gtest_main)
     add_test(NAME slick_logger_producer_ring_tests COMMAND slick_logger_producer_ring_tests)
 
+    add_executable(slick_logger_thread_ring_tests test_thread_rings.cpp)
+    target_include_directories(slick_logger_thread_ring_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(slick_logger_thread_ring_tests slick::logger GTest::gtest_main)
+    add_test(NAME slick_logger_thread_ring_tests COMMAND slick_logger_thread_ring_tests)
+
+    # The behavioral suites again with LogConfig::thread_rings on by default.
+    foreach(suite IN ITEMS tests:test_logger sink_tests:test_sinks timestamp_tests:test_timestamp
+                           pattern_tests:test_pattern statistics_tests:test_statistics)
+        string(REPLACE ":" ";" suite "${suite}")
+        list(GET suite 0 suite_name)
+        list(GET suite 1 suite_source)
+        set(target slick_logger_${suite_name}_thread_rings)
+        add_executable(${target} ${suite_source}.cpp)
+        target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(${target} PRIVATE SLICK_LOGGER_DEFAULT_THREAD_RINGS=1)
+        target_link_libraries(${target} slick::logger GTest::gtest_main)
+        # Its own directory: the suites write fixed file names, and ctest -j runs both copies at once.
+        file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${target}.wd)
+        add_test(NAME ${target} COMMAND ${target} WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${target}.wd)
+    endforeach()
+
     # Compiles the statistics publish against the no-P0718 branch of
     # detail::atomic_shared_ptr on every platform, not just the ones (libc++)
     # that select it. Its own executable on purpose: the macro changes the type

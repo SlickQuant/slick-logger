@@ -43,9 +43,11 @@ bool matches(const payload_t& payload, uint32_t size, uint64_t seq) {
     return true;
 }
 
+// Gives the record up, and counts it, when the ring is full.
 bool write_record(producer_ring& ring, uint32_t size, uint64_t seq) {
     uint8_t* at = ring.try_reserve(size);
     if (!at) {
+        ring.drop();
         return false;
     }
     fill(at, size, seq);
@@ -275,6 +277,32 @@ TEST(ProducerRing, WorksWhereverItIsMapped) {
     EXPECT_FALSE(reader.peek());
     reader.release();
     EXPECT_TRUE(write_record(*moved, 20, 5)); // the producer side works from the copy too
+}
+
+TEST(ProducerRing, CountsRecordsPublishedAndReleased) {
+    auto ring = producer_ring::allocate(256);
+    ring_reader reader(*ring);
+    for (uint64_t seq = 0; seq < 5; ++seq) {
+        ASSERT_TRUE(write_record(*ring, 40, seq)); // 48 bytes each, 240 in all
+    }
+    EXPECT_FALSE(write_record(*ring, 16, 9)); // a drop is not a record
+    EXPECT_EQ(ring->records(), 5u);
+    ASSERT_TRUE(reader.refresh());
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(reader.peek());
+        reader.pop();
+    }
+    EXPECT_EQ(ring->released_records(), 0u); // popped is not released
+    reader.release();
+    EXPECT_EQ(ring->released_records(), 2u);
+    // A reader that picks the ring up later carries the count on.
+    ring_reader later(*ring);
+    ASSERT_TRUE(later.refresh());
+    while (later.peek()) {
+        later.pop();
+    }
+    later.release();
+    EXPECT_EQ(ring->released_records(), 5u);
 }
 
 TEST(ProducerRing, ConcurrentProducerAndReaderNeverSeeABadRecord) {

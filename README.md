@@ -650,6 +650,25 @@ int main() {
 - `stats_sample_interval_ms`: how often the queue-fullness gauges are sampled between reports, default `10`
 - `stats_max_file_size`: roll the CSV to `<stem>.1.csv` at this size, default 16 MB; `0` disables rolling
 - `timestamper`: where entry timestamps come from; null keeps the current one, which is `std::chrono::system_clock` unless changed (see [Custom Timestamper](#custom-timestamper))
+- `thread_rings`: give every logging thread its own ring, default `false` (see [Per-thread rings](#per-thread-rings))
+- `thread_ring_size`: bytes per thread ring, default 1 MB, rounded up to a power of two, at least 4 KB
+- `max_thread_rings`: rings before further threads use the shared rings, default `64`
+- `writer_poll_interval_us`: how long the writer leaves a busy ring alone after draining it, default `5`
+- `thread_ring_full`: what a call does when its thread's ring is full, `RingFullPolicy::Spill` (default) or `RingFullPolicy::Drop`
+
+#### Per-thread rings
+
+With `thread_rings = true` (Local mode only), each logging thread writes to a ring of its own. A call reserves one record there, with its strings inline, and publishes it with one store. No two producers touch the same cache line. In an A/B test on an 8-core laptop, a call was about 20% cheaper than with the shared rings from one thread, and 3 to 4.5x cheaper from 4 to 8 threads.
+
+What changes:
+
+- By default a full ring spills to the shared rings until the writer catches up, so a burst slows calls down but loses nothing, unless the shared rings fill too and overwrite their oldest entries. With `thread_ring_full = RingFullPolicy::Drop`, a full ring drops the newest entry instead and counts it in `LogStats::entry_loss_count`, which keeps calls cheap under overload.
+- One thread's entries stay in order, spilled ones included. Across threads the writer merges them by timestamp, so an entry stamped just before its thread was preempted can land slightly late.
+- Each logging thread costs `thread_ring_size` of memory. A thread gets its ring on its first log call, which allocates and zeroes it. Call `Logger::instance().prepare_thread()` at thread start to do that ahead of time. It works at any log level. A thread that exits hands its ring to the next new thread.
+- Threads past `max_thread_rings` use the shared rings for the whole run. So do the strings of a record bigger than half a ring, though the record itself stays in the thread's ring.
+- String-ring statistics describe the shared string ring only.
+
+Define `SLICK_LOGGER_DEFAULT_THREAD_RINGS=1` to make it the default, including for the `init()` overloads that take no `LogConfig`.
 
 #### Sizing the string ring
 
@@ -690,6 +709,7 @@ Useful controls:
 - `flush()`: wait for queued entries to be written and flushed to their sinks, while keeping the logger running
 - `shutdown(clear_sinks = true)`: flush, stop the writer thread, and optionally clear sinks
 - `reset()`: return the singleton to an uninitialized state; mainly intended for tests
+- `prepare_thread()`: claim the calling thread's ring up front (see [Per-thread rings](#per-thread-rings)); returns whether it has one
 - `set_level()` / `get_level()`: update or read the global level filter
 - `set_timestamper()`: change the clock entries are stamped with; safe while the logger is running (see [Custom Timestamper](#custom-timestamper))
 - `clear_sinks()`: remove all currently registered sinks before reconfiguration

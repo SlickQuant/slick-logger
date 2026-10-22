@@ -55,6 +55,12 @@ LogConfig make_config(uint32_t interval_ms, uint32_t sample_ms, bool with_csv = 
     return config;
 }
 
+/// For tests of the shared string ring itself: thread rings keep strings out of it.
+LogConfig on_string_ring(LogConfig config) {
+    config.thread_rings = false;
+    return config;
+}
+
 /// Wait until the statistics thread has published a real sample, or give up.
 /// Polling a deadline rather than sleeping a fixed span keeps the test from
 /// flaking on a loaded CI machine.
@@ -229,7 +235,7 @@ TEST_F(SlickLoggerStatsTest, ThroughputIsPositiveUnderLoad) {
 }
 
 TEST_F(SlickLoggerStatsTest, StringRingMetricsAdvance) {
-    Logger::instance().init(make_config(50, 5));
+    Logger::instance().init(on_string_ring(make_config(50, 5)));
 
     const std::string payload(64, 'x');
     for (int i = 0; i < 50; ++i) {
@@ -431,7 +437,7 @@ TEST_F(SlickLoggerStatsTest, SampleIntervalClampedToReportInterval) {
 // ----------------------------------------------------------- string occupancy
 
 TEST_F(SlickLoggerStatsTest, StringOccupancyFoundFromDynamicArgs) {
-    Logger::instance().init(make_config(50, 5));
+    Logger::instance().init(on_string_ring(make_config(50, 5)));
 
     const std::string payload(100, 'y');
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -503,7 +509,7 @@ TEST_F(SlickLoggerStatsTest, StringOccupancyIsValidZeroWhenDrained) {
 TEST_F(SlickLoggerStatsTest, StringOccupancyPeakSurvivesDrain) {
     // The string ring is a gauge like the entry queue, so its peak has to come
     // from the oversampling tick: by report time the burst has usually drained.
-    Logger::instance().init(make_config(200, 5));
+    Logger::instance().init(on_string_ring(make_config(200, 5)));
 
     const std::string payload(100, 'q');
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -737,7 +743,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureVisibleWhileWriterStallsOnLiteralEntr
     config.enable_stats = true;
     config.stats_interval_ms = 30;
     config.stats_sample_interval_ms = 2;
-    Logger::instance().init(config);
+    Logger::instance().init(on_string_ring(config));
 
     // One real string first, so a valid frontier exists to be preserved.
     const std::string payload(120, 's');
@@ -843,7 +849,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureVisibleAtExactlyOneWrap) {
     config.enable_stats = true;
     config.stats_interval_ms = 30;
     config.stats_sample_interval_ms = 2;
-    Logger::instance().init(config);
+    Logger::instance().init(on_string_ring(config));
 
     // A drained anchor first: the writer consumes this string, so the frontier
     // ends up exactly on the write cursor and the span is a true zero. Everything
@@ -924,7 +930,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesWhenProducersLapDuringDispat
     config.enable_stats = true;
     config.stats_interval_ms = 30;
     config.stats_sample_interval_ms = 2;
-    Logger::instance().init(config);
+    Logger::instance().init(on_string_ring(config));
     Logger::instance().flush(); // drain the version banner, so the counts below are ours
 
     const uint32_t banner_writes = sink->writes();
@@ -1004,7 +1010,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedInTheBacklog
     config.enable_stats = true;
     config.stats_interval_ms = 30;
     config.stats_sample_interval_ms = 2;
-    Logger::instance().init(config);
+    Logger::instance().init(on_string_ring(config));
 
     // A drained anchor establishes the frontier the lap is chosen from.
     const std::string anchor(120, 'a');
@@ -1089,7 +1095,7 @@ TEST_F(SlickLoggerStatsTest, StringPressureSaturatesForAnEntryLappedBeforeAnyAnc
     config.enable_stats = true;
     config.stats_interval_ms = 30;
     config.stats_sample_interval_ms = 2;
-    Logger::instance().init(config);
+    Logger::instance().init(on_string_ring(config));
 
     {
         // Nothing has reserved a byte: the banner was filtered, so the frontier is
@@ -1178,7 +1184,7 @@ TEST_F(SlickLoggerStatsTest, DrainedEntryFreesNothingWhileEntriesStayQueued) {
     config.enable_stats = true;
     config.stats_interval_ms = 30;
     config.stats_sample_interval_ms = 2;
-    Logger::instance().init(config);
+    Logger::instance().init(on_string_ring(config));
 
     // First entry: the writer claims it, enters write(), and blocks there. Its
     // frontier step has not run yet; that happens once write() returns.
@@ -1219,7 +1225,7 @@ uint64_t footprint_of_one_short_string(uint32_t items_per_slot) {
     LogConfig config = make_config(20, 2, false);
     config.min_level = LogLevel::L_WARN; // drops the INFO banner: the ring starts empty
     config.string_items_per_slot = items_per_slot;
-    Logger::instance().init(config);
+    Logger::instance().init(on_string_ring(config));
 
     LOG_WARN("{}", std::string(10, 's'));
     Logger::instance().flush();
