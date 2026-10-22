@@ -94,7 +94,9 @@ if (MSVC)
     add_definitions(-D_WIN32_WINNT=0x0A00)
     set(CMAKE_SUPPRESS_REGENERATION true)   # supress zero_check
 else()
-    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer")
+    # UBSan aborts on its first finding, so a test that trips it fails everywhere,
+    # not only where the runtime happens to halt by default (macOS).
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer")
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
 
     if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT APPLE)

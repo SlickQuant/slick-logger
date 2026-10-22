@@ -1,6 +1,7 @@
 #include <slick/logger.hpp>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -424,6 +425,140 @@ TEST_F(ThreadRingTest, PrepareThreadClaimsARingAheadOfTheFirstCall) {
     EXPECT_TRUE(first_claimed);
     EXPECT_FALSE(second_claimed);
     ASSERT_EQ(sequences(sink->lines_)[1].size(), 1u);
+}
+
+TEST_F(ThreadRingTest, ThreadChurnReusesRings) {
+    // 1000 short-lived threads in waves of 20: each wave's threads take over the
+    // rings the last wave left, so the ring count follows the wave size.
+    auto& logger = Logger::instance();
+    auto sink = std::make_shared<CaptureSink>();
+    LogConfig config = ring_config(sink);
+    config.thread_ring_size = 4096;
+    config.enable_stats = true;
+    config.stats_interval_ms = 10;
+    config.stats_sample_interval_ms = 1;
+    logger.init(config);
+    constexpr int kWaves = 50;
+    constexpr int kWave = 20;
+    constexpr int kCount = 10;
+    for (int wave = 0; wave < kWaves; ++wave) {
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kWave; ++t) {
+            threads.emplace_back([id = wave * kWave + t] {
+                for (int i = 0; i < kCount; ++i) {
+                    LOG_INFO("t{} {} {}", id, i, std::string("churn"));
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        logger.flush(); // drained, so the next wave can take them over
+    }
+    ASSERT_EQ(sink->lines_.size(), 1u + kWaves * kWave * kCount);
+    const auto by_thread = sequences(sink->lines_);
+    ASSERT_EQ(by_thread.size(), static_cast<size_t>(kWaves * kWave));
+    for (const auto& [thread, seqs] : by_thread) {
+        ASSERT_EQ(seqs.size(), static_cast<size_t>(kCount));
+        for (int i = 0; i < kCount; ++i) {
+            ASSERT_EQ(seqs[i], i) << "thread " << thread;
+        }
+    }
+    ASSERT_TRUE(eventually([&] { return logger.stats_snapshot().entries_produced == sink->lines_.size(); }));
+    const LogStats stats = logger.stats_snapshot();
+    EXPECT_LE(stats.thread_ring_count, static_cast<uint32_t>(kWave + 1)) << "rings were allocated, not reused";
+    EXPECT_GE(stats.thread_ring_count, 2u);
+    EXPECT_EQ(stats.string_bytes_written, 0u) << "every thread found a ring";
+}
+
+TEST_F(ThreadRingTest, ChurnWithoutPausesLosesNothing) {
+    // No flush between threads: exited threads' rings may not be drained when the
+    // next ones arrive, so some take new rings and some, once all are taken, the
+    // shared rings. Every entry still arrives, in its thread's order.
+    auto& logger = Logger::instance();
+    auto sink = std::make_shared<CaptureSink>();
+    LogConfig config = ring_config(sink);
+    config.thread_ring_size = 4096;
+    config.max_thread_rings = 8;
+    config.log_queue_size = size_t{1} << 16;
+    logger.init(config);
+    constexpr int kThreads = 1000;
+    constexpr int kConcurrent = 16;
+    constexpr int kCount = 20;
+    std::vector<std::thread> threads;
+    for (int id = 0; id < kThreads; ++id) {
+        threads.emplace_back([id] {
+            for (int i = 0; i < kCount; ++i) {
+                LOG_INFO("t{} {} {}", id, i, std::string("churn"));
+            }
+        });
+        if (threads.size() == kConcurrent) {
+            for (auto& thread : threads) {
+                thread.join();
+            }
+            threads.clear();
+        }
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    logger.flush();
+    ASSERT_EQ(sink->lines_.size(), 1u + kThreads * kCount);
+    for (const auto& [thread, seqs] : sequences(sink->lines_)) {
+        ASSERT_EQ(seqs.size(), static_cast<size_t>(kCount));
+        for (int i = 0; i < kCount; ++i) {
+            ASSERT_EQ(seqs[i], i) << "thread " << thread;
+        }
+    }
+}
+
+TEST_F(ThreadRingTest, ManyRingsFlushingAtOnce) {
+    // 60 threads, each flushing right after logging: every flush waits for every
+    // ring, while the others keep logging.
+    constexpr int kThreads = 60;
+    constexpr int kCount = 200;
+    class LastSeqSink : public CaptureSink {
+    public:
+        LastSeqSink() {
+            for (auto& seq : last_) {
+                seq.store(-1, std::memory_order_relaxed);
+            }
+        }
+        void write(const LogEntry& entry) override {
+            CaptureSink::write(entry);
+            int thread = 0, seq = 0;
+            if (std::sscanf(lines_.back().message.c_str(), "t%d %d", &thread, &seq) == 2) {
+                last_[thread].store(seq, std::memory_order_release);
+            }
+        }
+        std::array<std::atomic<int>, kThreads> last_;
+    };
+    auto& logger = Logger::instance();
+    auto sink = std::make_shared<LastSeqSink>();
+    logger.init(ring_config(sink));
+    std::atomic<int> flushed{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < kCount; ++i) {
+                LOG_INFO("t{} {} {}", t, i, std::string("flush"));
+            }
+            Logger::instance().flush();
+            // Everything this thread logged has reached the sink by now.
+            if (sink->last_[t].load(std::memory_order_acquire) == kCount - 1) {
+                flushed.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    logger.flush();
+    EXPECT_EQ(flushed.load(), kThreads);
+    ASSERT_EQ(sink->lines_.size(), 1u + kThreads * kCount);
+    for (const auto& [thread, seqs] : sequences(sink->lines_)) {
+        ASSERT_EQ(seqs.size(), static_cast<size_t>(kCount)) << "thread " << thread;
+    }
 }
 
 TEST_F(ThreadRingTest, ReinitStartsFreshRings) {

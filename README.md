@@ -665,6 +665,7 @@ What changes:
 - By default a full ring spills to the shared rings until the writer catches up, so a burst slows calls down but loses nothing, unless the shared rings fill too and overwrite their oldest entries. With `thread_ring_full = RingFullPolicy::Drop`, a full ring drops the newest entry instead and counts it in `LogStats::entry_loss_count`, which keeps calls cheap under overload.
 - One thread's entries stay in order, spilled ones included. Across threads the writer merges them by timestamp, so an entry stamped just before its thread was preempted can land slightly late.
 - Each logging thread costs `thread_ring_size` of memory. A thread gets its ring on its first log call, which allocates and zeroes it. Call `Logger::instance().prepare_thread()` at thread start to do that ahead of time. It works at any log level. A thread that exits hands its ring to the next new thread.
+- A ring belongs to an OS thread. A thread that logs from the host and from a plugin sharing its logger (`Logger::set_instance()`) uses one ring from both, so its entries stay in order.
 - Threads past `max_thread_rings` use the shared rings for the whole run. So do the strings of a record bigger than half a ring, though the record itself stays in the thread's ring.
 - String-ring statistics describe the shared string ring only.
 
@@ -791,7 +792,8 @@ The sample interval is also how quickly the thread notices shutdown, so a long r
 
   One window stays invisible: a producer that has reserved string bytes but not yet taken an entry slot appears in neither ordering, so if it is preempted there, its bytes are unaccounted for until it publishes. Closing that gap would mean having producers announce reservations before publishing, which is not worth what it would cost the logging path.
 - String ring pressure: `string_bytes_per_sec`, `string_turnover_pct` and `string_wraps_per_sec` describe how fast the ring is recycled. Like `string_inflight_bytes` and `string_bytes_written`, they count ring footprint: each string counts as its size rounded up to `string_items_per_slot`, because that is the space it occupies. `string_turnover_pct` is a *rate*, not an occupancy: 100 means the ring turned over exactly once during the interval.
-- Loss: `entry_loss_count` is entries a producer overwrote before the writer could read them, including any it overwrote while the writer was copying one out, which the writer then discards instead of logging it torn. Counting is opt-in: build with `SLICK_LOGGER_ENABLE_LOSS_DETECTION` (see [Queue Tuning](#queue-tuning)). Otherwise it always reads `0`, and `kLossDetectionEnabled` tells the two cases apart. The process that reads the queue does the counting, so in shared-memory mode the collector has the figure and a producer reads `0`. `string_loss_count` is always `0` by construction: slick-queue counts losses inside `read()`, and the logger never calls it on the string ring.
+- Loss: `entry_loss_count` is entries a producer overwrote before the writer could read them, including any it overwrote while the writer was copying one out, which the writer then discards instead of logging it torn. Counting is opt-in: build with `SLICK_LOGGER_ENABLE_LOSS_DETECTION` (see [Queue Tuning](#queue-tuning)). Otherwise it always reads `0`, and `kLossDetectionEnabled` tells the two cases apart. The process that reads the queue does the counting, so in shared-memory mode the collector has the figure and a producer reads `0`. `string_loss_count` is always `0` by construction: slick-queue counts losses inside `read()`, and the logger never calls it on the string ring. With [per-thread rings](#per-thread-rings), entries dropped under `RingFullPolicy::Drop` count too, whatever the build option.
+- Thread rings: the entry counts and depth include every ring. `thread_ring_count` is how many rings have been allocated this run. Exited threads hand theirs on, so it follows the peak number of logging threads.
 
 #### The CSV
 
@@ -805,7 +807,7 @@ entry_queue_capacity,entry_queue_pct,entry_queue_pct_max,
 string_inflight_bytes,string_inflight_bytes_max,string_buffer_capacity,
 string_pct,string_pct_max,string_pct_valid,
 string_bytes_written,string_bytes_per_sec,string_turnover_pct,
-string_wraps_per_sec,entry_loss_count,string_loss_count
+string_wraps_per_sec,entry_loss_count,string_loss_count,thread_ring_count
 ```
 
 Leave `stats_file` empty to run the thread for `stats_snapshot()` alone and write no file. A CSV that cannot be created makes `init()` throw, the same as a sink that cannot be opened. A write failure afterwards is reported once to `stderr` and never takes the process down.

@@ -39,7 +39,7 @@ constexpr const char* kExpectedHeader =
     "string_inflight_bytes,string_inflight_bytes_max,string_buffer_capacity,"
     "string_pct,string_pct_max,string_pct_valid,"
     "string_bytes_written,string_bytes_per_sec,string_turnover_pct,"
-    "string_wraps_per_sec,entry_loss_count,string_loss_count";
+    "string_wraps_per_sec,entry_loss_count,string_loss_count,thread_ring_count";
 
 LogConfig make_config(uint32_t interval_ms, uint32_t sample_ms, bool with_csv = true) {
     LogConfig config;
