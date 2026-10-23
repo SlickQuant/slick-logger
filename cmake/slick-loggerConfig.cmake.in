@@ -18,4 +18,8 @@ if(DEFINED SLICK_LOGGER_ENABLE_CPU_RELAX AND NOT SLICK_LOGGER_ENABLE_CPU_RELAX)
     target_compile_definitions(slick::logger INTERFACE SLICK_LOGGER_ENABLE_CPU_RELAX=0)
 endif()
 
+if(DEFINED SLICK_LOGGER_DEFAULT_THREAD_RINGS AND NOT SLICK_LOGGER_DEFAULT_THREAD_RINGS)
+    target_compile_definitions(slick::logger INTERFACE SLICK_LOGGER_DEFAULT_THREAD_RINGS=0)
+endif()
+
 check_required_components(slick-logger)

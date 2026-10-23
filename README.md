@@ -9,20 +9,20 @@
 
 ## Overview
 
-slick-logger is a **header-only C++20** logging library for Windows, Linux, and macOS. `LOG_*` calls enqueue entries in a ring buffer, and a background writer formats them and sends them to console, file, or custom sinks. It also supports log rotation, binary payloads, and shared-memory logging across processes.
+slick-logger is a **header-only C++20** logging library for Windows, Linux, and macOS. `LOG_*` calls enqueue entries in a ring buffer of their thread's own, and a background writer formats them and sends them to console, file, or custom sinks. It also supports log rotation, binary payloads, and shared-memory logging across processes.
 
 ## Benchmark Highlights
 
-Recorded on an AMD Ryzen 9 5900HX, Windows 11, MSVC 19.44 `/O2`, with log output on a local NVMe SSD (2026-09-22):
+Recorded on an AMD Ryzen 9 5900HX, Windows 11, MSVC 19.44 `/O2`, with log output on a local NVMe SSD (2026-10-22):
 
 | Producer-side measurement | Result |
 | --- | ---: |
-| Literal message, 1 producer | **7.67 million calls/sec** |
-| Literal message, 8 producers | **10.96 million calls/sec** |
-| Three-argument message, 8 producers | **5.10 million calls/sec** |
-| Mean call latency, literal message | **169 ns** |
+| Literal message, 1 producer | **14.35 million calls/sec** |
+| Literal message, 8 producers | **18.91 million calls/sec** |
+| Three-argument message, 8 producers | **7.48 million calls/sec** |
+| Mean call latency, literal message | **153 ns** |
 
-Call timings exclude the writer's drain and flush time, and an overloaded queue can overwrite entries. The benchmark README has the [full results, comparisons, and methodology](benchmarks/README.md#results), plus [build/run instructions](benchmarks/README.md#building) for reproducing the numbers on your own hardware.
+Call timings exclude the writer's drain and flush time. A burst a thread ring cannot hold spills to the shared rings, which can overwrite their oldest entries when overloaded. The benchmark README has the [full results, comparisons, and methodology](benchmarks/README.md#results), plus [build/run instructions](benchmarks/README.md#building) for reproducing the numbers on your own hardware.
 
 ## Navigation
 
@@ -36,7 +36,7 @@ Call timings exclude the writer's drain and flush time, and an overloaded queue 
 
 ## Features
 
-- **High Performance**: Asynchronous logging through the slick-queue ring buffer, so the calling thread does as little as possible
+- **High Performance**: Asynchronous logging through a lock-free ring per logging thread, so the calling thread does as little as possible and threads never contend
 - **Modern Formatting**: Message formatting with C++20 `std::format`
 - **Multi-Sink Architecture**: Log to multiple destinations simultaneously (console, files, custom sinks)
 - **Log Rotation**: Size-based and time-based log rotation with configurable retention
@@ -650,26 +650,26 @@ int main() {
 - `stats_sample_interval_ms`: how often the queue-fullness gauges are sampled between reports, default `10`
 - `stats_max_file_size`: roll the CSV to `<stem>.1.csv` at this size, default 16 MB; `0` disables rolling
 - `timestamper`: where entry timestamps come from; null keeps the current one, which is `std::chrono::system_clock` unless changed (see [Custom Timestamper](#custom-timestamper))
-- `thread_rings`: give every logging thread its own ring, default `false` (see [Per-thread rings](#per-thread-rings))
-- `thread_ring_size`: bytes per thread ring, default 1 MB, rounded up to a power of two, at least 4 KB
+- `thread_rings`: give every logging thread its own ring, default `true` (see [Per-thread rings](#per-thread-rings))
+- `thread_ring_size`: bytes per thread ring, default 4 MB, rounded up to a power of two, at least 4 KB
 - `max_thread_rings`: rings before further threads use the shared rings, default `64`
 - `writer_poll_interval_us`: how long the writer leaves a busy ring alone after draining it, default `5`
 - `thread_ring_full`: what a call does when its thread's ring is full, `RingFullPolicy::Spill` (default) or `RingFullPolicy::Drop`
 
 #### Per-thread rings
 
-With `thread_rings = true` (Local mode only), each logging thread writes to a ring of its own. A call reserves one record there, with its strings inline, and publishes it with one store. No two producers touch the same cache line. In an A/B test on an 8-core laptop, a call was about 20% cheaper than with the shared rings from one thread, and 3 to 4.5x cheaper from 4 to 8 threads.
+By default (Local mode only), each logging thread writes to a ring of its own. A call reserves one record there, with its strings inline, and publishes it with one store. No two producers touch the same cache line. In an A/B test on an 8-core laptop, a call was about 20% cheaper than with the shared rings from one thread, and 3 to 4.5x cheaper from 4 to 8 threads.
 
-What changes:
+What changes compared to the shared rings (`thread_rings = false`, the default in earlier releases):
 
 - By default a full ring spills to the shared rings until the writer catches up, so a burst slows calls down but loses nothing, unless the shared rings fill too and overwrite their oldest entries. With `thread_ring_full = RingFullPolicy::Drop`, a full ring drops the newest entry instead and counts it in `LogStats::entry_loss_count`, which keeps calls cheap under overload.
 - One thread's entries stay in order, spilled ones included. Across threads the writer merges them by timestamp, so an entry stamped just before its thread was preempted can land slightly late.
-- Each logging thread costs `thread_ring_size` of memory. A thread gets its ring on its first log call, which allocates and zeroes it. Call `Logger::instance().prepare_thread()` at thread start to do that ahead of time. It works at any log level. A thread that exits hands its ring to the next new thread.
+- Each logging thread gets a ring of `thread_ring_size` on its first log call. Its pages are faulted in as it fills, so a thread that logs little uses little memory, but those first-lap faults land on log calls. Call `Logger::instance().prepare_thread()` at thread start to claim the ring and fault it all in up front; it works at any log level, and `init()` does it for its own thread. A thread that exits hands its ring to the next new thread.
 - A ring belongs to an OS thread. A thread that logs from the host and from a plugin sharing its logger (`Logger::set_instance()`) uses one ring from both, so its entries stay in order.
 - Threads past `max_thread_rings` use the shared rings for the whole run. So do the strings of a record bigger than half a ring, though the record itself stays in the thread's ring.
 - String-ring statistics describe the shared string ring only.
 
-Define `SLICK_LOGGER_DEFAULT_THREAD_RINGS=1` to make it the default, including for the `init()` overloads that take no `LogConfig`.
+To make the shared rings the default again, including for the `init()` overloads that take no `LogConfig`, configure with `-DSLICK_LOGGER_DEFAULT_THREAD_RINGS=OFF` or define `SLICK_LOGGER_DEFAULT_THREAD_RINGS=0` before including the header.
 
 #### Sizing the string ring
 
@@ -1420,16 +1420,19 @@ config.rotation_hour = std::chrono::hours(0); // midnight for daily rotation
 
 ## Architecture
 
-The logger uses a multi-producer, single-consumer ring buffer (slick-queue) that feeds any number of sinks:
+In Local mode each logging thread writes to a single-producer ring of its own (see [Per-thread rings](#per-thread-rings)). One writer thread merges the rings by timestamp and feeds any number of sinks. A shared multi-producer ring (slick-queue) takes the threads past `max_thread_rings` and whatever a full ring spills:
 
 ```
-[Thread 1] ──┐
-[Thread 2] ──┼──► [Lock-Free Queue] ──► [Writer Thread] ──┬──► ConsoleSink
-[Thread N] ──┘                                            ├──► FileSink  
-                                                          ├──► RotatingFileSink
-                                                          ├──► DailyFileSink
-                                                          └──► BinarySink
+[Thread 1] ──► [ring 1] ──┐
+[Thread 2] ──► [ring 2] ──┤
+[Thread N] ──► [ring N] ──┼──► [Writer Thread: merge by timestamp] ──┬──► ConsoleSink
+ spills, overflow threads ──► [shared ring] ──┘                      ├──► FileSink
+                                                                     ├──► RotatingFileSink
+                                                                     ├──► DailyFileSink
+                                                                     └──► BinarySink
 ```
+
+With `thread_rings = false` every thread logs through the shared ring, as in earlier releases.
 
 The same structure spans processes when the queue is placed in shared memory: the producers
 become other processes and the writer thread lives in the collector. See
@@ -1444,7 +1447,7 @@ become other processes and the writer thread lives in the collector. See
 ### Design Principles
 
 1. One dedicated writer thread handles all sink operations.
-2. Caller threads never block on I/O.
+2. Caller threads never block on I/O, and with per-thread rings they share no cache line with each other.
 3. Custom sinks are easy to add.
 4. Queue and sink management are thread-safe, built on atomic operations.
 5. In shared-memory mode, string references are ring indices instead of addresses, so an entry stays valid in any attached process.
@@ -1453,9 +1456,9 @@ become other processes and the writer thread lives in the collector. See
 
 The logger defers string formatting to the background thread:
 
-1. The caller thread captures the format pointer, source location, thread id, and owned copies of any dynamic string data, then writes the `LogEntry` straight into its ring slot. It writes the header and only the arguments the call has, not all `SLICK_LOGGER_MAX_ARGS` of them.
-2. The lock-free queue holds the entries. A producer never waits for space.
-3. The writer thread copies each entry out of its slot before using it, so a producer that has lapped the ring can never change an entry while a sink is formatting it. A copy the writer cannot prove predates such a rewrite is discarded and counted as lost. The writer then formats the message *and the line layout*, and writes to all matching sinks. The message is formatted at most once per entry, however many sinks render it, and only if one of them needs it.
+1. The caller thread captures the format pointer, source location, thread id, and owned copies of any dynamic string data, then writes the `LogEntry` straight into its ring. It writes the header and only the arguments the call has, not all `SLICK_LOGGER_MAX_ARGS` of them. In a thread's own ring the string bytes go into the same record, so a call is one reservation and one publishing store.
+2. The rings hold the entries. A producer never waits for space: a full thread ring spills to the shared ring (or drops, see `RingFullPolicy`), and the shared ring overwrites its oldest entries.
+3. A thread ring hands a record back only after the writer has dispatched it. From the shared ring the writer copies each entry out of its slot first, so a producer that has lapped the ring can never change an entry while a sink is formatting it; a copy the writer cannot prove predates such a rewrite is discarded and counted as lost. The writer then formats the message *and the line layout*, and writes to all matching sinks. The message is formatted at most once per entry, however many sinks render it, and only if one of them needs it.
 
 Formatting and I/O are the expensive parts, and this keeps both off the calling thread, so log calls stay cheap enough for high-frequency logging.
 

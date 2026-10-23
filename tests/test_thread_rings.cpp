@@ -400,7 +400,7 @@ TEST_F(ThreadRingTest, PrepareThreadClaimsARingAheadOfTheFirstCall) {
     config.max_thread_rings = 2;
     config.min_level = slick::logger::LogLevel::L_WARN; // filters the INFO banner, and any LOG_INFO warm-up
     logger.init(config);
-    EXPECT_TRUE(logger.prepare_thread()) << "the banner was filtered, so this claims the first ring";
+    EXPECT_TRUE(logger.prepare_thread()) << "init() prepared this thread's ring";
     EXPECT_TRUE(logger.prepare_thread()) << "and a second call finds it";
 
     std::atomic<bool> first_ready{false};
@@ -425,6 +425,41 @@ TEST_F(ThreadRingTest, PrepareThreadClaimsARingAheadOfTheFirstCall) {
     EXPECT_TRUE(first_claimed);
     EXPECT_FALSE(second_claimed);
     ASSERT_EQ(sequences(sink->lines_)[1].size(), 1u);
+}
+
+TEST_F(ThreadRingTest, PrepareThreadNeverPrefaultsARingHoldingRecords) {
+    // Pre-faulting overwrites the whole ring, so prepare_thread() may only do it
+    // while the ring is empty. Here the writer is held, so the records a thread
+    // logged before calling it are still in its ring.
+    auto& logger = Logger::instance();
+    auto sink = std::make_shared<HoldingSink>();
+    logger.init(ring_config(sink));
+    LOG_INFO("hold");
+    ASSERT_TRUE(eventually([&] { return sink->reached_.load(std::memory_order_acquire); }));
+    std::thread worker([&] {
+        for (int i = 0; i < 50; ++i) {
+            LOG_INFO("t1 {} {}", i, "before-" + std::to_string(i)); // claims the ring, unfaulted
+        }
+        EXPECT_TRUE(logger.prepare_thread());
+        for (int i = 50; i < 100; ++i) {
+            LOG_INFO("t1 {} {}", i, "after-" + std::to_string(i));
+        }
+    });
+    worker.join();
+    sink->release_.store(true, std::memory_order_release);
+    logger.flush();
+    const auto seqs = sequences(sink->lines_)[1];
+    ASSERT_EQ(seqs.size(), 100u);
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_EQ(seqs[i], i);
+    }
+    for (const auto& line : sink->lines_) {
+        int thread = 0, seq = 0;
+        if (std::sscanf(line.message.c_str(), "t%d %d", &thread, &seq) == 2) {
+            ASSERT_EQ(line.message, "t1 " + std::to_string(seq) + (seq < 50 ? " before-" : " after-") +
+                                        std::to_string(seq));
+        }
+    }
 }
 
 TEST_F(ThreadRingTest, ThreadChurnReusesRings) {

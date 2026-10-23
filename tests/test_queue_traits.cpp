@@ -83,6 +83,7 @@ private:
 
 LogConfig make_config(std::shared_ptr<ISink> sink, uint32_t queue_size) {
     LogConfig config;
+    config.thread_rings = false; // these switches belong to the shared queue
     config.sinks.push_back(std::move(sink));
     config.log_queue_size = queue_size;
     config.enable_stats = true;

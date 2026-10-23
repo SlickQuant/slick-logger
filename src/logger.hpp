@@ -139,9 +139,9 @@ extern "C" __declspec(dllimport) void __stdcall FlushProcessWriteBuffers(void);
 #endif
 
 // Default for LogConfig::thread_rings, which the init() overloads without a
-// LogConfig use too. Lets a whole program, or a test build, switch modes at once.
+// LogConfig use too. 0 puts every thread back on the shared rings.
 #ifndef SLICK_LOGGER_DEFAULT_THREAD_RINGS
-#define SLICK_LOGGER_DEFAULT_THREAD_RINGS 0
+#define SLICK_LOGGER_DEFAULT_THREAD_RINGS 1
 #endif
 
 #define SLICK_LOGGER_VERSION_MAJOR @slick-logger_VERSION_MAJOR@
@@ -2659,14 +2659,22 @@ public:
         return ::new (memory) producer_ring(capacity);
     }
 
-    /// A heap ring with every page pre-touched, so the first lap doesn't page
-    /// fault on the logging thread.
-    static pointer allocate(uint64_t capacity) {
+    /// A heap ring. With @p prefault, every page is touched now, so the first lap
+    /// doesn't page fault on the logging thread; without, pages are faulted in as
+    /// the first lap reaches them, and a ring that is never filled never costs
+    /// its full size in memory.
+    static pointer allocate(uint64_t capacity, bool prefault = true) {
         void* memory = ::operator new(block_size(capacity), std::align_val_t{alignof(producer_ring)});
         pointer ring{create(memory, capacity)};
-        std::memset(ring->data(), 0, static_cast<size_t>(capacity));
+        if (prefault) {
+            ring->prefault();
+        }
         return ring;
     }
+
+    /// Touch every page of the data. Producer side, and only while the ring holds
+    /// no unreleased record: it overwrites them.
+    void prefault() noexcept { std::memset(data(), 0, static_cast<size_t>(capacity_)); }
 
     uint64_t capacity() const noexcept { return capacity_; }
 
@@ -2913,6 +2921,7 @@ struct alignas(64) thread_ring_slot {
     // The owning thread's alone, from whichever module it logs.
     alignas(64) uint64_t spill_end = 0; // past its last spilled entry in the shared queue; 0 when none is pending
     uint32_t spill_check = 0;           // spilled calls left before looking at the writer's progress again
+    bool prefaulted = false;            // every page of the ring touched once (Logger::prepare_thread())
 
     ~thread_ring_slot() {
         if (producer_ring* r = ring.load(std::memory_order_relaxed)) {
@@ -3127,8 +3136,9 @@ struct LogConfig {
     /// ring does what thread_ring_full says. Entries from one thread stay in
     /// order; across threads they are merged by timestamp.
     bool thread_rings = SLICK_LOGGER_DEFAULT_THREAD_RINGS;
-    /// Bytes per thread ring, rounded up to a power of 2, at least 4 KiB.
-    size_t thread_ring_size = 1 << 20;
+    /// Bytes per thread ring, rounded up to a power of 2, at least 4 KiB. Pages are
+    /// faulted in as the ring fills, so an idle thread's ring costs little memory.
+    size_t thread_ring_size = 4 << 20;
     /// Rings before further threads fall back to the shared rings.
     uint32_t max_thread_rings = 64;
     /// How long the writer leaves a busy ring alone after draining it, so it does
@@ -3606,10 +3616,11 @@ public:
      * @return Whether the thread has a ring: false when thread rings are off, the
      *         logger is not running, or every ring is taken
      *
-     * The first log call on a thread allocates and zeroes its ring
-     * (LogConfig::thread_ring_size). Call this at thread start to keep that off a
-     * latency-sensitive path. Works whatever the log level, unlike a warm-up call.
-     * Needed once per thread per init().
+     * The first log call on a thread allocates its ring (LogConfig::thread_ring_size),
+     * and the ring's pages are then faulted in as it fills. This claims the ring
+     * and faults in every page now, keeping both off a latency-sensitive path.
+     * Works whatever the log level, unlike a warm-up call. Needed once per thread
+     * per init(); init() does it for its own thread.
      */
     bool prepare_thread() noexcept;
 
@@ -3680,8 +3691,9 @@ private:
     /// The calling thread's registry slot, claiming one if it holds none, or
     /// kNoSlot when the registry is full.
     static constexpr uint32_t kNoSlot = UINT32_MAX;
-    /// While spilling, a thread checks whether it may return to its ring this often.
-    static constexpr uint32_t kSpillCheckCalls = 16;
+    /// While spilling, a thread checks whether it may return to its ring this
+    /// often: the writer's cursor it reads is on a line the writer keeps moving.
+    static constexpr uint32_t kSpillCheckCalls = 64;
     uint32_t claim_thread_ring(uint64_t generation) noexcept;
     /// Finish a claim of slot @p index: exit hook, new ticket, Active.
     uint32_t activate_slot(uint32_t index, uint64_t generation, bool new_owner) noexcept;
@@ -3690,11 +3702,8 @@ private:
     /// Reserve a shared-queue slot, announcing it first in Local mode (see
     /// entry_page_cursor_). Shared by the shared path and thread-ring spills.
     LogEntry& reserve_shared_entry(uint64_t& index, bool use_offsets) noexcept;
-    /// Write an entry whose ring is full to the shared queue instead, gated on
-    /// that ring; its strings are already in the shared string ring.
-    void spill_to_shared_queue(detail::thread_ring_tls& tls, const detail::producer_ring* ring, StringRef format,
-                               uint64_t timestamp, StringRef file, uint32_t line, int sink_index, LogLevel level,
-                               uint8_t flags, uint8_t arg_count, const LogArgument* args, size_t arg_bytes) noexcept;
+    /// Open a spill: what the thread's spilled entries wait for in its ring.
+    void begin_spill(detail::thread_ring_slot& slot, const detail::producer_ring& ring) noexcept;
     /// Merge step over every ring and the shared queue: dispatch a run of entries
     /// from the source with the oldest head.
     DrainResult drain_sources();
@@ -3921,14 +3930,16 @@ private:
     std::unique_ptr<detail::thread_ring_slot[]> ring_slots_;
     /// Slots ever claimed this run; the writer, flush() and statistics scan these.
     alignas(64) std::atomic<uint32_t> ring_slots_used_{0};
-    // Writer thread only.
+    // Writer thread only. On lines of their own: the writer stores these for every
+    // shared-queue entry, and sharing a line with the stamp below (read on every
+    // log call) cost each call a cache miss.
     std::unique_ptr<detail::ring_view[]> ring_views_;
-    LogEntry shared_head_{};     // the shared queue's next entry, held for the merge
+    alignas(64) LogEntry shared_head_{}; // the shared queue's next entry, held for the merge
     bool shared_head_ready_ = false;
     uint64_t shared_cursor_ = 0; // read cursor past shared_head_; read_index_ lags until it is dispatched
 
     // ---- Multi-process state; all inert while mode_ is Local ----
-    QueueMode mode_ = QueueMode::Local;
+    alignas(64) QueueMode mode_ = QueueMode::Local;
     // Cached per-entry stamp, applied on the caller thread by log_to_sink_with_location.
     // Holding these as members keeps the hot path to a load plus a fixed-size copy.
     uint8_t entry_flags_ = 0;
@@ -3941,7 +3952,8 @@ private:
     uint32_t stalled_entry_timeout_ms_ = 0;
     // ---- Statistics state; all inert unless stats_enabled_ ----
 
-    std::thread stats_thread_;
+    // A line of its own too: the writer and the statistics thread write this block.
+    alignas(64) std::thread stats_thread_;
     /// The published sample, immutable once stored. The statistics thread swaps in
     /// a fresh one per report and readers only ever see a completed object, so
     /// stats_snapshot() involves no data race; see publish_stats(). Held through
@@ -6828,6 +6840,9 @@ inline void Logger::start() {
         // init().
         writer_thread_ = std::thread([this]() { writer_thread_func(); });
     }
+    // init() is no hot path, and the thread calling it often logs the most: its
+    // ring is faulted in here rather than one page at a time on later calls.
+    prepare_thread();
     log(LogLevel::L_INFO, "SlickLogger v{}", SLICK_LOGGER_VERSION);
 
     // Spawned last, so the banner above is already in the queue rather than
@@ -7455,9 +7470,23 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
             ring->drop(); // counted in LogStats::entry_loss_count
             return true;
         }
+        // Full, or an earlier spill is still pending: the shared queue instead of a
+        // drop, with pid set to slot + 1 (Local mode stamps 0 otherwise). The writer
+        // holds such an entry until the ring has been drained to where the spill
+        // began, so the thread's order holds. Written here rather than in a helper,
+        // so the arguments are still a compile-time size, as on the shared path.
         place_strings(nullptr); // to the shared string ring, before the slot as on the shared path
-        spill_to_shared_queue(tls, ring, format_ref, timestamp, file, line, sink_index, level, flags, arg_count,
-                              staged_args.data(), arg_bytes);
+        if (slot.spill_end == 0) {
+            begin_spill(slot, *ring);
+        }
+        uint64_t index;
+        LogEntry& entry = reserve_shared_entry(index, false);
+        write_entry(entry, format_ref, timestamp, file, tls.thread_id, line, sink_index, level, flags, arg_count,
+                    staged_args.data(), arg_bytes);
+        entry.pid = static_cast<uint32_t>(tls.slot - ring_slots_.get()) + 1;
+        log_queue_->publish(index);
+        slot.spill_end = index + 1;
+        wake_writer();
         return true;
     }
     place_strings(inline_strings ? reinterpret_cast<char*>(record) + offsetof(LogEntry, args) + arg_bytes : nullptr);
@@ -7471,31 +7500,12 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
     return true;
 }
 
-SLICK_LOGGER_NOINLINE inline void Logger::spill_to_shared_queue(detail::thread_ring_tls& tls,
-                                                               const detail::producer_ring* ring, StringRef format,
-                                                               uint64_t timestamp, StringRef file, uint32_t line,
-                                                               int sink_index, LogLevel level, uint8_t flags,
-                                                               uint8_t arg_count, const LogArgument* args,
-                                                               size_t arg_bytes) noexcept {
-    // The ring is full, or an earlier spill is still pending. The entry goes to
-    // the shared queue, with its pid set to slot + 1
-    // (Local mode stamps 0 otherwise). The writer holds it until the ring has
-    // been drained to where the spill began, so the thread's order holds.
-    detail::thread_ring_slot& slot = *tls.slot;
-    if (slot.spill_end == 0) {
-        // Published before the entry that refers to it. A previous spill's entries
-        // are all out by now, so nothing still waits on the old value.
-        slot.spill_gate.store(ring->written(), std::memory_order_release);
-        slot.spill_check = kSpillCheckCalls;
-    }
-    uint64_t index;
-    LogEntry& entry = reserve_shared_entry(index, false);
-    write_entry(entry, format, timestamp, file, tls.thread_id, line, sink_index, level, flags, arg_count, args,
-                arg_bytes);
-    entry.pid = static_cast<uint32_t>(tls.slot - ring_slots_.get()) + 1;
-    log_queue_->publish(index);
-    slot.spill_end = index + 1;
-    wake_writer();
+SLICK_LOGGER_NOINLINE inline void Logger::begin_spill(detail::thread_ring_slot& slot,
+                                                     const detail::producer_ring& ring) noexcept {
+    // Published before the entry that refers to it. A previous spill's entries
+    // are all out by now, so nothing still waits on the old value.
+    slot.spill_gate.store(ring.written(), std::memory_order_release);
+    slot.spill_check = kSpillCheckCalls;
 }
 
 inline bool Logger::prepare_thread() noexcept {
@@ -7503,10 +7513,20 @@ inline bool Logger::prepare_thread() noexcept {
         return false;
     }
     detail::thread_ring_tls& tls = detail::tls_thread_ring;
-    if (thread_ring_current(tls)) {
-        return tls.ring != nullptr; // already attached this run
+    if (!thread_ring_current(tls) && !attach_thread_ring(tls)) {
+        return false;
     }
-    return attach_thread_ring(tls) != nullptr;
+    if (!tls.ring) {
+        return false; // every ring is taken
+    }
+    // A log call leaves the ring's pages to be faulted in as it fills. Fault them
+    // all now instead, while the ring is still empty and so safe to overwrite.
+    detail::thread_ring_slot& slot = *tls.slot;
+    if (!slot.prefaulted && tls.ring->written() == tls.ring->released()) {
+        tls.ring->prefault();
+        slot.prefaulted = true;
+    }
+    return true;
 }
 
 SLICK_LOGGER_FORCE_INLINE bool Logger::thread_ring_current(const detail::thread_ring_tls& tls) const noexcept {
@@ -7574,7 +7594,9 @@ inline uint32_t Logger::claim_thread_ring(uint64_t generation) noexcept {
         }
         if (!slots[i].ring.load(std::memory_order_relaxed)) {
             try {
-                slots[i].ring.store(detail::producer_ring::allocate(thread_ring_size_).release(),
+                // Not pre-faulted: a claim on a log call must stay cheap, and a ring
+                // only costs what it is filled to. prepare_thread() faults it in.
+                slots[i].ring.store(detail::producer_ring::allocate(thread_ring_size_, false).release(),
                                     std::memory_order_release);
             } catch (...) {
                 slots[i].state.store(slot_t::kFree, std::memory_order_release);

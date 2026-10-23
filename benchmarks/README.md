@@ -6,7 +6,8 @@ Performance benchmarks comparing SlickLogger against other C++ logging libraries
 
 | Name in results | What it is |
 |-----------------|------------|
-| `slick-logger` | This library: lock-free queue, deferred formatting, async writer thread |
+| `slick-logger` | This library: a lock-free ring per logging thread, deferred formatting, async writer thread |
+| `slick (shared)` | The same with `thread_rings = false`: every thread on one shared lock-free queue |
 | `spdlog_sync` | spdlog 1.12.0 writing through `basic_file_sink_mt` on the calling thread |
 | `spdlog_async` | spdlog 1.12.0 in async mode (8192-slot queue, one worker thread) |
 | `std_ofstream` | Baseline: `fmt::format` into an `std::ofstream` with `std::endl` per line |
@@ -16,7 +17,7 @@ spdlog and fmt are fetched automatically by `benchmarks/CMakeLists.txt` (spdlog 
 ## Results
 
 Everything below is a real run of the suite at its default settings. Re-run it
-yourself before quoting any of it — these numbers describe one machine.
+yourself before quoting any of it: these numbers describe one machine.
 
 ### Measured on
 
@@ -28,155 +29,183 @@ yourself before quoting any of it — these numbers describe one machine.
 | Compiler | MSVC 19.44 (toolset 14.44.35207), `/O2 /DNDEBUG`, C++20 |
 | Log output | Local NVMe SSD |
 | Settings | 50,000 iterations × 3 runs (the defaults) |
-| Date | 2026-09-22 |
+| Date | 2026-10-22 |
+
+`slick-logger` is the default configuration: a ring per logging thread
+(`LogConfig::thread_rings`). `slick (shared)` is the same build with
+`-DSLICK_LOGGER_DEFAULT_THREAD_RINGS=OFF`, every thread on the shared rings as in
+earlier releases. Runs on this machine drift by up to 2× between back-to-back
+runs of one binary, so the main-suite figures are the best of three runs,
+interleaved between the two builds.
 
 ### Read this before the tables
 
 **Put the log output on a local disk.** Every library here ultimately writes to
-a file, so the storage device sets the ceiling for the synchronous ones. The
-same suite run with its working directory on an SMB share measured
-`spdlog_sync` at 9,021 ops/sec and `std_ofstream` at 202 ops/sec — 144× and
-310× below the local-disk numbers in the table below. `slick-logger` barely
-moved (8.8M vs 7.7M), because its producer threads never touch the file. That
-asymmetry makes a network-mounted run useless for comparison and flattering to
-this library. The runner scripts cd into the build tree, so check where your
-build tree actually lives.
+a file, so the storage device sets the ceiling for the synchronous ones. On an
+SMB share `spdlog_sync` measured 9,021 ops/sec and `std_ofstream` 202 ops/sec,
+144× and 310× below the local-disk numbers, while `slick-logger` barely moved
+because its producers never touch the file. A network-mounted run is useless for
+comparison. The runner scripts cd into the build tree, so check where it lives.
+
+**The writer sets the ceiling here.** Each run logs a 50,000-entry burst while a
+FileSink formats it, which is slower than the producers. Whatever the writer
+has not drained must wait in memory: a 4 MB thread ring holds about 32,000
+medium entries or 18,000 large ones, and the rest spill to the shared rings.
+Large messages fill a ring fastest, which is why they gain the least.
 
 ### Throughput (ops/sec, higher is better)
 
-**Small messages** — one literal, no arguments:
+**Small messages**: one literal, no arguments:
 
-| Threads | slick-logger | spdlog_async | spdlog_sync | std_ofstream |
-|--------:|-------------:|-------------:|------------:|-------------:|
-| 1 | 7,669,915 | 3,765,386 | 1,298,350 | 62,700 |
-| 2 | 6,018,601 | 2,852,539 | 822,326 | — |
-| 4 | 8,723,449 | 2,242,966 | 725,643 | — |
-| 8 | 10,960,620 | 1,925,261 | 490,994 | — |
+| Threads | slick-logger | slick (shared) | spdlog_async | spdlog_sync | std_ofstream |
+|--------:|-------------:|---------------:|-------------:|------------:|-------------:|
+| 1 | 14,352,792 | 12,114,714 | 4,972,223 | 1,462,648 | 68,728 |
+| 2 | 12,798,460 | 8,261,324 | 2,977,428 | 946,902 | n/a |
+| 4 | 17,748,816 | 11,268,640 | 2,369,683 | 696,618 | n/a |
+| 8 | 18,913,439 | 13,036,420 | 2,024,661 | 519,768 | n/a |
 
-**Medium messages** — three arguments (int, double, string):
+**Medium messages**: three arguments (int, double, string):
 
-| Threads | slick-logger | spdlog_async | spdlog_sync | std_ofstream |
-|--------:|-------------:|-------------:|------------:|-------------:|
-| 1 | 4,750,287 | 899,182 | 575,968 | 59,732 |
-| 2 | 4,285,896 | 1,343,762 | 408,128 | — |
-| 4 | 4,487,423 | 1,444,199 | 296,298 | — |
-| 8 | 5,097,901 | 1,395,898 | 211,542 | — |
+| Threads | slick-logger | slick (shared) | spdlog_async | spdlog_sync | std_ofstream |
+|--------:|-------------:|---------------:|-------------:|------------:|-------------:|
+| 1 | 3,766,374 | 3,373,209 | 910,457 | 523,017 | 56,860 |
+| 2 | 5,328,348 | 4,354,450 | 1,511,183 | 351,020 | n/a |
+| 4 | 6,706,990 | 5,176,815 | 1,523,838 | 282,248 | n/a |
+| 8 | 7,484,766 | 5,954,902 | 1,542,377 | 230,245 | n/a |
 
-**Large messages** — eleven arguments:
+**Large messages**: eleven arguments:
 
-| Threads | slick-logger | spdlog_async | spdlog_sync | std_ofstream |
-|--------:|-------------:|-------------:|------------:|-------------:|
-| 1 | 3,152,905 | 445,112 | 173,023 | 47,921 |
-| 2 | 2,738,959 | 735,008 | 147,620 | — |
-| 4 | 3,051,647 | 1,121,690 | 107,400 | — |
-| 8 | 3,192,537 | 1,219,525 | 82,540 | — |
+| Threads | slick-logger | slick (shared) | spdlog_async | spdlog_sync | std_ofstream |
+|--------:|-------------:|---------------:|-------------:|------------:|-------------:|
+| 1 | 2,184,524 | 2,191,357 | 319,465 | 175,137 | 48,659 |
+| 2 | 3,196,001 | 3,101,373 | 591,170 | 130,251 | n/a |
+| 4 | 3,506,901 | 3,178,382 | 999,338 | 104,579 | n/a |
+| 8 | 3,500,203 | 3,318,504 | 1,333,143 | 90,518 | n/a |
 
 The baseline only runs single-threaded; a shared `std::ofstream` across threads
 is not a meaningful comparison.
 
-The 2-thread dip for `slick-logger` on small messages is reproducible: at one
-thread the producer has the queue's cacheline to itself, and at two it starts
-paying for the contention without yet having enough parallelism to cover it.
+With thread rings, producers share no cache line, so adding threads no longer
+costs each call a contended reservation. The shared rings dip at two threads,
+where each call starts paying for that contention without enough parallelism
+to cover it.
 
 ### Latency (ns per call, lower is better)
 
-Producer-side cost of a `LOG_*` call — the time to stamp and enqueue, not the
-time until the line reaches disk.
+Producer-side cost of a `LOG_*` call: the time to stamp and enqueue, not the
+time until the line reaches disk. Total elapsed time over 50,000 calls:
 
-| Message size | Mean | Median |
-|--------------|-----:|-------:|
-| Small | 169 | 177 |
-| Medium | 288 | 302 |
-| Large | 337 | 340 |
+| Message size | slick-logger | slick (shared) |
+|--------------|-------------:|---------------:|
+| Small | 153 | 162 |
+| Medium | 290 | 339 |
+| Large | 527 | 501 |
 
 From `latency_benchmark`, which times each call individually (10,000 samples):
 
-| Metric | slick-logger | spdlog_sync |
-|--------|-------------:|------------:|
-| Mean | 173 ns | 1,420 ns |
-| Median | 200 ns | 500 ns |
-| P95 | 200 ns | 900 ns |
-| P99 | 300 ns | 32,800 ns |
-| P99.9 | 2,600 ns | 92,100 ns |
-| Max | 42,800 ns | 156,700 ns |
+| Metric | slick-logger | slick (shared) | spdlog_sync |
+|--------|-------------:|---------------:|------------:|
+| Mean | 148 ns | 135 ns | 1,186 ns |
+| Median | 100 ns | 100 ns | 400 ns |
+| P95 | 200 ns | 200 ns | 600 ns |
+| P99 | 300 ns | 200 ns | 19,900 ns |
+| P99.9 | 1,500 ns | 1,400 ns | 84,400 ns |
+| Max | 102,300 ns | 47,600 ns | 650,200 ns |
 
-The tail is the point: `spdlog_sync`'s P99 is 66× its median, because a
-synchronous call eventually waits on the file. SlickLogger's P99 is 1.5× its
-median — the writer thread absorbs the I/O.
+`spdlog_sync`'s P99 is 50× its median, because a synchronous call eventually
+waits on the file. SlickLogger's P99 is 3× its median: the writer thread
+absorbs the I/O. The slick means differ by one outlier: 102 µs over 10,000
+samples is 10 ns of the mean.
 
-**Timer granularity.** `latency_benchmark` reports a 100 ns minimum and a
-median landing exactly on 200 ns because Windows' `high_resolution_clock` ticks
-at 100 ns. Per-call figures below roughly 100 ns cannot be resolved by this
-harness, which is why its distribution collapses into the 100–500 ns bucket
-(99.5% of samples). The aggregate figures in the table above — total elapsed
-time divided by iterations — are the more precise measurement.
+**Timer granularity.** `latency_benchmark` reports a 100 ns minimum and median
+because Windows' `high_resolution_clock` ticks at 100 ns. Per-call figures below
+roughly 100 ns cannot be resolved by this harness, which is why 99.5% of its
+samples land in the 100–500 ns bucket. The aggregate figures above, total
+elapsed time divided by iterations, are the more precise measurement.
 
 **Latency under background load** (`latency_benchmark`):
 
-| Background load | Mean | P99 |
-|-----------------|-----:|----:|
-| idle | 170 ns | 300 ns |
-| 1,000 msg/sec | 318 ns | 500 ns |
-| 5,000 msg/sec | 209 ns | 300 ns |
-| 10,000 msg/sec | 187 ns | 200 ns |
+| Background load | slick-logger mean | P99 | slick (shared) mean | P99 |
+|-----------------|------------------:|----:|--------------------:|----:|
+| idle | 120 ns | 200 ns | 137 ns | 200 ns |
+| 1,000 msg/sec | 179 ns | 300 ns | 157 ns | 400 ns |
+| 5,000 msg/sec | 132 ns | 200 ns | 195 ns | 1,100 ns |
+| 10,000 msg/sec | 148 ns | 200 ns | 195 ns | 300 ns |
 
 ### Thread scaling (`throughput_benchmark`)
 
-Medium messages, a separate harness from the table above, so absolute numbers
+Medium messages, a separate harness from the tables above, so absolute numbers
 differ:
 
-| Threads | slick-logger | Efficiency | spdlog_async | Efficiency |
-|--------:|-------------:|-----------:|-------------:|-----------:|
-| 1 | 3,461,010 | 100.0% | 1,654,210 | 100.0% |
-| 2 | 4,015,298 | 58.0% | 658,008 | 19.9% |
-| 4 | 6,052,820 | 43.7% | 255,286 | 3.9% |
-| 8 | 8,607,713 | 31.1% | 140,065 | 1.1% |
-| 16 | 9,359,610 | 16.9% | 113,637 | 0.4% |
+| Threads | slick-logger | Memory MB | slick (shared) | Memory MB | spdlog_async |
+|--------:|-------------:|----------:|---------------:|----------:|-------------:|
+| 1 | 4,999,575 | 8 | 5,271,398 | 5 | 2,162,433 |
+| 2 | 6,017,662 | 11 | 4,744,565 | 10 | 802,627 |
+| 4 | 8,597,898 | 28 | 8,020,758 | 16 | 368,899 |
+| 8 | 13,269,243 | 48 | 10,764,654 | 16 | 123,210 |
+| 16 | 17,789,638 | 80 | 14,870,110 | 16 | 117,026 |
 
-Efficiency is per-thread, so it falls as threads are added even while total
-throughput rises. What matters is the direction: SlickLogger's total keeps
-climbing through 16 threads, while `spdlog_async`'s total *drops* — 1.65M at
-one thread down to 114K at sixteen, a 14× regression under contention.
+SlickLogger's total keeps climbing through 16 threads, while `spdlog_async`'s
+drops 18× from one thread to sixteen. With thread rings, memory follows the
+number of logging threads: each ring is faulted in as far as it fills, up to
+`thread_ring_size` (4 MB).
 
-**Burst handling** — five bursts of 50,000 messages, one second apart:
+**Burst handling**: five bursts of 50,000 messages, one second apart:
 
 | Logger | Mean | StdDev |
 |--------|-----:|-------:|
-| slick-logger | 3,083,616 ops/sec | 56,461 |
-| spdlog_async | 1,429,902 ops/sec | 96,855 |
+| slick-logger | 4,169,366 ops/sec | 582,238 |
+| slick (shared) | 3,962,112 ops/sec | 124,491 |
+| spdlog_async | 1,429,273 ops/sec | 46,067 |
 
 ### Memory (`memory_benchmark`)
 
-| Logger | Queue size | Peak MB |
-|--------|-----------:|--------:|
-| SlickLogger | 1,024 | 5 |
-| SlickLogger | 8,192 | 8 |
-| SlickLogger | 65,536 | 36 |
-| SlickLogger | 262,144 | 105 |
-| spdlog_async | 1,024 | 0 |
-| spdlog_async | 8,192 | 3 |
-| spdlog_async | 65,536 | 25 |
-| spdlog_async | 262,144 | 102 |
+| Queue size | slick-logger peak MB | slick (shared) peak MB | spdlog_async peak MB |
+|-----------:|---------------------:|-----------------------:|---------------------:|
+| 1,024 | 9 | 5 | 0 |
+| 8,192 | 11 | 8 | 3 |
+| 65,536 | 29 | 36 | 25 |
+| 262,144 | 94 | 106 | 102 |
 
-**Read the peak column, and ignore the `Bytes/Msg` and `Efficiency` columns the
+**Read the peak columns, and ignore the `Bytes/Msg` and `Efficiency` columns the
 tool prints.** Those divide peak memory by the message count, which says little
 about a logger whose rings are allocated once up front.
+
+The queue size is the shared entry ring's. With thread rings it takes only
+spills and threads past `max_thread_rings`, and each logging thread adds a ring
+that is faulted in as it fills. The sustained-load test logged 299,956 messages
+at 10,000 msg/sec with a 4 MB peak and 4 MB final (16 MB on the shared rings),
+and ten fragmentation cycles produced 0 MB of growth.
 
 The string ring is a `slick::queue<char>`, and slick-queue keeps a 16-byte
 control slot per reservation unit. Before `LogConfig::string_items_per_slot`
 existed the unit was one byte, so the default 16 MB `string_buffer_size`
-carried a 256 MB control array, and SlickLogger peaked at 257 MB even with a
-1,024-entry queue. The default unit is now 64 bytes, which shrinks that array to
-4 MB. The peaks above are mostly the entry queue and the parts of the string
-ring actually written to.
+carried a 256 MB control array. The default unit is now 64 bytes, which shrinks
+that array to 4 MB.
 
-Steady-state behaviour is unremarkable by comparison — the sustained-load test
-logged 299,905 messages at 10,000 msg/sec with a 16 MB peak and 16 MB final, and
-ten fragmentation cycles produced 0 MB of growth.
+### Thread ring size (`thread_ring_size`)
+
+The main suite with the ring size set through `LogConfig`, before the default
+was settled (single runs, ops/sec):
+
+| Case | shared rings | 1 MB | **4 MB (default)** | 16 MB |
+|------|-------------:|-----:|-------------------:|------:|
+| Small, 1 thread | 11,931,287 | 11,648,209 | 11,800,272 | 11,442,979 |
+| Small, 4 threads | 10,875,066 | 17,508,624 | 17,773,322 | 18,071,581 |
+| Medium, 1 thread | 3,461,599 | 2,985,625 | 3,290,925 | 3,224,863 |
+| Medium, 4 threads | 5,165,592 | 6,260,068 | 6,623,756 | 6,680,845 |
+| Large, 1 thread | 2,119,881 | 1,926,121 | 2,077,526 | 1,998,514 |
+| Large, 4 threads | 3,038,153 | 3,205,435 | 3,623,437 | 3,640,084 |
+
+A bigger ring spills less, but the first lap of a fresh ring takes its page
+faults on log calls, and this suite starts every run with fresh rings. 4 MB was
+within a few percent of the best at every thread count. A long-running program
+pays those faults once per ring; `Logger::prepare_thread()` pays them up front.
 
 ### String ring unit size (`string_items_per_slot`)
 
-A separate scratch harness: 16 MB string ring, 65,536-entry queue, a null sink,
+A separate scratch harness, run before thread rings, so every string went
+through the string ring: 16 MB string ring, 65,536-entry queue, a null sink,
 and each producer thread logging `"msg {} {} {}"` with an int, a 12-byte string
 and a 40-byte string. Figures are the median producer-side cost of one log call
 over five rounds of 400,000 calls per thread. Peak is the process working set.
@@ -187,7 +216,7 @@ over five rounds of 400,000 calls per thread. Peak is the process working set.
 | 16 | 164 ns | 666 ns | 1,771 ns | 60 |
 | 32 | 163 ns | 655 ns | 1,769 ns | 52 |
 | **64 (default)** | 166 ns | 575 ns | 989 ns | 48 |
-| 128 | — | — | 1,015 ns | 46 |
+| 128 | n/a | n/a | 1,015 ns | 46 |
 
 Moving from 1 byte to 16 fixes most of the memory cost. The gain from 32 to 64
 is under contention: at 64 every string starts on its own cache line, so

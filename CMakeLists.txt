@@ -16,6 +16,8 @@ option(SLICK_LOGGER_ENABLE_THREAD_ID "Capture the producing thread id in every e
 # library sharing one Logger must agree; processes sharing a segment need not.
 option(SLICK_LOGGER_ENABLE_LOSS_DETECTION "Count entries overwritten before the writer read them" OFF)
 option(SLICK_LOGGER_ENABLE_CPU_RELAX "Pause/yield before a producer retries a lost race (failed CAS) to reserve a queue slot" ON)
+# Default for LogConfig::thread_rings, also used by the init() overloads without a LogConfig.
+option(SLICK_LOGGER_DEFAULT_THREAD_RINGS "Give each logging thread its own ring by default (Local mode)" ON)
 # The multi-process collector is a convenience executable;
 # the shared-memory feature itself is header-only and always available.
 option(BUILD_SLICK_LOGGER_COLLECTOR "Build the standalone slick_log_collector executable" OFF)
@@ -86,6 +88,9 @@ if(SLICK_LOGGER_ENABLE_LOSS_DETECTION)
 endif()
 if(NOT SLICK_LOGGER_ENABLE_CPU_RELAX)
     target_compile_definitions(slick-logger INTERFACE SLICK_LOGGER_ENABLE_CPU_RELAX=0)
+endif()
+if(NOT SLICK_LOGGER_DEFAULT_THREAD_RINGS)
+    target_compile_definitions(slick-logger INTERFACE SLICK_LOGGER_DEFAULT_THREAD_RINGS=0)
 endif()
 target_link_libraries(slick-logger INTERFACE slick::queue)
 
