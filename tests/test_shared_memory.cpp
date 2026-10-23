@@ -2,7 +2,8 @@
 //
 // Covers the shared-memory queue modes: entries produced in one process (or one
 // logger) carry ring-buffer offsets instead of addresses, and the collector
-// resolves them against its own mapping before handing them to sinks.
+// resolves them against its own mapping before handing them to sinks. A
+// producer's thread rings live in its own segment; see the last section.
 
 #include <slick/logger.hpp>
 #include <gtest/gtest.h>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -71,6 +73,10 @@ size_t count_lines_containing(const std::vector<std::string>& lines, std::string
         }
     }
     return n;
+}
+
+void touch_file(const std::filesystem::path& path) {
+    std::ofstream(path) << "go\n";
 }
 
 // Launch the producer executable and wait for it to exit, returning its exit code.
@@ -694,11 +700,13 @@ TEST_F(SharedMemoryTest, BacklogReplayReportsTheStringsItHasNotDrainedYet) {
 
     // A real producer process fills the segment first and then lingers, so the
     // segment is still there for the collector to attach to. Everything it logs
-    // is published, and still undrained, before the collector exists.
+    // is published, and still undrained, before the collector exists. It logs
+    // through the shared rings, since with thread rings its strings would stay
+    // in its own segment.
     const auto ready_marker = temp_log("test_shm_backlog_ready.marker");
     std::thread producer([&] {
         run_producer("--name " + segment + " --tag pre --count " + std::to_string(kProduced) +
-                     " --queue-size 1024 --string-buffer-size 65536 --linger-ms 3000"
+                     " --queue-size 1024 --string-buffer-size 65536 --linger-ms 3000 --thread-rings 0"
                      " --ready-file " + ready_marker.string());
     });
     // A sleep would only make the backlog probable: lose the race and the
@@ -770,4 +778,374 @@ TEST_F(SharedMemoryTest, BacklogReplayReportsTheStringsItHasNotDrainedYet) {
 
     Logger::instance().shutdown();
     producer.join();
+}
+
+// ---------------------------------------------------------------------------
+// Thread rings in shared memory: a producer process's rings live in a segment
+// of its own, found through the registry, "<name>.reg".
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using slick::logger::detail::shm_registry;
+using slick::logger::detail::shm_registry_slot;
+
+/// The "seq <tag> <thread> <i>" lines of one tag, in file order, per thread. A
+/// line that does not parse lands under thread -1.
+std::map<int, std::vector<int>> sequences(const std::vector<std::string>& lines, const std::string& tag) {
+    std::map<int, std::vector<int>> out;
+    const std::string needle = "seq " + tag + " ";
+    for (const auto& line : lines) {
+        const size_t at = line.find(needle);
+        if (at == std::string::npos) {
+            continue;
+        }
+        int thread = -1;
+        int index = -1;
+        if (std::sscanf(line.c_str() + at + needle.size(), "%d %d", &thread, &index) == 2) {
+            out[thread].push_back(index);
+        } else {
+            out[-1].push_back(-1);
+        }
+    }
+    return out;
+}
+
+/// Empty when @p values is 0, 1, 2, ...; otherwise where it stops being so.
+std::string first_gap(const std::vector<int>& values) {
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (values[i] != static_cast<int>(i)) {
+            return "at " + std::to_string(i) + " found " + std::to_string(values[i]);
+        }
+    }
+    return {};
+}
+
+/// A segment's registry, mapped into this process.
+struct registry_mapping {
+    slick::shm::shared_memory shm;
+    shm_registry* registry;
+
+    explicit registry_mapping(const std::string& segment)
+        : shm((segment + ".reg").c_str(), slick::shm::open_existing),
+          registry(static_cast<shm_registry*>(shm.data())) {}
+
+    shm_registry_slot& slot(uint32_t index) { return registry->slots[index]; }
+    uint32_t state(uint32_t index) { return shm_registry_slot::state_of(slot(index).control.load()); }
+};
+
+LogConfig collector_config(const std::string& segment, const std::filesystem::path& path) {
+    LogConfig config;
+    config.mode = QueueMode::SharedCollector;
+    config.shared_memory_name = segment;
+    config.process_tag = "collector";
+    config.log_queue_size = 1024;
+    config.string_buffer_size = 1 << 16;
+    config.sinks.push_back(std::make_shared<slick::logger::FileSink>(path));
+    return config;
+}
+
+uint32_t this_pid() {
+    return static_cast<uint32_t>(SLICK_TEST_GETPID());
+}
+
+} // namespace
+
+// Each producer thread logs through a ring of its own, and its entries reach the
+// collector complete and in order without touching the shared entry queue.
+TEST_F(SharedMemoryTest, ProducerThreadsLogThroughTheirOwnRings) {
+    const auto log_path = temp_log("test_shm_rings.log");
+    const auto segment = unique_segment_name("slt_tr_");
+    constexpr int kThreads = 4;
+    constexpr int kCount = 2000;
+
+    Logger::instance().init(collector_config(segment, log_path));
+    ASSERT_EQ(run_producer("--name " + segment + " --tag rings --threads " + std::to_string(kThreads) +
+                           " --count " + std::to_string(kCount) + " --queue-size 1024 --string-buffer-size 65536"),
+              0);
+    ASSERT_TRUE(wait_for([&] { return read_all(log_path).find("producer done") != std::string::npos; }));
+    {
+        // Only the two banners and "producer done" could have taken the shared path.
+        slick::queue<slick::logger::LogEntry, slick::logger::detail::logger_queue_traits> raw(segment.c_str());
+        EXPECT_LT(raw.initial_reading_index(), 16u) << "the producer's threads logged through the shared queue";
+    }
+    Logger::instance().shutdown();
+
+    const auto seq = sequences(read_lines(log_path), "rings");
+    ASSERT_EQ(seq.size(), static_cast<size_t>(kThreads));
+    for (const auto& [thread, values] : seq) {
+        EXPECT_EQ(values.size(), static_cast<size_t>(kCount)) << "thread " << thread;
+        EXPECT_EQ(first_gap(values), "") << "thread " << thread;
+    }
+}
+
+// Several producer processes at once, each in its own registry slot.
+TEST_F(SharedMemoryTest, ManyProducerProcessesEachKeepTheirOrder) {
+    const auto log_path = temp_log("test_shm_many.log");
+    const auto segment = unique_segment_name("slt_mp_");
+    constexpr int kProducers = 6;
+    constexpr int kCount = 500;
+
+    Logger::instance().init(collector_config(segment, log_path));
+    std::vector<std::thread> producers;
+    std::vector<int> codes(kProducers, -1);
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([&, p] {
+            codes[p] = run_producer("--name " + segment + " --tag p" + std::to_string(p) + " --threads 2 --count " +
+                                    std::to_string(kCount) + " --queue-size 1024 --string-buffer-size 65536");
+        });
+    }
+    for (auto& producer : producers) {
+        producer.join();
+    }
+    for (int p = 0; p < kProducers; ++p) {
+        ASSERT_EQ(codes[p], 0) << "producer " << p;
+    }
+    ASSERT_TRUE(wait_for([&] {
+        return count_lines_containing(read_lines(log_path), "producer done") == static_cast<size_t>(kProducers);
+    }));
+    Logger::instance().shutdown();
+
+    const auto lines = read_lines(log_path);
+    for (int p = 0; p < kProducers; ++p) {
+        const auto seq = sequences(lines, "p" + std::to_string(p));
+        ASSERT_EQ(seq.size(), 2u) << "producer " << p;
+        for (const auto& [thread, values] : seq) {
+            EXPECT_EQ(values.size(), static_cast<size_t>(kCount)) << "producer " << p << " thread " << thread;
+            EXPECT_EQ(first_gap(values), "") << "producer " << p << " thread " << thread;
+        }
+    }
+}
+
+// A ring too small to keep up spills into the shared queue. The collector reads
+// rings only every 20 ms here, so a spilled entry is there long before the ring
+// records ahead of it are read: it must wait for them. Paced, so the collector
+// keeps up and the producer keeps going back to its ring between spills.
+TEST_F(SharedMemoryTest, SpillsFromAFullRingStayBehindItsRecords) {
+    const auto log_path = temp_log("test_shm_spill.log");
+    const auto segment = unique_segment_name("slt_sp_");
+    constexpr int kCount = 3000;
+
+    LogConfig config = collector_config(segment, log_path);
+    config.log_queue_size = 16384;
+    config.string_buffer_size = 1 << 22;
+    config.writer_poll_interval_us = 20000;
+    Logger::instance().init(config);
+    ASSERT_EQ(run_producer("--name " + segment + " --tag spill --threads 2 --count " + std::to_string(kCount) +
+                           " --pace-us 30 --ring-size 4096 --queue-size 16384 --string-buffer-size 4194304"),
+              0);
+    ASSERT_TRUE(wait_for([&] { return read_all(log_path).find("producer done") != std::string::npos; }));
+    {
+        slick::queue<slick::logger::LogEntry, slick::logger::detail::logger_queue_traits> raw(segment.c_str());
+        ASSERT_GT(raw.initial_reading_index(), 1000u) << "nothing spilled, so nothing was tested";
+    }
+    Logger::instance().shutdown();
+
+    const auto seq = sequences(read_lines(log_path), "spill");
+    ASSERT_EQ(seq.size(), 2u);
+    for (const auto& [thread, values] : seq) {
+        EXPECT_EQ(values.size(), static_cast<size_t>(kCount)) << "thread " << thread;
+        EXPECT_EQ(first_gap(values), "") << "thread " << thread;
+    }
+}
+
+// A producer killed while its threads log: the collector takes every record it
+// published, none of them torn, then unlinks its segment and frees its slot.
+TEST_F(SharedMemoryTest, RecoversFromAProducerKilledMidBurst) {
+    const auto log_path = temp_log("test_shm_killed.log");
+    const auto segment = unique_segment_name("slt_kl_");
+    constexpr int kThreads = 3;
+    constexpr int kCrashAfter = 3000;
+
+    Logger::instance().init(collector_config(segment, log_path));
+    // --flush-first: the collector holds the segment before the burst, so it
+    // outlives the producer on Windows too.
+    const int rc = run_producer("--name " + segment + " --tag crash --flush-first --threads " +
+                                std::to_string(kThreads) + " --count 100000000 --crash-after " +
+                                std::to_string(kCrashAfter) + " --queue-size 1024 --string-buffer-size 65536");
+    ASSERT_NE(rc, 0) << "the producer was meant to be killed";
+
+    registry_mapping registry(segment);
+    const std::string ring_segment = segment + ".r0";
+    EXPECT_TRUE(wait_for([&] {
+        return registry.state(0) == shm_registry_slot::kFree &&
+               !slick::shm::shared_memory::exists(ring_segment.c_str());
+    })) << "the dead producer's slot was not freed, state " << registry.state(0);
+    Logger::instance().shutdown();
+
+    const auto seq = sequences(read_lines(log_path), "crash");
+    EXPECT_EQ(seq.count(-1), 0u) << "a torn record reached the sink";
+    size_t total = 0;
+    for (const auto& [thread, values] : seq) {
+        total += values.size();
+        EXPECT_EQ(first_gap(values), "") << "thread " << thread;
+    }
+    EXPECT_GE(total, static_cast<size_t>(kCrashAfter)) << "published records were lost";
+}
+
+// A dead producer's pid handed to a live process must not keep its slot alive:
+// the start time tells them apart.
+TEST_F(SharedMemoryTest, ReusedPidIsNotTakenForTheDeadProducer) {
+    const auto log_path = temp_log("test_shm_pid_reuse.log");
+    const auto segment = unique_segment_name("slt_pr_");
+    const auto logged = temp_log("test_shm_pid_reuse.logged");
+    const auto go = temp_log("test_shm_pid_reuse.go");
+
+    // No collector yet: the producer logs, then dies without closing its slot.
+    int rc = 0;
+    std::thread producer([&] {
+        rc = run_producer("--name " + segment + " --tag reuse --log pre 5 --touch " + logged.string() + " --wait " +
+                          go.string() + " --crash --queue-size 1024 --string-buffer-size 65536");
+    });
+    ASSERT_TRUE(wait_for([&] { return std::filesystem::exists(logged); }));
+    registry_mapping registry(segment);
+    ASSERT_EQ(registry.state(0), shm_registry_slot::kActive);
+    // On Windows a segment goes with its last handle: hold this one past the producer.
+    slick::shm::shared_memory keep((segment + ".r0").c_str(), slick::shm::open_existing);
+    touch_file(go);
+    producer.join();
+    ASSERT_NE(rc, 0);
+
+    // This process now plays the one the OS handed the dead producer's pid to.
+    ASSERT_EQ(registry.state(0), shm_registry_slot::kActive);
+    registry.slot(0).pid.store(this_pid());
+
+    Logger::instance().init(collector_config(segment, log_path));
+    EXPECT_TRUE(wait_for([&] { return registry.state(0) == shm_registry_slot::kFree; }))
+        << "a live process with the dead producer's pid kept its slot";
+    Logger::instance().shutdown();
+    EXPECT_EQ(count_lines_containing(read_lines(log_path), "step pre"), 5u);
+}
+
+namespace {
+
+/// A collector restart against a producer that keeps running: phase a goes to
+/// the first collector, b is logged with none attached, c goes to the second.
+void run_collector_restart(bool collect_backlog, const std::filesystem::path& first_path,
+                           const std::filesystem::path& second_path, const std::filesystem::path& marker_prefix) {
+    const auto segment = unique_segment_name("slt_rs_");
+    auto marker = [&](const char* name) { return marker_prefix.string() + name; };
+    for (const char* name : {".a", ".b", ".logged_b", ".c"}) {
+        std::error_code ec;
+        std::filesystem::remove(marker(name), ec);
+    }
+
+    Logger::instance().init(collector_config(segment, first_path));
+    int rc = -1;
+    std::thread producer([&] {
+        rc = run_producer("--name " + segment + " --tag rs --log a 5 --flush --touch " + marker(".a") + " --wait " +
+                          marker(".b") + " --log b 5 --touch " + marker(".logged_b") + " --wait " + marker(".c") +
+                          " --log c 5 --flush --queue-size 1024 --string-buffer-size 65536");
+    });
+    ASSERT_TRUE(wait_for([&] { return std::filesystem::exists(marker(".a")); }));
+    Logger::instance().shutdown();
+    Logger::instance().reset();
+
+    touch_file(marker(".b"));
+    ASSERT_TRUE(wait_for([&] { return std::filesystem::exists(marker(".logged_b")); }));
+    LogConfig config = collector_config(segment, second_path);
+    config.collect_backlog = collect_backlog;
+    Logger::instance().init(config);
+    touch_file(marker(".c"));
+    producer.join();
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(wait_for([&] { return read_all(second_path).find("producer done") != std::string::npos; }));
+    Logger::instance().shutdown();
+
+    const auto first = read_lines(first_path);
+    const auto second = read_lines(second_path);
+    EXPECT_EQ(count_lines_containing(first, "step a"), 5u);
+    EXPECT_EQ(count_lines_containing(second, "step a"), 0u) << "the second collector replayed what the first wrote";
+    EXPECT_EQ(count_lines_containing(second, "step b"), collect_backlog ? 5u : 0u);
+    EXPECT_EQ(count_lines_containing(second, "step c"), 5u);
+    for (const char* name : {".a", ".b", ".logged_b", ".c"}) {
+        std::error_code ec;
+        std::filesystem::remove(marker(name), ec);
+    }
+}
+
+} // namespace
+
+TEST_F(SharedMemoryTest, RestartedCollectorReplaysOnlyWhatWasNotRead) {
+    run_collector_restart(true, temp_log("test_shm_restart_a1.log"), temp_log("test_shm_restart_a2.log"),
+                          "test_shm_restart_a");
+}
+
+TEST_F(SharedMemoryTest, RestartedCollectorWithoutBacklogSkipsUnreadRecords) {
+    run_collector_restart(false, temp_log("test_shm_restart_b1.log"), temp_log("test_shm_restart_b2.log"),
+                          "test_shm_restart_b");
+}
+
+// With every registry slot held by a live process, a producer logs through the
+// shared rings instead, and says so.
+TEST_F(SharedMemoryTest, FullRegistryFallsBackToTheSharedRings) {
+    const auto log_path = temp_log("test_shm_full.log");
+    const auto segment = unique_segment_name("slt_fr_");
+
+    Logger::instance().init(collector_config(segment, log_path));
+    registry_mapping registry(segment);
+    const uint64_t start_time = slick::logger::detail::process_start_time(this_pid());
+    for (uint32_t i = 0; i < shm_registry::kSlotCount; ++i) {
+        registry.slot(i).pid.store(this_pid());
+        registry.slot(i).start_time.store(start_time);
+        registry.slot(i).control.store(shm_registry_slot::make(shm_registry_slot::kActive, 1));
+    }
+    const int rc = run_producer("--name " + segment + " --tag full --count 5 --queue-size 1024 --string-buffer-size 65536");
+    const bool done = wait_for([&] { return read_all(log_path).find("producer done") != std::string::npos; });
+    for (uint32_t i = 0; i < shm_registry::kSlotCount; ++i) {
+        registry.slot(i).control.store(shm_registry_slot::make(shm_registry_slot::kFree, 1));
+    }
+    Logger::instance().shutdown();
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(done);
+    const auto lines = read_lines(log_path);
+    EXPECT_EQ(count_lines_containing(lines, "producer message"), 5u);
+    EXPECT_EQ(count_lines_containing(lines, "no thread rings in shared memory"), 1u);
+}
+
+// Two collectors would both hand ring space back to the producers.
+TEST_F(SharedMemoryTest, SecondCollectorIsRefused) {
+    const auto log_path = temp_log("test_shm_first_collector.log");
+    const auto other_path = temp_log("test_shm_second_collector.log");
+    const auto segment = unique_segment_name("slt_2c_");
+
+    Logger::instance().init(collector_config(segment, log_path));
+    EXPECT_EQ(run_producer("--name " + segment + " --collector " + other_path.string()), 3)
+        << "a second collector attached to the same registry";
+    Logger::instance().shutdown();
+
+    // Released on shutdown, so the next one gets in.
+    EXPECT_EQ(run_producer("--name " + segment + " --collector " + other_path.string()), 0);
+}
+
+// A producer built with another layout cannot be read: it is skipped, and said so once.
+TEST_F(SharedMemoryTest, ProducerWithAnotherLayoutIsRefusedWithOneWarning) {
+    using slick::logger::detail::shm_ring_segment;
+    const auto log_path = temp_log("test_shm_layout.log");
+    const auto segment = unique_segment_name("slt_ly_");
+
+    Logger::instance().init(collector_config(segment, log_path));
+    registry_mapping registry(segment);
+    // Slot 0 as a producer of another build would leave it.
+    const std::string name = segment + ".r0";
+    slick::shm::shared_memory foreign(name.c_str(), shm_ring_segment::bytes(1, 4096), slick::shm::create_only);
+    auto* const header = static_cast<shm_ring_segment*>(foreign.data());
+    header->magic = shm_ring_segment::kMagic;
+    header->layout_version = shm_ring_segment::kLayoutVersion;
+    header->generation = 1;
+    header->ring_count = 1;
+    header->ring_capacity = 4096;
+    header->record_layout = shm_ring_segment::record_layout_of() + 1;
+    registry.slot(0).pid.store(this_pid());
+    registry.slot(0).start_time.store(slick::logger::detail::process_start_time(this_pid()));
+    registry.slot(0).control.store(shm_registry_slot::make(shm_registry_slot::kActive, 1));
+    registry.registry->changes.fetch_add(1);
+
+    EXPECT_TRUE(wait_for([&] { return read_all(log_path).find("another slick-logger layout") != std::string::npos; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // a few more scans
+    registry.slot(0).control.store(shm_registry_slot::make(shm_registry_slot::kFree, 1));
+    Logger::instance().shutdown();
+    EXPECT_EQ(count_lines_containing(read_lines(log_path), "another slick-logger layout"), 1u);
+    slick::shm::shared_memory::remove(name.c_str());
 }

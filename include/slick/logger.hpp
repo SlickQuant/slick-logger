@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <thread>
@@ -123,10 +124,25 @@
 #if defined(_WIN32)
 extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
 extern "C" __declspec(dllimport) void __stdcall FlushProcessWriteBuffers(void);
+// Process liveness for shared-memory mode; see detail::process_running().
+struct _FILETIME;
+extern "C" __declspec(dllimport) void* __stdcall OpenProcess(unsigned long, int, unsigned long);
+extern "C" __declspec(dllimport) int __stdcall CloseHandle(void*);
+extern "C" __declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void*, unsigned long);
+extern "C" __declspec(dllimport) int __stdcall GetProcessTimes(void*, _FILETIME*, _FILETIME*, _FILETIME*, _FILETIME*);
+extern "C" __declspec(dllimport) unsigned long __stdcall GetLastError(void);
 #elif defined(__linux__)
 #  include <sys/syscall.h> // SYS_gettid, __NR_membarrier
+#  include <signal.h>      // kill(pid, 0)
+#  include <cerrno>
 #elif defined(__APPLE__)
 #  include <pthread.h>
+#  include <signal.h>
+#  include <cerrno>
+#  include <libproc.h>     // proc_pidinfo
+#elif !defined(_WIN32)
+#  include <signal.h>
+#  include <cerrno>
 #endif
 
 #if defined(__SANITIZE_THREAD__)
@@ -622,6 +638,129 @@ inline uint32_t current_process_id() noexcept {
     #endif
     }();
     return id;
+}
+
+#if defined(_WIN32)
+inline void* open_process(uint32_t pid, bool& denied) noexcept {
+    void* const process = ::OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */ | 0x00100000 /* SYNCHRONIZE */,
+                                        0, pid);
+    denied = !process && ::GetLastError() == 5; // ERROR_ACCESS_DENIED: it exists
+    return process;
+}
+
+inline uint64_t process_creation_time(void* process) noexcept {
+    uint64_t times[4] = {}; // FILETIMEs: creation, exit, kernel, user
+    return ::GetProcessTimes(process, reinterpret_cast<_FILETIME*>(&times[0]), reinterpret_cast<_FILETIME*>(&times[1]),
+                             reinterpret_cast<_FILETIME*>(&times[2]), reinterpret_cast<_FILETIME*>(&times[3]))
+               ? times[0]
+               : 0;
+}
+#elif defined(__linux__)
+/// Fields of /proc/<pid>/stat: false when it cannot be read.
+inline bool read_proc_stat(uint32_t pid, char& state, uint64_t& start_time) noexcept {
+    char path[32];
+    std::snprintf(path, sizeof(path), "/proc/%u/stat", pid);
+    std::FILE* const file = std::fopen(path, "r");
+    if (!file) {
+        return false;
+    }
+    char text[1024];
+    const size_t size = std::fread(text, 1, sizeof(text) - 1, file);
+    std::fclose(file);
+    text[size] = '\0';
+    // The command (field 2) may hold spaces and parentheses: count from the last ')'.
+    const char* at = std::strrchr(text, ')');
+    if (!at) {
+        return false;
+    }
+    ++at;
+    for (int field = 3; field <= 22; ++field) {
+        while (*at == ' ') {
+            ++at;
+        }
+        if (field == 3) {
+            state = *at;
+        } else if (field == 22) {
+            start_time = std::strtoull(at, nullptr, 10); // clock ticks since boot
+            return true;
+        }
+        while (*at && *at != ' ') {
+            ++at;
+        }
+    }
+    return false;
+}
+#endif
+
+/**
+ * @brief When process @p pid started, or 0 when it is not running or the OS
+ *        will not say. Paired with the pid it names one process: a pid the OS
+ *        reuses comes back with another start time.
+ */
+inline uint64_t process_start_time(uint32_t pid) noexcept {
+#if defined(_WIN32)
+    bool denied;
+    void* const process = open_process(pid, denied);
+    if (!process) {
+        return 0;
+    }
+    const uint64_t start = process_creation_time(process);
+    ::CloseHandle(process);
+    return start;
+#elif defined(__linux__)
+    char state = 0;
+    uint64_t start = 0;
+    return read_proc_stat(pid, state, start) ? start : 0;
+#elif defined(__APPLE__)
+    proc_bsdinfo info{};
+    if (::proc_pidinfo(static_cast<int>(pid), PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) {
+        return 0;
+    }
+    return uint64_t{info.pbi_start_tvsec} * 1000000 + info.pbi_start_tvusec;
+#else
+    (void)pid;
+    return 0;
+#endif
+}
+
+/// Whether @p pid is running and, when @p start_time is not 0, is the process
+/// that started then. A process this one may not query counts as running.
+inline bool process_running(uint32_t pid, uint64_t start_time) noexcept {
+    if (pid == 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    bool denied;
+    void* const process = open_process(pid, denied);
+    if (!process) {
+        return denied;
+    }
+    bool running = ::WaitForSingleObject(process, 0) == 0x102; // WAIT_TIMEOUT: not signaled, so not exited
+    if (running && start_time != 0) {
+        const uint64_t start = process_creation_time(process);
+        running = start == 0 || start == start_time;
+    }
+    ::CloseHandle(process);
+    return running;
+#else
+    if (::kill(static_cast<pid_t>(pid), 0) != 0 && errno != EPERM) {
+        return false;
+    }
+#  if defined(__linux__)
+    char state = 0;
+    uint64_t start = 0;
+    if (read_proc_stat(pid, state, start)) {
+        if (state == 'Z' || state == 'X') {
+            return false; // exited, not yet reaped
+        }
+        return start_time == 0 || start == start_time;
+    }
+    return true;
+#  else
+    const uint64_t start = start_time ? process_start_time(pid) : 0;
+    return start == 0 || start == start_time;
+#  endif
+#endif
 }
 
 /**
@@ -1236,6 +1375,9 @@ inline constexpr uint8_t kEntryHasSourceLocation = 0x02;
 // alongside kEntryOffsets, because a format copied into a ring has no fixed
 // address.
 inline constexpr uint8_t kEntryStaticFormat = 0x04;
+// Spilled from a full thread ring into the shared queue: pid holds the ring it
+// waits for until the writer restores it, and sinks never see this flag.
+inline constexpr uint8_t kEntrySpilled = 0x08;
 
 #pragma pack(push, 1)
 /**
@@ -1293,7 +1435,7 @@ struct LogEntry {
     uint32_t line = 0; // Source line captured by LOG_* macros
     int sink_index = -1; // Optional sink index, logged by that sink only
     LogLevel level;
-    uint8_t flags = 0; // kEntryOffsets / kEntryHasSourceLocation / kEntryStaticFormat
+    uint8_t flags = 0; // kEntryOffsets / kEntryHasSourceLocation / kEntryStaticFormat / kEntrySpilled
     uint8_t arg_count = 0; // Number of arguments
     char tag[SLICK_LOGGER_TAG_SIZE] = {}; // NUL-padded producer tag; empty in Local mode
     LogArgument args[SLICK_LOGGER_MAX_ARGS];
@@ -2679,6 +2821,7 @@ public:
     void prefault() noexcept { std::memset(data(), 0, static_cast<size_t>(capacity_)); }
 
     uint64_t capacity() const noexcept { return capacity_; }
+    uint32_t layout_version() const noexcept { return layout_version_; }
 
     /// The largest payload one record can carry. A record is at most half the
     /// ring, so it and the end-of-lap space it may skip always fit in an empty ring.
@@ -2732,6 +2875,12 @@ public:
     /// Records counted by drop().
     uint64_t drops() const noexcept { return drops_.load(std::memory_order_relaxed); }
 
+    /// While the producer spills elsewhere, the position its spilled records wait
+    /// for: the reader holds them until it has released the ring up to here. Kept
+    /// in the ring so a reader in another process sees it too.
+    void set_spill_gate(uint64_t position) noexcept { spill_gate_.store(position, std::memory_order_release); }
+    uint64_t spill_gate() const noexcept { return spill_gate_.load(std::memory_order_acquire); }
+
     // ---- either side ----
 
     /// Total bytes published so far.
@@ -2768,6 +2917,7 @@ private:
     uint64_t cached_read_pos_ = 0;  // the last read_pos_ the producer looked at
     std::atomic<uint64_t> drops_{0};
     std::atomic<uint64_t> records_{0};
+    std::atomic<uint64_t> spill_gate_{0};
     // Reader-owned: the producer only loads read_pos_, and only when the ring looks full.
     alignas(64) std::atomic<uint64_t> read_pos_{0};
     std::atomic<uint64_t> released_records_{0};
@@ -2864,6 +3014,14 @@ public:
     /// Whether everything the producer had published at refresh() has been popped.
     bool batch_done() const noexcept { return cursor_ == batch_end_; }
 
+    /// Hand back everything published so far unread.
+    void skip() noexcept {
+        cursor_ = batch_end_ = ring_->written();
+        popped_ = ring_->records();
+        current_size_ = 0;
+        release();
+    }
+
     /// Batches cut short by an impossible record size.
     uint64_t corrupt() const noexcept { return corrupt_; }
 
@@ -2875,6 +3033,10 @@ private:
     uint64_t corrupt_ = 0;
     uint64_t popped_ = 0;
 };
+
+/// How a log argument is passed to an out-of-line function: scalars by value.
+template<typename T>
+using cold_arg_t = std::conditional_t<std::is_scalar_v<std::remove_cvref_t<T>>, std::remove_cvref_t<T>, T&&>;
 
 /// Bytes an argument of type T copies into the record (thread rings) or the
 /// string ring: text and binary payloads, as opposed to scalars and pointers.
@@ -2917,9 +3079,6 @@ struct alignas(64) thread_ring_slot {
     /// while its thread lives on (a plugin unloaded), and the ring must not stay in
     /// use once another thread may take it over.
     std::atomic<uint64_t> ticket{0};
-    /// While the thread spills to the shared queue, the ring position its spilled
-    /// entries wait for. Set before the first one is published.
-    std::atomic<uint64_t> spill_gate{0};
     // The owning thread's alone, from whichever module it logs.
     alignas(64) uint64_t spill_end = 0; // past its last spilled entry in the shared queue; 0 when none is pending
     uint32_t spill_check = 0;           // spilled calls left before looking at the writer's progress again
@@ -2970,7 +3129,9 @@ struct ring_view {
     uint32_t head_size = 0;
     uint64_t head_timestamp = 0;
     int64_t last_poll_ns = 0;      // when refresh() last found records
+    uintptr_t delta = 0;           // remote: this mapping's address minus the producer's
     bool gated = false;            // wait out the poll interval before the next refresh()
+    bool remote = false;           // a producer process's ring: its addresses need translating
 
     /// Peek the batch's next record into head. False if there is none.
     bool hold_next() noexcept {
@@ -3019,6 +3180,127 @@ inline void writer_barrier() noexcept {
     std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
 }
+
+/// A StringRef holding a shared string ring index, not an address. Set in shared
+/// memory only, where a ring record holds both; no user-space address has this bit.
+inline constexpr uint64_t kStringRingRef = uint64_t{1} << 63;
+
+/// One process's claim in the shared-memory registry.
+struct alignas(64) shm_registry_slot {
+    static constexpr uint32_t kFree = 0;
+    static constexpr uint32_t kClaiming = 1; // a producer is building its segment
+    static constexpr uint32_t kActive = 2;
+    static constexpr uint32_t kClosing = 3;  // shut down: the collector drains it, then frees it
+
+    /// State in the low 32 bits, generation in the high 32: one CAS changes both,
+    /// so a slot freed and claimed again never passes for the one a CAS expects.
+    std::atomic<uint64_t> control{0};
+    std::atomic<uint32_t> pid{0};
+    std::atomic<uint64_t> start_time{0}; // process_start_time(pid)
+
+    static constexpr uint32_t state_of(uint64_t control) noexcept { return static_cast<uint32_t>(control); }
+    static constexpr uint32_t generation_of(uint64_t control) noexcept { return static_cast<uint32_t>(control >> 32); }
+    static constexpr uint64_t make(uint32_t state, uint32_t generation) noexcept {
+        return (uint64_t{generation} << 32) | state;
+    }
+};
+
+/**
+ * @brief The registry segment, "<shared_memory_name>.reg"
+ *
+ * A producer process with thread rings claims a slot here and creates its ring
+ * segment, "<shared_memory_name>.r<slot>". The collector finds them here. Zeroed
+ * memory is its empty state; the creator writes the header, then sets ready.
+ */
+struct shm_registry {
+    static constexpr uint64_t kMagic = 0x4745524C474B4C53ull; // "SLKGLREG"
+    static constexpr uint32_t kLayoutVersion = 1;
+    static constexpr uint32_t kSlotCount = 64;
+
+    alignas(64) std::atomic<uint32_t> ready;
+    uint32_t layout_version;
+    uint64_t magic;
+    uint32_t slot_count;
+    /// Bumped when a producer claims or closes a slot, so the collector looks at once.
+    std::atomic<uint64_t> changes;
+    /// The attached collector, (pid << 32) | low 32 bits of its start time, or 0.
+    alignas(64) std::atomic<uint64_t> collector;
+    /// The collector's read cursor on the shared entry queue: a spilling producer
+    /// goes back to its ring once this passes its last spill.
+    alignas(64) std::atomic<uint64_t> read_index;
+    shm_registry_slot slots[kSlotCount];
+};
+
+/// A producer process's ring segment: this header, then ring_count rings.
+struct alignas(64) shm_ring_segment {
+    static constexpr uint64_t kMagic = 0x474E524C474B4C53ull; // "SLKGLRNG"
+    static constexpr uint32_t kLayoutVersion = 1;
+    static constexpr uint32_t kMaxRings = 64;
+
+    uint64_t magic;
+    uint32_t layout_version;
+    uint32_t ring_layout_version; // producer_ring::kLayoutVersion
+    uint32_t generation;          // the registry slot's when this was built
+    uint32_t ring_count;
+    uint64_t ring_capacity;
+    /// Where the producer mapped the segment. Its ring records hold addresses in
+    /// that mapping, which the collector shifts into its own.
+    uint64_t producer_base;
+    uint32_t record_layout; // record_layout_of(): both sides must read a record alike
+
+    /// What a record's layout depends on: the LogEntry header and LogArgument sizes.
+    static constexpr uint32_t record_layout_of() noexcept {
+        return static_cast<uint32_t>(offsetof(LogEntry, args) << 16 | sizeof(LogArgument));
+    }
+    static constexpr size_t bytes(uint32_t count, uint64_t capacity) noexcept {
+        return sizeof(shm_ring_segment) + size_t{count} * producer_ring::block_size(capacity);
+    }
+    producer_ring* ring(uint32_t index) noexcept {
+        return reinterpret_cast<producer_ring*>(reinterpret_cast<uint8_t*>(this) + sizeof(shm_ring_segment) +
+                                                size_t{index} * producer_ring::block_size(ring_capacity));
+    }
+};
+
+/// A collector's registry lease: its pid and the low 32 bits of its start time.
+inline uint64_t collector_lease(uint32_t pid) noexcept {
+    return (uint64_t{pid} << 32) | static_cast<uint32_t>(process_start_time(pid));
+}
+
+inline bool collector_lease_running(uint64_t lease) noexcept {
+    const uint32_t pid = static_cast<uint32_t>(lease >> 32);
+    if (!process_running(pid, 0)) {
+        return false;
+    }
+    const uint32_t start = static_cast<uint32_t>(process_start_time(pid));
+    return start == 0 || start == static_cast<uint32_t>(lease);
+}
+
+/// A shared-memory spill's pid until the writer restores it: registry slot, ring,
+/// then the low bits of the slot's generation.
+inline constexpr uint32_t kRouteSlotBits = 6;
+inline constexpr uint32_t kRouteRingBits = 6;
+inline constexpr uint32_t kRouteGenerationMask = (1u << (32 - kRouteSlotBits - kRouteRingBits)) - 1;
+static_assert(shm_registry::kSlotCount == 1u << kRouteSlotBits &&
+              shm_ring_segment::kMaxRings == 1u << kRouteRingBits);
+
+/// The collector's view of one producer process.
+struct remote_producer {
+    slick::shm::shared_memory segment;
+    std::unique_ptr<ring_view[]> views; // null while nothing is attached
+    uint32_t ring_count = 0;
+    uint32_t generation = 0;            // the registry slot's, while attached
+    uint32_t pid = 0;
+    uint64_t start_time = 0;
+    bool closing = false;               // nothing more is coming: detach once drained
+    bool owns_slot = true;              // the registry slot still names it: free it on detach
+    // The previous attachment, for spills that outlive it.
+    uint32_t last_generation = UINT32_MAX;
+    uint32_t last_pid = 0;
+    // A slot seen in kClaiming: freed if it stays so, and its claimer is gone.
+    uint64_t claiming_control = 0;
+    int64_t claiming_since_ns = 0;
+    uint32_t refused_generation = 0; // a segment another build made: warned about once
+};
 
 } // namespace detail
 
@@ -3130,13 +3412,15 @@ struct LogConfig {
     /// reset()), that amounts to std::chrono::system_clock.
     std::shared_ptr<ITimestamper> timestamper;
 
-    // ---- Per-thread rings; Local mode only ----
+    // ---- Per-thread rings; Local mode and SharedProducer ----
 
     /// Give every logging thread its own ring, so producers share no cache line.
     /// A record carries its strings inline. Threads past max_thread_rings use the
     /// shared rings above, as do the strings of a record over half a ring; a full
     /// ring does what thread_ring_full says. Entries from one thread stay in
-    /// order; across threads they are merged by timestamp.
+    /// order; across threads they are merged by timestamp. A SharedProducer keeps
+    /// its rings in a shared-memory segment of its own, sized by the shared_*
+    /// fields below; a SharedCollector logs through the shared rings.
     bool thread_rings = SLICK_LOGGER_DEFAULT_THREAD_RINGS;
     /// Bytes per thread ring, rounded up to a power of 2, at least 4 KiB. Pages are
     /// faulted in as the ring fills, so an idle thread's ring costs little memory.
@@ -3148,6 +3432,11 @@ struct LogConfig {
     uint32_t writer_poll_interval_us = 5;
     /// What a log call does when its thread's ring is full.
     RingFullPolicy thread_ring_full = RingFullPolicy::Spill;
+    /// SharedProducer: rings in this process's segment, at most 64. Threads past
+    /// them log through the shared rings.
+    uint32_t shared_thread_rings = 16;
+    /// SharedProducer: bytes per ring in the segment, as thread_ring_size.
+    size_t shared_thread_ring_size = 1 << 20;
 };
 
 /**
@@ -3680,14 +3969,21 @@ private:
     // ---- Per-thread rings (LogConfig::thread_rings) ----
 
     void configure_thread_rings(const LogConfig& config) noexcept;
-    /// Build the registry for start(). Throws only on allocation failure.
-    void create_thread_rings();
+    /// Build the registry for start(). Throws only on allocation failure. Returns
+    /// why a producer process has no rings this run, or empty.
+    std::string create_thread_rings();
     /// Log through the calling thread's ring, spilling to the shared queue while
     /// it is full. False when the thread has no ring this run, which sends the
-    /// call down the shared path.
-    template<typename FormatT, typename... Args>
+    /// call down the shared path. @p InShm: a SharedProducer, whose records
+    /// another process reads, so they must not point into this one.
+    template<bool InShm, typename FormatT, typename... Args>
     bool log_to_thread_ring(int sink_index, LogLevel level, const char* file_name, uint32_t line,
                             bool copy_file_name, uint64_t timestamp, FormatT&& format, Args&&... args);
+    /// log_to_thread_ring<true>, out of line, so Local mode's inlined path does not grow.
+    /// @p packed holds the format, then the arguments.
+    template<typename Packed>
+    bool log_to_shared_thread_ring(int sink_index, LogLevel level, const char* file_name, uint32_t line,
+                                   bool copy_file_name, uint64_t timestamp, const Packed& packed);
     /// The calling thread's ring, claiming one if it has none in this run.
     detail::producer_ring* attach_thread_ring(detail::thread_ring_tls& tls) noexcept;
     /// The calling thread's registry slot, claiming one if it holds none, or
@@ -3705,20 +4001,63 @@ private:
     /// entry_page_cursor_). Shared by the shared path and thread-ring spills.
     LogEntry& reserve_shared_entry(uint64_t& index, bool use_offsets) noexcept;
     /// Open a spill: what the thread's spilled entries wait for in its ring.
-    void begin_spill(detail::thread_ring_slot& slot, const detail::producer_ring& ring) noexcept;
+    void begin_spill(detail::thread_ring_slot& slot, detail::producer_ring& ring) noexcept;
     /// Merge step over every ring and the shared queue: dispatch a run of entries
     /// from the source with the oldest head.
     DrainResult drain_sources();
     /// Peek the next record of @p view into its head. False if it has none now.
+    /// @p slot is the local registry slot, null for a producer process's ring.
     /// @p urgent skips the poll interval: a spilled entry is waiting on this ring.
-    bool load_ring_head(uint32_t index, detail::ring_view& view, bool urgent, int64_t& now_ns, bool& polling);
+    bool load_ring_head(detail::ring_view& view, detail::thread_ring_slot* slot, bool urgent, int64_t& now_ns,
+                        bool& polling);
     void dispatch_ring_head(detail::ring_view& view);
     /// Read the shared queue's next entry into shared_head_. False if there is none.
     bool load_shared_head();
+    /// For a spilled head: find the ring it waits for, and restore its pid.
+    void resolve_spill();
+    /// Collector: a stall in the shared queue while no head is held.
+    DrainResult shared_queue_stall();
+    /// Publish the shared queue's read cursor, to flush() and spilling producers.
+    void publish_shared_cursor() noexcept;
     bool thread_rings_pending() const noexcept;
     /// Whether the held shared entry may go out: a spilled one waits until its
     /// thread's ring has been drained to where the spill began.
     bool shared_head_released() const noexcept;
+
+    // ---- Thread rings in shared memory: the registry and producer segments ----
+
+    /// Open (or create) the registry. A collector also takes the collector lease.
+    void setup_registry(const LogConfig& config);
+    /// Producer: claim a registry slot and build this process's ring segment.
+    /// False, with @p why set, when the process logs through the shared rings instead.
+    bool claim_registry_slot(std::string& why) noexcept;
+    /// Producer: close the slot. Collector: detach every producer, drop the lease.
+    void close_registry() noexcept;
+    std::string producer_segment_name(uint32_t slot) const;
+    /// Collector: attach new producers, detach drained closing or dead ones.
+    /// @p initial applies LogConfig::collect_backlog to what it attaches.
+    void scan_registry(bool initial);
+    /// Collector, writer thread: scan when a producer announced a change, or
+    /// every kRegistryScanMs for liveness.
+    void poll_registry();
+    bool attach_producer(uint32_t index, bool skip_backlog);
+    void detach_producer(uint32_t index, bool free_slot);
+    /// Unlink slot @p index's segment, then free the slot if it still holds @p control.
+    void free_registry_slot(uint32_t index, uint64_t control) noexcept;
+    static bool producer_drained(const detail::remote_producer& producer) noexcept;
+    /// Point a producer process's record at this process's copy of its strings.
+    void resolve_remote_record(LogEntry& entry, const detail::ring_view& view) const noexcept;
+    /// Producer: whether a live collector holds the registry.
+    bool collector_attached() const noexcept;
+    /// Producer: wait until the collector has taken everything logged so far,
+    /// up to @p limit (0: no limit), or until no collector is attached.
+    void wait_for_collector(std::chrono::milliseconds limit);
+    /// Collector, writer thread: whether flush request @p generation has seen
+    /// every producer ring drained to where it stood when the request arrived.
+    bool remote_flush_ready(uint64_t generation);
+    /// Collector, writer thread: refresh the remote ring counters statistics read.
+    void publish_remote_totals() noexcept;
+    static constexpr int64_t kRegistryScanMs = 100;
     struct ring_totals {
         uint64_t produced = 0; // records published
         uint64_t consumed = 0; // records released by the writer
@@ -3733,6 +4072,8 @@ private:
     template<typename T>
     size_t stage_argument(LogArgument& arg, T&& value);
     static size_t stage_bytes(StringRef& ref, const char* data, size_t size, bool terminate) noexcept;
+    /// SharedProducer: stage the file name and literal format a record would point at.
+    static size_t stage_static_strings(StringRef& file, bool& copy_file, StringRef& format, uint8_t& flags) noexcept;
     /// Pass 2: copy a staged string to @p out and point @p ref at the copy.
     static void copy_staged(char*& out, StringRef& ref, bool terminate) noexcept;
     /// The header and @p arg_bytes of arguments, written straight into @p entry.
@@ -3887,10 +4228,17 @@ private:
     // Thread rings, read on every call. ring_generation_ changes per run, so a
     // thread's ring from an earlier run is never reused; it never goes back to 0.
     bool thread_rings_ = false;
+    bool local_rings_ = false;         // thread_rings_ in Local mode: the one test on the logging path
     bool ring_fence_ = true;           // producers fence before checking writer_parked_
     bool ring_full_drops_ = false;     // RingFullPolicy::Drop
+    bool ring_in_shm_ = false;         // SharedProducer: literal formats and file names are copied too
     uint32_t thread_ring_max_payload_ = 0;
     std::atomic<uint64_t> ring_generation_{1};
+    // Spills only. Local: route = slot, progress = read_index_. SharedProducer: the
+    // route also names the registry slot, and progress is the collector's cursor.
+    uint32_t spill_route_base_ = 0;
+    uint32_t spill_route_shift_ = 0;
+    const std::atomic<uint64_t>* spill_progress_ = &read_index_;
     std::unordered_map<std::string_view, int> sinkname_index_map_;
     /// Layout handed to sinks that have none of their own, including sinks added
     /// after set_pattern(). Null means the built-in layout. The one compiled copy
@@ -3939,6 +4287,41 @@ private:
     alignas(64) LogEntry shared_head_{}; // the shared queue's next entry, held for the merge
     bool shared_head_ready_ = false;
     uint64_t shared_cursor_ = 0; // read cursor past shared_head_; read_index_ lags until it is dispatched
+    // A spilled shared_head_'s ring, and the view reading it.
+    const detail::producer_ring* shared_gate_ring_ = nullptr;
+    const detail::ring_view* shared_gate_view_ = nullptr;
+
+    // ---- Thread rings in shared memory; inert unless registry_ ----
+    slick::shm::shared_memory registry_shm_;
+    detail::shm_registry* registry_ = nullptr;
+    // Producer: its segment and registry slot.
+    slick::shm::shared_memory ring_shm_;
+    uint32_t registry_slot_ = kNoSlot;
+    uint32_t registry_generation_ = 0;
+    // Collector: its lease, and one view per registry slot. Writer thread only once running.
+    uint64_t collector_lease_ = 0;
+    bool registry_backlog_ = true;
+    std::unique_ptr<detail::remote_producer[]> remote_;
+    std::vector<detail::ring_view*> remote_views_; // every attached producer ring, for the merge
+    uint64_t registry_changes_seen_ = 0;
+    int64_t next_registry_scan_ns_ = 0;
+    struct flush_target {
+        uint32_t producer;
+        uint32_t generation;
+        uint32_t ring;
+        uint64_t written;
+    };
+    std::vector<flush_target> remote_flush_targets_;
+    uint64_t remote_flush_generation_ = 0;
+    // Remote ring counters for statistics, published by the writer.
+    std::atomic<uint64_t> remote_produced_{0};
+    std::atomic<uint64_t> remote_consumed_{0};
+    std::atomic<uint64_t> remote_dropped_{0};
+    std::atomic<uint32_t> remote_rings_{0};
+    // Counters of producers already detached, so the totals never go backwards.
+    uint64_t remote_retired_produced_ = 0;
+    uint64_t remote_retired_consumed_ = 0;
+    uint64_t remote_retired_dropped_ = 0;
 
     // ---- Multi-process state; all inert while mode_ is Local ----
     alignas(64) QueueMode mode_ = QueueMode::Local;
@@ -6350,7 +6733,7 @@ inline void Logger::accumulate_stats_sample() noexcept {
     // needs no clamp. The clamp below still covers the reverse ordering.
     uint64_t consumed = read_index_.load(std::memory_order_relaxed);
     uint64_t produced = log_queue_->initial_reading_index();
-    if (thread_rings_) {
+    if (thread_rings_ || registry_) {
         const ring_totals rings = thread_ring_totals();
         consumed += rings.consumed;
         produced += rings.produced;
@@ -6467,7 +6850,7 @@ inline LogStats Logger::sample_stats() noexcept {
     uint64_t consumed = read_index_.load(std::memory_order_relaxed);
     uint64_t produced = log_queue_->initial_reading_index();
     ring_totals rings;
-    if (thread_rings_) {
+    if (thread_rings_ || registry_) {
         rings = thread_ring_totals();
         consumed += rings.consumed;
         produced += rings.produced;
@@ -6744,21 +7127,45 @@ inline void Logger::init(const std::filesystem::path& log_file, size_t log_queue
 }
 
 inline void Logger::configure_thread_rings(const LogConfig& config) noexcept {
-    thread_rings_ = config.thread_rings && config.mode == QueueMode::Local;
-    thread_ring_size_ = std::clamp<size_t>(round_up_to_power_of_2(config.thread_ring_size), 4096, size_t{1} << 30);
-    max_thread_rings_ = std::clamp<uint32_t>(config.max_thread_rings, 1, 4096);
+    const bool producer = config.mode == QueueMode::SharedProducer;
+    thread_rings_ = config.thread_rings && (config.mode == QueueMode::Local || producer);
+    const size_t ring_size = producer ? config.shared_thread_ring_size : config.thread_ring_size;
+    thread_ring_size_ = std::clamp<size_t>(round_up_to_power_of_2(ring_size), 4096, size_t{1} << 30);
+    max_thread_rings_ = producer ? std::clamp<uint32_t>(config.shared_thread_rings, 1, detail::shm_ring_segment::kMaxRings)
+                                 : std::clamp<uint32_t>(config.max_thread_rings, 1, 4096);
     ring_poll_interval_ns_ = int64_t{config.writer_poll_interval_us} * 1000;
     ring_full_drops_ = config.thread_ring_full == RingFullPolicy::Drop;
 }
 
-inline void Logger::create_thread_rings() {
+inline std::string Logger::create_thread_rings() {
     ring_slots_ = std::make_unique<detail::thread_ring_slot[]>(max_thread_rings_);
-    ring_views_ = std::make_unique<detail::ring_view[]>(max_thread_rings_);
     ring_slots_used_.store(0, std::memory_order_relaxed);
     thread_ring_max_payload_ = static_cast<uint32_t>(std::min<size_t>(thread_ring_size_ / 2, UINT32_MAX)) -
                                detail::producer_ring::kRecordHeader;
-    ring_fence_ = !detail::writer_barrier_available();
-    shared_head_ready_ = false;
+    if (mode_ != QueueMode::SharedProducer) {
+        ring_views_ = std::make_unique<detail::ring_view[]>(max_thread_rings_);
+        ring_fence_ = !detail::writer_barrier_available();
+        local_rings_ = true;
+        return {};
+    }
+    // A producer process: its rings are in its own segment, and it has no writer to wake.
+    std::string why;
+    if (!claim_registry_slot(why)) {
+        ring_slots_.reset();
+        thread_rings_ = false;
+        return why;
+    }
+    auto* const segment = static_cast<detail::shm_ring_segment*>(ring_shm_.data());
+    for (uint32_t i = 0; i < max_thread_rings_; ++i) {
+        ring_slots_[i].ring.store(segment->ring(i), std::memory_order_relaxed);
+    }
+    ring_fence_ = false;
+    ring_in_shm_ = true;
+    spill_route_base_ = ((registry_generation_ & detail::kRouteGenerationMask)
+                         << (detail::kRouteSlotBits + detail::kRouteRingBits)) | registry_slot_;
+    spill_route_shift_ = detail::kRouteSlotBits;
+    spill_progress_ = &registry_->read_index;
+    return {};
 }
 
 inline void Logger::start() {
@@ -6813,8 +7220,12 @@ inline void Logger::start() {
         open_stats_csv();
     }
 
+    shared_head_ready_ = false;
+    shared_gate_ring_ = nullptr;
+    shared_gate_view_ = nullptr;
+    std::string ring_warning;
     if (thread_rings_) {
-        create_thread_rings();
+        ring_warning = create_thread_rings();
     }
     running_ = true;
 
@@ -6823,7 +7234,6 @@ inline void Logger::start() {
     if (mode_ != QueueMode::SharedProducer) {
         // Initialize read_index_ before starting the thread
         read_index_.store(log_queue_->initial_reading_index(), std::memory_order_relaxed);
-        shared_cursor_ = read_index_.load(std::memory_order_relaxed);
         if (mode_ == QueueMode::SharedCollector && collect_backlog_) {
             // Producers may already have published into this segment before the
             // collector attached. Rewind to the oldest slot the ring can still
@@ -6833,6 +7243,12 @@ inline void Logger::start() {
             const uint64_t attached_at = read_index_.load(std::memory_order_relaxed);
             read_index_.store(attached_at > capacity ? attached_at - capacity : 0,
                               std::memory_order_relaxed);
+        }
+        shared_cursor_ = read_index_.load(std::memory_order_relaxed);
+        if (registry_) {
+            publish_shared_cursor();
+            // Producers already running: their rings are backlog too.
+            scan_registry(true);
         }
 
         // No wait for the thread to come up: running_ is already true, and the
@@ -6846,6 +7262,10 @@ inline void Logger::start() {
     // ring is faulted in here rather than one page at a time on later calls.
     prepare_thread();
     log(LogLevel::L_INFO, "SlickLogger v{}", SLICK_LOGGER_VERSION);
+    if (!ring_warning.empty()) {
+        log(LogLevel::L_WARN, "SlickLogger: no thread rings in shared memory ({}), logging through the shared rings",
+            ring_warning);
+    }
 
     // Spawned last, so the banner above is already in the queue rather than
     // racing the first sample. The CSV is already open by this point.
@@ -6912,6 +7332,21 @@ inline void Logger::init(const LogConfig& config) {
                             normalize_items_per_slot(config.string_items_per_slot, string_buffer_size));
     }
     configure_thread_rings(config);
+    if (mode_ != QueueMode::Local) {
+        try {
+            setup_registry(config);
+        } catch (...) {
+            close_registry();
+            log_queue_.reset();
+            string_queue_.reset();
+            mode_ = QueueMode::Local;
+            shm_name_.clear();
+            entry_flags_ = 0;
+            pid_ = 0;
+            thread_rings_ = false;
+            throw;
+        }
+    }
     start();
 }
 
@@ -7019,6 +7454,445 @@ inline void Logger::setup_shared_queues(const LogConfig& config, uint32_t queue_
 #endif
     std::memset(tag_, 0, sizeof(tag_));
     std::memcpy(tag_, config.process_tag.data(), truncated_tag_length(config.process_tag));
+}
+
+inline std::string Logger::producer_segment_name(uint32_t slot) const {
+    // '.' is not allowed in shared_memory_name, so no other name can collide.
+    return shm_name_ + ".r" + std::to_string(slot);
+}
+
+inline void Logger::setup_registry(const LogConfig& config) {
+    using registry_t = detail::shm_registry;
+    const bool collector = mode_ == QueueMode::SharedCollector;
+    if (!collector && !thread_rings_) {
+        return; // a producer on the shared rings never needs it
+    }
+    // The creator writes the header, then sets ready. Opening can race it, so
+    // keep trying for a while rather than read a half-built header.
+    const std::string name = shm_name_ + ".reg";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        slick::shm::shared_memory shm(name.c_str(), sizeof(registry_t), slick::shm::open_or_create);
+        auto* const registry = static_cast<registry_t*>(shm.data());
+        if (registry && shm.is_creator()) {
+            registry->magic = registry_t::kMagic;
+            registry->layout_version = registry_t::kLayoutVersion;
+            registry->slot_count = registry_t::kSlotCount;
+            registry->ready.store(1, std::memory_order_release);
+        }
+        if (registry && shm.size() >= sizeof(registry_t) && registry->ready.load(std::memory_order_acquire) == 1) {
+            if (registry->magic != registry_t::kMagic || registry->layout_version != registry_t::kLayoutVersion ||
+                registry->slot_count != registry_t::kSlotCount) {
+                throw std::runtime_error("shared memory registry '" + name + "' has layout version " +
+                                         std::to_string(registry->layout_version) + ", this build uses " +
+                                         std::to_string(registry_t::kLayoutVersion) +
+                                         ". All processes must run the same slick-logger version.");
+            }
+            registry_shm_ = std::move(shm);
+            registry_ = registry;
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("shared memory registry '" + name +
+                                     "' is not initialized: a stale or foreign segment, remove it");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!collector) {
+        return;
+    }
+    // One collector at a time: two would both hand ring space back to producers.
+    const uint64_t lease = detail::collector_lease(detail::current_process_id());
+    uint64_t holder = registry_->collector.load(std::memory_order_acquire);
+    for (;;) {
+        if (holder != 0 && holder != lease && detail::collector_lease_running(holder)) {
+            throw std::runtime_error("another collector (pid " + std::to_string(holder >> 32) +
+                                     ") is attached to '" + shm_name_ + "'");
+        }
+        if (registry_->collector.compare_exchange_weak(holder, lease, std::memory_order_acq_rel,
+                                                       std::memory_order_acquire)) {
+            break;
+        }
+    }
+    collector_lease_ = lease;
+    registry_backlog_ = config.collect_backlog;
+    remote_ = std::make_unique<detail::remote_producer[]>(registry_t::kSlotCount);
+    remote_views_.clear();
+    registry_changes_seen_ = registry_->changes.load(std::memory_order_acquire);
+    next_registry_scan_ns_ = 0;
+    remote_flush_targets_.clear();
+    remote_flush_generation_ = 0;
+}
+
+inline bool Logger::claim_registry_slot(std::string& why) noexcept {
+    using slot_t = detail::shm_registry_slot;
+    try {
+        const uint32_t pid = detail::current_process_id();
+        const uint64_t start_time = detail::process_start_time(pid);
+        const size_t bytes = detail::shm_ring_segment::bytes(max_thread_rings_, thread_ring_size_);
+        // A free slot first. Failing that, one whose owner closed or died and whose
+        // segment went with it, so nothing in it can still be read.
+        for (int pass = 0; pass < 2; ++pass) {
+            for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
+                slot_t& slot = registry_->slots[i];
+                uint64_t control = slot.control.load(std::memory_order_acquire);
+                const uint32_t state = slot_t::state_of(control);
+                const std::string name = producer_segment_name(i);
+                if (pass == 0 ? state != slot_t::kFree
+                              : !(state == slot_t::kClosing ||
+                                  (state == slot_t::kActive &&
+                                   !detail::process_running(slot.pid.load(std::memory_order_relaxed),
+                                                            slot.start_time.load(std::memory_order_relaxed)))) ||
+                                    slick::shm::shared_memory::exists(name.c_str())) {
+                    continue;
+                }
+                // A new generation on claiming, so a claim taken over never passes for the new one.
+                const uint32_t generation = slot_t::generation_of(control) + 1;
+                const uint64_t claiming = slot_t::make(slot_t::kClaiming, generation);
+                if (!slot.control.compare_exchange_strong(control, claiming, std::memory_order_acq_rel,
+                                                          std::memory_order_relaxed)) {
+                    continue;
+                }
+                slot.pid.store(pid, std::memory_order_relaxed);
+                slot.start_time.store(start_time, std::memory_order_relaxed);
+                try {
+                    slick::shm::shared_memory::remove(name.c_str()); // a stale segment: the slot is ours now
+                    slick::shm::shared_memory segment(name.c_str(), bytes, slick::shm::create_only);
+                    auto* const header = static_cast<detail::shm_ring_segment*>(segment.data());
+                    header->magic = detail::shm_ring_segment::kMagic;
+                    header->layout_version = detail::shm_ring_segment::kLayoutVersion;
+                    header->ring_layout_version = detail::producer_ring::kLayoutVersion;
+                    header->generation = generation;
+                    header->ring_count = max_thread_rings_;
+                    header->ring_capacity = thread_ring_size_;
+                    header->producer_base = reinterpret_cast<uintptr_t>(header);
+                    header->record_layout = detail::shm_ring_segment::record_layout_of();
+                    for (uint32_t r = 0; r < max_thread_rings_; ++r) {
+                        detail::producer_ring::create(header->ring(r), thread_ring_size_);
+                    }
+                    uint64_t expected = claiming;
+                    if (!slot.control.compare_exchange_strong(expected, slot_t::make(slot_t::kActive, generation),
+                                                              std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                        continue; // freed under us as a dead claim: leave it to its next owner
+                    }
+                    registry_->changes.fetch_add(1, std::memory_order_release);
+                    ring_shm_ = std::move(segment);
+                    registry_slot_ = i;
+                    registry_generation_ = generation;
+                    return true;
+                } catch (const std::exception& e) {
+                    why = e.what();
+                    uint64_t expected = claiming;
+                    slot.control.compare_exchange_strong(expected, slot_t::make(slot_t::kFree, generation),
+                                                         std::memory_order_release, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (why.empty()) {
+            why = "all " + std::to_string(detail::shm_registry::kSlotCount) + " registry slots are taken";
+        }
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    return false;
+}
+
+inline void Logger::close_registry() noexcept {
+    using slot_t = detail::shm_registry_slot;
+    if (!registry_) {
+        return;
+    }
+    if (remote_) {
+        // Collector: a closing producer drained by now is freed; the rest stay
+        // registered for the next collector.
+        for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
+            detail::remote_producer& producer = remote_[i];
+            if (producer.views) {
+                detach_producer(i, producer.closing && producer.owns_slot && producer_drained(producer));
+            }
+        }
+        uint64_t lease = collector_lease_;
+        if (lease != 0) {
+            registry_->collector.compare_exchange_strong(lease, 0, std::memory_order_release, std::memory_order_relaxed);
+        }
+        remote_.reset();
+        remote_views_.clear();
+        remote_flush_targets_.clear();
+        collector_lease_ = 0;
+        remote_retired_produced_ = remote_retired_consumed_ = remote_retired_dropped_ = 0;
+        remote_produced_.store(0, std::memory_order_relaxed);
+        remote_consumed_.store(0, std::memory_order_relaxed);
+        remote_dropped_.store(0, std::memory_order_relaxed);
+        remote_rings_.store(0, std::memory_order_relaxed);
+    }
+    if (registry_slot_ != kNoSlot) {
+        // Producer: unmapped first, so by the time the collector frees the slot no
+        // handle of this process keeps the segment's name taken.
+        ring_shm_ = slick::shm::shared_memory{};
+        uint64_t expected = slot_t::make(slot_t::kActive, registry_generation_);
+        registry_->slots[registry_slot_].control.compare_exchange_strong(
+            expected, slot_t::make(slot_t::kClosing, registry_generation_), std::memory_order_acq_rel,
+            std::memory_order_relaxed);
+        registry_->changes.fetch_add(1, std::memory_order_release);
+        registry_slot_ = kNoSlot;
+        registry_generation_ = 0;
+    }
+    registry_shm_ = slick::shm::shared_memory{};
+    registry_ = nullptr;
+}
+
+inline void Logger::poll_registry() {
+    const uint64_t changes = registry_->changes.load(std::memory_order_acquire);
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (changes == registry_changes_seen_ && now_ns < next_registry_scan_ns_) {
+        return;
+    }
+    registry_changes_seen_ = changes;
+    next_registry_scan_ns_ = now_ns + kRegistryScanMs * 1000000;
+    scan_registry(false);
+}
+
+inline void Logger::scan_registry(bool initial) {
+    using slot_t = detail::shm_registry_slot;
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
+        slot_t& slot = registry_->slots[i];
+        detail::remote_producer& producer = remote_[i];
+        const uint64_t control = slot.control.load(std::memory_order_acquire);
+        const uint32_t state = slot_t::state_of(control);
+        if (producer.views) {
+            if (slot_t::generation_of(control) != producer.generation ||
+                (state != slot_t::kActive && state != slot_t::kClosing)) {
+                producer.closing = true; // the slot moved on: finish this one and leave the slot be
+                producer.owns_slot = false;
+            } else if (state == slot_t::kClosing || !detail::process_running(producer.pid, producer.start_time)) {
+                producer.closing = true; // closed or died: what it published is all there is
+            }
+            if (producer.closing && producer_drained(producer)) {
+                detach_producer(i, producer.owns_slot);
+            }
+            continue;
+        }
+        if (state == slot_t::kActive || state == slot_t::kClosing) {
+            if (!attach_producer(i, initial && !registry_backlog_) &&
+                (state == slot_t::kClosing || !detail::process_running(slot.pid.load(std::memory_order_relaxed),
+                                                                       slot.start_time.load(std::memory_order_relaxed)))) {
+                free_registry_slot(i, control); // nothing to read, and nobody left to write it
+            }
+        } else if (state == slot_t::kClaiming) {
+            // A claimer records its pid just after it claims, so give it time.
+            if (producer.claiming_control != control) {
+                producer.claiming_control = control;
+                producer.claiming_since_ns = now_ns;
+            } else if (now_ns - producer.claiming_since_ns > 1000000000 &&
+                       !detail::process_running(slot.pid.load(std::memory_order_relaxed),
+                                                slot.start_time.load(std::memory_order_relaxed))) {
+                free_registry_slot(i, control); // died building its segment
+            }
+        }
+    }
+    publish_remote_totals();
+}
+
+inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
+    using slot_t = detail::shm_registry_slot;
+    using segment_t = detail::shm_ring_segment;
+    const slot_t& slot = registry_->slots[index];
+    const uint64_t control = slot.control.load(std::memory_order_acquire);
+    const uint32_t state = slot_t::state_of(control);
+    if (state != slot_t::kActive && state != slot_t::kClosing) {
+        return false;
+    }
+    const uint32_t generation = slot_t::generation_of(control);
+    try {
+        slick::shm::shared_memory segment(producer_segment_name(index).c_str(), slick::shm::open_existing);
+        auto* const header = static_cast<segment_t*>(segment.data());
+        if (!header || segment.size() < sizeof(segment_t) || header->magic != segment_t::kMagic ||
+            header->generation != generation) {
+            return false; // not the segment this generation built
+        }
+        if (header->layout_version != segment_t::kLayoutVersion ||
+            header->ring_layout_version != detail::producer_ring::kLayoutVersion ||
+            header->record_layout != segment_t::record_layout_of() || header->ring_count == 0 ||
+            header->ring_count > segment_t::kMaxRings || !detail::producer_ring::valid_capacity(header->ring_capacity) ||
+            segment.size() < segment_t::bytes(header->ring_count, header->ring_capacity)) {
+            detail::remote_producer& producer = remote_[index];
+            if (producer.refused_generation != generation) {
+                producer.refused_generation = generation;
+                log(LogLevel::L_WARN, "SlickLogger: producer pid {} was built with another slick-logger layout "
+                                      "(version or SLICK_LOGGER_TAG_SIZE); its thread rings are not read",
+                    slot.pid.load(std::memory_order_relaxed));
+            }
+            return false;
+        }
+        const uint32_t count = header->ring_count;
+        auto views = std::make_unique<detail::ring_view[]>(count);
+        const uintptr_t delta = reinterpret_cast<uintptr_t>(header) - static_cast<uintptr_t>(header->producer_base);
+        for (uint32_t r = 0; r < count; ++r) {
+            detail::producer_ring* const ring = header->ring(r);
+            if (ring->layout_version() != detail::producer_ring::kLayoutVersion ||
+                ring->capacity() != header->ring_capacity) {
+                return false;
+            }
+            detail::ring_view& view = views[r];
+            view.ring = ring;
+            view.reader = detail::ring_reader(*ring);
+            view.remote = true;
+            view.delta = delta;
+            if (skip_backlog) {
+                view.reader.skip();
+            }
+        }
+        detail::remote_producer& producer = remote_[index];
+        producer.segment = std::move(segment);
+        producer.views = std::move(views);
+        producer.ring_count = count;
+        producer.generation = generation;
+        producer.pid = slot.pid.load(std::memory_order_relaxed);
+        producer.start_time = slot.start_time.load(std::memory_order_relaxed);
+        producer.closing = state == slot_t::kClosing;
+        producer.owns_slot = true;
+        for (uint32_t r = 0; r < count; ++r) {
+            remote_views_.push_back(&producer.views[r]);
+        }
+        return true;
+    } catch (const std::exception&) {
+        return false; // not there yet, or already gone
+    }
+}
+
+inline void Logger::detach_producer(uint32_t index, bool free_slot) {
+    using slot_t = detail::shm_registry_slot;
+    detail::remote_producer& producer = remote_[index];
+    const detail::ring_view* const first = producer.views.get();
+    const detail::ring_view* const last = first + producer.ring_count;
+    std::erase_if(remote_views_, [&](const detail::ring_view* view) {
+        return std::less_equal<>{}(first, view) && std::less<>{}(view, last);
+    });
+    if (shared_gate_view_ && std::less_equal<>{}(first, shared_gate_view_) && std::less<>{}(shared_gate_view_, last)) {
+        shared_gate_view_ = nullptr; // drained by now, so the spill waiting on it may go
+        shared_gate_ring_ = nullptr;
+    }
+    for (uint32_t r = 0; r < producer.ring_count; ++r) {
+        const detail::producer_ring* const ring = producer.views[r].ring;
+        remote_retired_produced_ += ring->records();
+        remote_retired_consumed_ += ring->released_records();
+        remote_retired_dropped_ += ring->drops();
+    }
+    producer.last_generation = producer.generation;
+    producer.last_pid = producer.pid;
+    producer.views.reset();
+    producer.segment = slick::shm::shared_memory{};
+    producer.ring_count = 0;
+    producer.closing = false;
+    if (free_slot) {
+        const uint64_t closing = slot_t::make(slot_t::kClosing, producer.last_generation);
+        const uint64_t active = slot_t::make(slot_t::kActive, producer.last_generation);
+        free_registry_slot(index, slot_t::state_of(registry_->slots[index].control.load(std::memory_order_acquire)) ==
+                                          slot_t::kClosing ? closing : active);
+    }
+}
+
+inline void Logger::free_registry_slot(uint32_t index, uint64_t control) noexcept {
+    using slot_t = detail::shm_registry_slot;
+    // Unlinked before the slot is free, so no new owner's segment can be unlinked.
+    slick::shm::shared_memory::remove(producer_segment_name(index).c_str());
+    registry_->slots[index].control.compare_exchange_strong(
+        control, slot_t::make(slot_t::kFree, slot_t::generation_of(control)), std::memory_order_acq_rel,
+        std::memory_order_relaxed);
+}
+
+inline bool Logger::producer_drained(const detail::remote_producer& producer) noexcept {
+    for (uint32_t r = 0; r < producer.ring_count; ++r) {
+        const detail::ring_view& view = producer.views[r];
+        if (view.head || view.ring->written() != view.ring->released()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline void Logger::publish_remote_totals() noexcept {
+    uint64_t produced = remote_retired_produced_;
+    uint64_t consumed = remote_retired_consumed_;
+    uint64_t dropped = remote_retired_dropped_;
+    for (const detail::ring_view* view : remote_views_) {
+        consumed += view->ring->released_records(); // before records(), so depth never reads negative
+        produced += view->ring->records();
+        dropped += view->ring->drops();
+    }
+    remote_consumed_.store(consumed, std::memory_order_relaxed);
+    remote_produced_.store(produced, std::memory_order_relaxed);
+    remote_dropped_.store(dropped, std::memory_order_relaxed);
+    remote_rings_.store(static_cast<uint32_t>(remote_views_.size()), std::memory_order_relaxed);
+}
+
+inline bool Logger::remote_flush_ready(uint64_t generation) {
+    if (remote_flush_generation_ != generation) {
+        // A new request: everything published by now has to be taken first.
+        remote_flush_generation_ = generation;
+        remote_flush_targets_.clear();
+        for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
+            const detail::remote_producer& producer = remote_[i];
+            for (uint32_t r = 0; producer.views && r < producer.ring_count; ++r) {
+                const detail::producer_ring* const ring = producer.views[r].ring;
+                const uint64_t written = ring->written();
+                if (written != ring->released()) {
+                    remote_flush_targets_.push_back({i, producer.generation, r, written});
+                }
+            }
+        }
+    }
+    std::erase_if(remote_flush_targets_, [this](const flush_target& target) {
+        const detail::remote_producer& producer = remote_[target.producer];
+        return !producer.views || producer.generation != target.generation ||
+               producer.views[target.ring].ring->released() >= target.written;
+    });
+    return remote_flush_targets_.empty();
+}
+
+inline bool Logger::collector_attached() const noexcept {
+    const uint64_t lease = registry_ ? registry_->collector.load(std::memory_order_acquire) : 0;
+    return lease != 0 && detail::collector_lease_running(lease);
+}
+
+inline void Logger::wait_for_collector(std::chrono::milliseconds limit) {
+    if (!collector_attached()) {
+        return; // a later collector replays what is still here
+    }
+    // What this process has logged so far: its rings, and its share of the shared
+    // queue (threads past its rings, spills), which the collector's cursor covers.
+    const uint64_t queue_target = log_queue_->initial_reading_index();
+    std::vector<std::pair<const detail::producer_ring*, uint64_t>> targets;
+    const uint32_t used = ring_slots_used_.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < used; ++i) {
+        const detail::producer_ring* const ring = ring_slots_[i].ring.load(std::memory_order_acquire);
+        if (ring && ring->written() != ring->released()) {
+            targets.emplace_back(ring, ring->written());
+        }
+    }
+    const auto start = std::chrono::steady_clock::now();
+    auto next_check = start + std::chrono::milliseconds(50);
+    wait_until_ready([&] {
+        bool done = registry_->read_index.load(std::memory_order_acquire) >= queue_target;
+        for (const auto& [ring, target] : targets) {
+            done = done && ring->released() >= target;
+        }
+        if (done) {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (limit.count() > 0 && now - start >= limit) {
+            return true;
+        }
+        if (now >= next_check) {
+            next_check = now + std::chrono::milliseconds(50);
+            return !collector_attached(); // it went away mid-wait
+        }
+        return false;
+    });
 }
 
 inline void Logger::add_sink(std::shared_ptr<ISink> sink) {
@@ -7241,10 +8115,20 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
 
     const uint64_t timestamp = current_timestamp();
 
-    // Never set alongside kEntryOffsets: thread rings are Local mode only.
-    if (thread_rings_ &&
-        log_to_thread_ring(sink_index, level, file_name, line, copy_file_name, timestamp, format, args...)) {
-        return;
+    // One test for Local mode's rings; a SharedProducer's are checked only past it.
+    if (local_rings_) {
+        if (log_to_thread_ring<false>(sink_index, level, file_name, line, copy_file_name, timestamp, format, args...)) {
+            return;
+        }
+    } else if (ring_in_shm_) [[unlikely]] {
+        // Packed into one tuple, scalars by value. Passed one by one, or by
+        // reference, they add a few ns per call to the Local path above, even
+        // when this branch is not taken.
+        const std::tuple<FormatT&&, detail::cold_arg_t<Args>...> packed(
+            std::forward<FormatT>(format), static_cast<detail::cold_arg_t<Args>>(args)...);
+        if (log_to_shared_thread_ring(sink_index, level, file_name, line, copy_file_name, timestamp, packed)) {
+            return;
+        }
     }
 
     // In shared-memory mode every string reference must be a ring index, because
@@ -7357,7 +8241,19 @@ SLICK_LOGGER_FORCE_INLINE void Logger::write_entry(LogEntry& entry, StringRef fo
     }
 }
 
-template<typename FormatT, typename... Args>
+template<typename Packed>
+SLICK_LOGGER_NOINLINE bool Logger::log_to_shared_thread_ring(int sink_index, LogLevel level, const char* file_name,
+                                                             uint32_t line, bool copy_file_name, uint64_t timestamp,
+                                                             const Packed& packed) {
+    return std::apply(
+        [&](auto&& format, auto&&... args) {
+            return log_to_thread_ring<true>(sink_index, level, file_name, line, copy_file_name, timestamp, format,
+                                            args...);
+        },
+        packed);
+}
+
+template<bool InShm, typename FormatT, typename... Args>
 SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLevel level, const char* file_name,
                                                           uint32_t line, bool copy_file_name, uint64_t timestamp,
                                                           FormatT&& format, Args&&... args) {
@@ -7410,6 +8306,9 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
         size_t arg_idx = 0;
         ((string_bytes += stage_argument(staged_args[arg_idx++], args)), ...);
     }
+    if constexpr (InShm) {
+        string_bytes += stage_static_strings(file, copy_file, format_ref, flags);
+    }
 
     // Copies every staged string to @p out, or to the shared string ring when null.
     const auto place_strings = [&](char* out) {
@@ -7426,8 +8325,8 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
         if (copy_file) {
             place(file, true);
         }
-        if constexpr (!IS_STRING_LITERAL(format)) {
-            place(format_ref, true);
+        if constexpr (InShm || !IS_STRING_LITERAL(format)) {
+            place(format_ref, true); // in shared memory, a literal was staged too
         }
         if constexpr (is_single_format_args_v<Args...>) {
             for (uint8_t i = 0; i < arg_count; ++i) {
@@ -7462,7 +8361,7 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
     detail::thread_ring_slot& slot = *tls.slot;
     if (slot.spill_end != 0 && --slot.spill_check == 0) [[unlikely]] {
         slot.spill_check = kSpillCheckCalls;
-        if (read_index_.load(std::memory_order_acquire) >= slot.spill_end) {
+        if (spill_progress_->load(std::memory_order_acquire) >= slot.spill_end) {
             slot.spill_end = 0;
         }
     }
@@ -7473,7 +8372,7 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
             return true;
         }
         // Full, or an earlier spill is still pending: the shared queue instead of a
-        // drop, with pid set to slot + 1 (Local mode stamps 0 otherwise). The writer
+        // drop, flagged kEntrySpilled with the ring's route in pid. The writer
         // holds such an entry until the ring has been drained to where the spill
         // began, so the thread's order holds. Written here rather than in a helper,
         // so the arguments are still a compile-time size, as on the shared path.
@@ -7482,10 +8381,11 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
             begin_spill(slot, *ring);
         }
         uint64_t index;
-        LogEntry& entry = reserve_shared_entry(index, false);
-        write_entry(entry, format_ref, timestamp, file, tls.thread_id, line, sink_index, level, flags, arg_count,
-                    staged_args.data(), arg_bytes);
-        entry.pid = static_cast<uint32_t>(tls.slot - ring_slots_.get()) + 1;
+        LogEntry& entry = reserve_shared_entry(index, InShm);
+        write_entry(entry, format_ref, timestamp, file, tls.thread_id, line, sink_index, level,
+                    static_cast<uint8_t>(flags | entry_flags_ | kEntrySpilled), arg_count, staged_args.data(),
+                    arg_bytes);
+        entry.pid = spill_route_base_ | (static_cast<uint32_t>(tls.slot - ring_slots_.get()) << spill_route_shift_);
         log_queue_->publish(index);
         slot.spill_end = index + 1;
         wake_writer();
@@ -7503,10 +8403,10 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
 }
 
 SLICK_LOGGER_NOINLINE inline void Logger::begin_spill(detail::thread_ring_slot& slot,
-                                                     const detail::producer_ring& ring) noexcept {
+                                                     detail::producer_ring& ring) noexcept {
     // Published before the entry that refers to it. A previous spill's entries
     // are all out by now, so nothing still waits on the old value.
-    slot.spill_gate.store(ring.written(), std::memory_order_release);
+    ring.set_spill_gate(ring.written());
     slot.spill_check = kSpillCheckCalls;
 }
 
@@ -7653,6 +8553,22 @@ inline size_t Logger::stage_argument(LogArgument& arg, T&& value) {
         arg.type = ArgType::STRING_DYNAMIC; // std::string, std::string_view
         return stage_bytes(arg.value.dynamic_str, value.data(), value.size(), true);
     }
+}
+
+inline size_t Logger::stage_static_strings(StringRef& file, bool& copy_file, StringRef& format,
+                                           uint8_t& flags) noexcept {
+    // A static file name or literal format lives in this module's image, which
+    // the collector process cannot read: copy them too.
+    size_t bytes = 0;
+    if ((flags & kEntryHasSourceLocation) && !copy_file) {
+        bytes += stage_bytes(file, file.ptr, std::strlen(file.ptr), true);
+        copy_file = true;
+    }
+    if (flags & kEntryStaticFormat) {
+        bytes += stage_bytes(format, format.ptr, format.length, true);
+        flags = static_cast<uint8_t>(flags & ~kEntryStaticFormat);
+    }
+    return bytes;
 }
 
 inline size_t Logger::stage_bytes(StringRef& ref, const char* data, size_t size, bool terminate) noexcept {
@@ -7850,8 +8766,9 @@ inline StringRef Logger::store_bytes_in_queue(const char* data, size_t size, boo
     StringRef ref;
     if (use_offsets) {
         // Shared memory: hand out the ring index, which every attached process
-        // can resolve against its own mapping.
-        ref.offset = start_index;
+        // can resolve against its own mapping. Tagged, so a ring record holding
+        // it among addresses still tells it apart; the ring masks the tag off.
+        ref.offset = start_index | detail::kStringRingRef;
     }
     else {
         ref.ptr = dest;
@@ -7914,6 +8831,11 @@ inline uint8_t Logger::unpack_format_args(LogArgument* out, std::format_args fa,
 
 inline void Logger::shutdown(bool clear_sinks) {
     if (running_.load(std::memory_order_relaxed)) {
+        if (registry_slot_ != kNoSlot) {
+            // On Windows a producer's segment goes away with its last handle, so
+            // give an attached collector a moment to take what is in it.
+            wait_for_collector(std::chrono::milliseconds(1000));
+        }
         running_.store(false, std::memory_order_release);
         // The writer thread may be parked. atomic::wait has no timeout, so it
         // only ever resumes because the token changed. Without this the join
@@ -7965,10 +8887,24 @@ inline void Logger::shutdown(bool clear_sinks) {
     // Generation first: a thread-exit hook or a ring cached by a thread checks it
     // before touching the registry. The rings go with their slots.
     ring_generation_.fetch_add(1, std::memory_order_acq_rel);
+    if (ring_in_shm_ && ring_slots_) {
+        for (uint32_t i = 0; i < max_thread_rings_; ++i) {
+            ring_slots_[i].ring.store(nullptr, std::memory_order_relaxed); // the segment's, not the slot's
+        }
+    }
     ring_views_.reset();
     ring_slots_.reset();
     ring_slots_used_.store(0, std::memory_order_relaxed);
     thread_rings_ = false;
+    local_rings_ = false;
+    close_registry();
+    ring_in_shm_ = false;
+    spill_route_base_ = 0;
+    spill_route_shift_ = 0;
+    spill_progress_ = &read_index_;
+    shared_head_ready_ = false;
+    shared_gate_ring_ = nullptr;
+    shared_gate_view_ = nullptr;
 
     mode_ = QueueMode::Local;
     entry_flags_ = 0;
@@ -7988,9 +8924,13 @@ inline void Logger::flush() {
         return;
     }
     if (mode_ == QueueMode::SharedProducer) {
-        // No local writer thread: entries are published to the shared queue the
-        // moment log() returns, and only the collector process can observe them
-        // reaching a sink. Publishing is all this process can guarantee.
+        // No local writer thread, and only the collector process can observe an
+        // entry reaching a sink. With thread rings, wait for it to take
+        // everything logged so far; without, publishing is all this process
+        // can guarantee.
+        if (registry_slot_ != kNoSlot) {
+            wait_for_collector(std::chrono::milliseconds(0));
+        }
         return;
     }
     // Snapshot the write cursor: any entry reserved before this point has
@@ -8081,7 +9021,7 @@ inline void Logger::reset() {
 }
 
 inline Logger::DrainResult Logger::drain_pending() {
-    if (thread_rings_) {
+    if (thread_rings_ || registry_) { // a collector reads producer processes' rings
         return drain_sources();
     }
     // read() takes a plain uint64_t& and advances it in place. The atomic must
@@ -8145,19 +9085,17 @@ inline Logger::DrainResult Logger::drain_sources() {
     // and whatever queued behind it waits with it. That ring skips its poll
     // interval meanwhile, or the writer would idle on records it is not reading.
     const bool shared_open = shared_head_ready_ && shared_head_released();
-    const uint32_t urgent = shared_head_ready_ && !shared_open ? shared_head_.pid - 1 : kNoSlot;
+    const detail::ring_view* const urgent = shared_head_ready_ && !shared_open ? shared_gate_view_ : nullptr;
 
     // Each source is in order, so the oldest entry overall is the oldest head.
-    const uint32_t used = ring_slots_used_.load(std::memory_order_acquire);
     int64_t now_ns = INT64_MIN; // read once, only if a ring needs it
     bool polling = false;
     detail::ring_view* best = nullptr;
     uint64_t best_ts = UINT64_MAX;
     uint64_t next_ts = UINT64_MAX; // the oldest head of every other source
-    for (uint32_t i = 0; i < used; ++i) {
-        detail::ring_view& view = ring_views_[i];
-        if (!view.head && !load_ring_head(i, view, i == urgent, now_ns, polling)) {
-            continue;
+    const auto consider = [&](detail::ring_view& view, detail::thread_ring_slot* slot) {
+        if (!view.head && !load_ring_head(view, slot, &view == urgent, now_ns, polling)) {
+            return;
         }
         if (view.head_timestamp < best_ts) {
             next_ts = best_ts;
@@ -8166,6 +9104,13 @@ inline Logger::DrainResult Logger::drain_sources() {
         } else if (view.head_timestamp < next_ts) {
             next_ts = view.head_timestamp;
         }
+    };
+    const uint32_t used = ring_slots_used_.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < used; ++i) {
+        consider(ring_views_[i], &ring_slots_[i]);
+    }
+    for (detail::ring_view* view : remote_views_) {
+        consider(*view, nullptr);
     }
 
     if (shared_open) {
@@ -8173,7 +9118,6 @@ inline Logger::DrainResult Logger::drain_sources() {
             // A run from the shared queue, until a ring's head is older. Under
             // overload most entries are spills, so this is most of the work.
             do {
-                shared_head_.pid = 0; // a spill's ring tag; Local mode stamps 0
                 dispatch_entry(shared_head_);
                 shared_head_ready_ = false;
                 read_index_.store(shared_cursor_, std::memory_order_relaxed);
@@ -8181,13 +9125,20 @@ inline Logger::DrainResult Logger::drain_sources() {
                     advance_string_frontier();
                 }
             } while (load_shared_head() && shared_head_released() && shared_head_.timestamp < best_ts);
+            publish_shared_cursor();
             return DrainResult::Wrote;
         }
         const uint64_t shared_ts = shared_head_.timestamp; // LogEntry is packed: no reference to its fields
         next_ts = std::min(next_ts, shared_ts);
     }
+    // A hole a dead producer process left in the shared queue blocks it, never the rings.
+    const DrainResult stall = !shared_head_ready_ && mode_ == QueueMode::SharedCollector ? shared_queue_stall()
+                                                                                         : DrainResult::Idle;
+    if (stall == DrainResult::SkippedStalled) {
+        return stall;
+    }
     if (!best) {
-        return polling ? DrainResult::Polling : DrainResult::Idle;
+        return polling ? DrainResult::Polling : stall;
     }
     // A run from the oldest ring, until another source's head is older.
     do {
@@ -8200,16 +9151,87 @@ inline bool Logger::load_shared_head() {
     auto [entry_ptr, count] = log_queue_->read(shared_cursor_);
     if (entry_ptr && count) {
         shared_head_ready_ = snapshot_entry(shared_head_, *entry_ptr, shared_cursor_ - 1);
+        stalled_since_ = {};
+        shared_gate_ring_ = nullptr;
+        shared_gate_view_ = nullptr;
+        if (shared_head_ready_ && (shared_head_.flags & kEntrySpilled)) {
+            resolve_spill();
+        }
     }
     // Stored only when it moved: spilling threads poll this line.
     if (!shared_head_ready_ && read_index_.load(std::memory_order_relaxed) != shared_cursor_) {
         read_index_.store(shared_cursor_, std::memory_order_relaxed);
+        publish_shared_cursor();
     }
     return shared_head_ready_;
 }
 
-inline bool Logger::load_ring_head(uint32_t index, detail::ring_view& view, bool urgent, int64_t& now_ns,
-                                   bool& polling) {
+inline void Logger::resolve_spill() {
+    shared_head_.flags = static_cast<uint8_t>(shared_head_.flags & ~kEntrySpilled);
+    const uint32_t route = shared_head_.pid;
+    shared_head_.pid = 0;
+    if (!remote_) {
+        // Local mode: the route is the thread's slot.
+        if (ring_slots_ && route < max_thread_rings_) {
+            shared_gate_ring_ = ring_slots_[route].ring.load(std::memory_order_acquire);
+            shared_gate_view_ = &ring_views_[route];
+        }
+        return;
+    }
+    // A producer process: registry slot, ring, generation.
+    using slot_t = detail::shm_registry_slot;
+    const uint32_t index = route & (detail::shm_registry::kSlotCount - 1);
+    const uint32_t ring = (route >> detail::kRouteSlotBits) & (detail::shm_ring_segment::kMaxRings - 1);
+    const uint32_t generation = route >> (detail::kRouteSlotBits + detail::kRouteRingBits);
+    const auto matches = [generation](uint32_t g) { return (g & detail::kRouteGenerationMask) == generation; };
+    detail::remote_producer& producer = remote_[index];
+    if (!producer.views) {
+        // Spilled before the collector's next look: its ring records come first.
+        attach_producer(index, false);
+    }
+    if (producer.views && matches(producer.generation)) {
+        shared_head_.pid = producer.pid;
+        if (ring < producer.ring_count) {
+            shared_gate_view_ = &producer.views[ring];
+            shared_gate_ring_ = shared_gate_view_->ring;
+        }
+    } else if (producer.last_generation != UINT32_MAX && matches(producer.last_generation)) {
+        shared_head_.pid = producer.last_pid; // detached, so drained: nothing to wait for
+    } else if (const detail::shm_registry_slot& slot = registry_->slots[index];
+               matches(slot_t::generation_of(slot.control.load(std::memory_order_acquire)))) {
+        shared_head_.pid = slot.pid.load(std::memory_order_relaxed);
+    }
+}
+
+inline Logger::DrainResult Logger::shared_queue_stall() {
+    // A producer process killed between reserve() and publish() leaves a hole that
+    // read() will never return, stalling every entry behind it.
+    if (stalled_entry_timeout_ms_ == 0 || log_queue_->initial_reading_index() <= shared_cursor_) {
+        stalled_since_ = {};
+        return DrainResult::Idle;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (stalled_since_ == std::chrono::steady_clock::time_point{}) {
+        stalled_since_ = now;
+        return DrainResult::WaitingOnStall;
+    }
+    if (now - stalled_since_ < std::chrono::milliseconds(stalled_entry_timeout_ms_)) {
+        return DrainResult::WaitingOnStall;
+    }
+    read_index_.store(++shared_cursor_, std::memory_order_relaxed); // abandon the stalled slot
+    publish_shared_cursor();
+    stalled_since_ = {};
+    return DrainResult::SkippedStalled;
+}
+
+inline void Logger::publish_shared_cursor() noexcept {
+    if (registry_) {
+        registry_->read_index.store(read_index_.load(std::memory_order_relaxed), std::memory_order_release);
+    }
+}
+
+inline bool Logger::load_ring_head(detail::ring_view& view, detail::thread_ring_slot* slot, bool urgent,
+                                   int64_t& now_ns, bool& polling) {
     using slot_t = detail::thread_ring_slot;
     const auto now = [&now_ns]() noexcept {
         if (now_ns == INT64_MIN) {
@@ -8219,15 +9241,17 @@ inline bool Logger::load_ring_head(uint32_t index, detail::ring_view& view, bool
         return now_ns;
     };
     if (!view.ring || view.reader.batch_done()) {
-        slot_t& slot = ring_slots_[index];
-        const uint32_t state = slot.state.load(std::memory_order_acquire);
-        if (state < slot_t::kActive) {
-            return false; // free, or a thread is still setting it up
-        }
-        if (!view.ring) {
-            // A slot keeps its ring for every later thread, so this happens once.
-            view.ring = slot.ring.load(std::memory_order_acquire);
-            view.reader = detail::ring_reader(*view.ring);
+        uint32_t state = slot_t::kActive; // a producer process's rings are set up when attached
+        if (slot) {
+            state = slot->state.load(std::memory_order_acquire);
+            if (state < slot_t::kActive) {
+                return false; // free, or a thread is still setting it up
+            }
+            if (!view.ring) {
+                // A slot keeps its ring for every later thread, so this happens once.
+                view.ring = slot->ring.load(std::memory_order_acquire);
+                view.reader = detail::ring_reader(*view.ring);
+            }
         }
         // Right after a non-empty batch the producer is likely still writing:
         // leave its lines alone for the poll interval, unless a spill waits on it.
@@ -8240,8 +9264,8 @@ inline bool Logger::load_ring_head(uint32_t index, detail::ring_view& view, bool
             if (state == slot_t::kOrphaned) {
                 // Drained: free it for the next thread, unless one already took it over.
                 uint32_t expected = slot_t::kOrphaned;
-                slot.state.compare_exchange_strong(expected, slot_t::kFree, std::memory_order_release,
-                                                   std::memory_order_relaxed);
+                slot->state.compare_exchange_strong(expected, slot_t::kFree, std::memory_order_release,
+                                                    std::memory_order_relaxed);
             }
             return false;
         }
@@ -8264,6 +9288,9 @@ inline void Logger::dispatch_ring_head(detail::ring_view& view) {
         LogEntry& copy = entry_scratch_;
         std::memcpy(static_cast<void*>(&copy), view.head, kHeader + arg_count * sizeof(LogArgument));
         copy.arg_count = arg_count;
+        if (view.remote) {
+            resolve_remote_record(copy, view);
+        }
         dispatch_entry(copy);
     }
     // Strings live in the record, so its space goes back only now.
@@ -8273,6 +9300,42 @@ inline void Logger::dispatch_ring_head(detail::ring_view& view) {
     if (!view.reader.batch_done()) {
         view.hold_next();
     }
+}
+
+inline void Logger::resolve_remote_record(LogEntry& entry, const detail::ring_view& view) const noexcept {
+    // The producer wrote addresses in its own mapping of the segment. Shifted into
+    // this one, each must still lie inside its record, or it is dropped unread.
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(view.head);
+    const uintptr_t end = begin + view.head_size;
+    const auto resolve = [&](StringRef& ref) noexcept {
+        if (ref.length == 0) {
+            ref.ptr = "";
+            return;
+        }
+        const uint64_t value = ref.offset;
+        if (value & detail::kStringRingRef) {
+            ref.ptr = (*string_queue_)[value]; // too big for the ring, so in the shared string ring
+            return;
+        }
+        const uintptr_t at = static_cast<uintptr_t>(value) + view.delta;
+        if (at < begin || at > end || end - at < ref.length) {
+            ref.ptr = "";
+            ref.length = 0;
+            return;
+        }
+        ref.ptr = reinterpret_cast<const char*>(at);
+    };
+    resolve(entry.format);
+    if (entry.flags & kEntryHasSourceLocation) {
+        resolve(entry.file);
+    }
+    for (uint8_t i = 0; i < entry.arg_count; ++i) {
+        LogArgument& arg = entry.args[i];
+        if (arg.type == ArgType::STRING_DYNAMIC || arg.type == ArgType::STRING_LITERAL || arg.type == ArgType::BLOB) {
+            resolve(arg.value.dynamic_str);
+        }
+    }
+    entry.flags = static_cast<uint8_t>(entry.flags & ~(kEntryOffsets | kEntryStaticFormat | kEntrySpilled));
 }
 
 inline bool Logger::thread_rings_pending() const noexcept {
@@ -8290,11 +9353,8 @@ inline bool Logger::thread_rings_pending() const noexcept {
 }
 
 inline bool Logger::shared_head_released() const noexcept {
-    if (shared_head_.pid == 0) {
-        return true; // not a spill
-    }
-    const detail::thread_ring_slot& slot = ring_slots_[shared_head_.pid - 1];
-    return slot.ring.load(std::memory_order_relaxed)->released() >= slot.spill_gate.load(std::memory_order_acquire);
+    // Not a spill, or its ring is gone: nothing to wait for.
+    return !shared_gate_ring_ || shared_gate_ring_->released() >= shared_gate_ring_->spill_gate();
 }
 
 inline Logger::ring_totals Logger::thread_ring_totals() const noexcept {
@@ -8307,6 +9367,13 @@ inline Logger::ring_totals Logger::thread_ring_totals() const noexcept {
             totals.dropped += ring->drops();
             ++totals.rings;
         }
+    }
+    if (registry_) {
+        // A collector's view of producer processes, refreshed by its writer.
+        totals.consumed += remote_consumed_.load(std::memory_order_relaxed);
+        totals.produced += remote_produced_.load(std::memory_order_relaxed);
+        totals.dropped += remote_dropped_.load(std::memory_order_relaxed);
+        totals.rings += remote_rings_.load(std::memory_order_relaxed);
     }
     return totals;
 }
@@ -8337,18 +9404,29 @@ inline void Logger::writer_thread_func() {
     // keeps polling for entries that cross a process boundary. mode_ is fixed
     // before this thread starts and does not change while it runs.
     const bool can_park = (mode_ == QueueMode::Local);
+    // A collector also watches the registry for producer processes. Under load it
+    // looks every kScanRuns runs, so the clock read stays off the per-run cost.
+    const bool collector = registry_ != nullptr;
+    constexpr uint32_t kScanRuns = 256;
+    uint32_t runs = 0;
 
     while (running_.load(std::memory_order_relaxed)) {
         // Read the request before flushing so a request arriving mid-flush is not
         // mistaken for one this flush already covered.
         const uint64_t flush_requested = flush_request_.load(std::memory_order_acquire);
-        if (flush_requested != flush_done_.load(std::memory_order_relaxed)) {
+        if (flush_requested != flush_done_.load(std::memory_order_relaxed) &&
+            (!collector || remote_flush_ready(flush_requested))) {
             flush_sinks();
             sinks_dirty = false;
             flush_done_.store(flush_requested, std::memory_order_release);
         }
 
-        switch (drain_pending()) {
+        const DrainResult result = drain_pending();
+        if (collector && (result != DrainResult::Wrote || ++runs == kScanRuns)) {
+            runs = 0;
+            poll_registry();
+        }
+        switch (result) {
         case DrainResult::Wrote:
             sinks_dirty = true;
             idle_yields = 0;
@@ -8401,6 +9479,9 @@ inline void Logger::writer_thread_func() {
     // false and the entry could never be consumed.
     stalled_since_ = {};
     ring_poll_interval_ns_ = 0; // nothing left to protect: drain the rings straight through
+    if (collector) {
+        scan_registry(false); // producers that came or went since the last look
+    }
     while (true) {
         const DrainResult result = drain_pending();
         if (result == DrainResult::Idle) {
@@ -8409,6 +9490,9 @@ inline void Logger::writer_thread_func() {
         if (result == DrainResult::WaitingOnStall) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+    }
+    if (collector) {
+        scan_registry(false); // free the closing producers drained just now
     }
 
     // The writer thread owns the sinks, so this final flush is the last chance to

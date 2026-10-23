@@ -97,6 +97,9 @@ target_link_libraries(throughput_benchmark
     ${SPDLOG_LIBRARIES}
 )
 
+add_executable(multiprocess_benchmark multiprocess_benchmark.cpp)
+target_link_libraries(multiprocess_benchmark slick::logger Threads::Threads)
+
 add_executable(memory_benchmark memory_benchmark.cpp)
 target_link_libraries(memory_benchmark 
     slick::logger
@@ -109,8 +112,10 @@ if(MSVC)
     target_compile_options(latency_benchmark PRIVATE /O2 /DNDEBUG)
     target_compile_options(throughput_benchmark PRIVATE /O2 /DNDEBUG)
     target_compile_options(memory_benchmark PRIVATE /O2 /DNDEBUG)
+    target_compile_options(multiprocess_benchmark PRIVATE /O2 /DNDEBUG)
 else()
     target_compile_options(latency_benchmark PRIVATE -O3 -march=native -DNDEBUG)
     target_compile_options(throughput_benchmark PRIVATE -O3 -march=native -DNDEBUG)
     target_compile_options(memory_benchmark PRIVATE -O3 -march=native -DNDEBUG)
+    target_compile_options(multiprocess_benchmark PRIVATE -O3 -march=native -DNDEBUG)
 endif()

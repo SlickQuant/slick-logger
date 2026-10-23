@@ -223,6 +223,39 @@ is under contention: at 64 every string starts on its own cache line, so
 producers no longer false-share the lines they copy into. Going past 64 gains
 nothing more and only makes short strings more wasteful.
 
+### Multi-process
+
+`multiprocess_benchmark`: N producer processes with T threads each log into one
+collector whose sink only counts, so this measures the transport, not
+formatting. Rounds alternate between thread rings in shared memory (the
+default) and the shared queue (`thread_rings = false`, the only path in earlier
+releases). A producer's figure is the time its threads spend inside their log
+calls. Same machine, Release, 2026-10-23.
+
+Bursts that fit in a ring: each thread logs 10 bursts of 5,000
+`"bench {} {} {}"` entries (an int, a double, a 12-byte string), 20 ms apart.
+
+| Producers x threads | Thread rings, min / median | Shared queue, min / median | Delivered, worst round (rings / shared) |
+|---|---:|---:|---:|
+| 4 x 2 | 185 / 200 ns | 807 / 955 ns | 100% / 83.6% |
+| 8 x 1 | 181 / 260 ns | 915 / 959 ns | 100% / 100% |
+| 2 x 4 | 189 / 208 ns | 977 / 1,029 ns | 100% / 100% |
+
+One burst of 50,000 entries per thread, 4 x 2, which the collector cannot keep up with:
+
+| | ns/call, min / median | Delivered, worst round |
+|---|---:|---:|
+| Thread rings | 1,294 / 1,485 ns | 83.6% |
+| Shared queue | 1,266 / 1,305 ns | 50.9% |
+
+On the shared queue every call of every process contends on the same
+reservation counters. A ring is the thread's own, so a call is 4 to 5x
+cheaper. Once a ring is full, its calls spill to the shared queue and pay the
+same contention, which is why sustained overload comes out even. The rings
+still hold the start of the burst, so less is lost. With nine processes on 16
+hardware threads the scheduler moves these numbers a lot: medians shifted by up
+to 2x between runs, minimums much less.
+
 ## Building
 
 The benchmarks are gated on **two** conditions — the option, and a Release
@@ -353,6 +386,18 @@ SlickLogger sustained load results:
   Peak memory: 5 MB
   Final memory: 5 MB
 ```
+
+### multiprocess_benchmark
+
+The multi-process A/B above. It starts copies of itself as the producers.
+
+```
+multiprocess_benchmark [--producers N] [--threads T] [--burst B] [--bursts K]
+                       [--pause-ms P] [--rounds R]
+```
+
+The defaults are 4, 2, 5,000, 10, 20 and 5. `--bursts 1 --burst 50000
+--pause-ms 0` is the overload case.
 
 `simple_benchmark` and `quick_benchmark` also build. They are scratch programs
 for checking that a build works, not measurement tools — they report a single

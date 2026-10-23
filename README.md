@@ -22,6 +22,8 @@ Recorded on an AMD Ryzen 9 5900HX, Windows 11, MSVC 19.44 `/O2`, with log output
 | Three-argument message, 8 producers | **7.48 million calls/sec** |
 | Mean call latency, literal message | **153 ns** |
 
+With 4 producer processes of 2 threads each, a call took about 185-200 ns with thread rings in shared memory, against 800-950 ns through the shared queue ([multi-process results](benchmarks/README.md#multi-process)).
+
 Call timings exclude the writer's drain and flush time. A burst a thread ring cannot hold spills to the shared rings, which can overwrite their oldest entries when overloaded. The benchmark README has the [full results, comparisons, and methodology](benchmarks/README.md#results), plus [build/run instructions](benchmarks/README.md#building) for reproducing the numbers on your own hardware.
 
 ## Navigation
@@ -48,7 +50,7 @@ Call timings exclude the writer's drain and flush time. A burst a thread ring ca
 - **Direct Sink Logging**: Messages can go to one named sink, or a sink reference, instead of being broadcast
 - **Binary Payloads**: Raw byte payloads, written to a file verbatim by `BinarySink`, with the encoding left entirely to you
 - **Shared-Library Redirection**: Plugin or strategy libraries can route their logs into the host application's logger
-- **Multi-Process Logging**: Several processes can log into one shared-memory queue drained by a single collector process
+- **Multi-Process Logging**: Several processes log through shared memory, each thread into a ring of its own, and one collector process drains them all
 - **Runtime Statistics**: An optional background thread samples throughput, queue fullness and drop counts, and writes them to a CSV
 - **Queue Tuning**: Build-time switches count lost entries and control the CAS backoff producers use under contention
 - **Header-Only**: so there is nothing to link
@@ -655,10 +657,11 @@ int main() {
 - `max_thread_rings`: rings before further threads use the shared rings, default `64`
 - `writer_poll_interval_us`: how long the writer leaves a busy ring alone after draining it, default `5`
 - `thread_ring_full`: what a call does when its thread's ring is full, `RingFullPolicy::Spill` (default) or `RingFullPolicy::Drop`
+- `shared_thread_rings`, `shared_thread_ring_size`: a `SharedProducer`'s rings, default 16 of 1 MB (see [Multi-Process Logging](#thread-rings-across-processes))
 
 #### Per-thread rings
 
-By default (Local mode only), each logging thread writes to a ring of its own. A call reserves one record there, with its strings inline, and publishes it with one store. No two producers touch the same cache line. In an A/B test on an 8-core laptop, a call was about 20% cheaper than with the shared rings from one thread, and 3 to 4.5x cheaper from 4 to 8 threads.
+By default each logging thread writes to a ring of its own, in Local mode and in a `SharedProducer` (see [Thread rings across processes](#thread-rings-across-processes)). A call reserves one record there, with its strings inline, and publishes it with one store. No two producers touch the same cache line. In an A/B test on an 8-core laptop, a call was about 20% cheaper than with the shared rings from one thread, and 3 to 4.5x cheaper from 4 to 8 threads.
 
 What changes compared to the shared rings (`thread_rings = false`, the default in earlier releases):
 
@@ -1130,14 +1133,15 @@ extern "C" void strategy_shutdown() {
 
 ### Multi-Process Logging (Shared Memory)
 
-Several processes can log into a single shared-memory ring buffer that one collector
-process drains. The collector owns the sinks and the writer thread; producer processes
-own neither and only enqueue entries.
+Several processes can log into shared memory that one collector process drains. The
+collector owns the sinks and the writer thread; producer processes own neither and only
+enqueue entries. Each producer thread writes to a ring in its process's own segment, and
+a shared ring takes their overflow (see [below](#thread-rings-across-processes)).
 
 ```
-Process A ──┐
-Process B ──┼──► [Shared Memory Ring] ──► [Collector Process] ──┬──► ConsoleSink
-Process C ──┘                                                   └──► FileSink
+Process A: [ring] [ring] ──┐
+Process B: [ring] [ring] ──┼──► [Collector: merge by timestamp] ──┬──► ConsoleSink
+overflow ──► [Shared Ring] ┘                                      └──► FileSink
 ```
 
 #### Collector
@@ -1177,6 +1181,8 @@ Logger::instance().shutdown();
 ```
 
 All the usual `LOG_*` macros, sinks-by-index, log levels, and source locations work unchanged.
+In a producer with thread rings, `flush()` returns once the collector has taken everything
+logged before it, or at once when no collector is attached.
 
 #### Output
 
@@ -1225,6 +1231,36 @@ It stops on Ctrl-C (`SIGINT`/`SIGTERM`), draining whatever is still queued befor
 | `process_tag` | `""` | Optional short process label, truncated to 15 characters |
 | `collect_backlog` | `true` | Collector replays entries already resident in the ring when it attaches |
 | `stalled_entry_timeout_ms` | `5000` | Collector abandons an unpublished slot after this long; `0` disables |
+| `thread_rings` | `true` | Producer threads log into rings in shared memory |
+| `shared_thread_rings` | `16` | Rings in a producer's segment, at most 64; further threads use the shared ring |
+| `shared_thread_ring_size` | 1 MB | Bytes per ring, rounded up to a power of two |
+
+#### Thread rings across processes
+
+A producer claims a slot in the registry, `<name>.reg`, and creates its own segment,
+`<name>.r<slot>`, holding `shared_thread_rings` rings. They work as in
+[Local mode](#per-thread-rings): no two threads share a cache line, a record carries its
+strings, and a full ring spills to the shared ring without breaking the thread's order. The
+collector finds producers through the registry and merges every ring and the shared ring by
+timestamp.
+
+- Each producer reserves `shared_thread_rings × shared_thread_ring_size` (16 MB by default).
+  Pages are faulted in as the rings fill; `prepare_thread()` faults in the calling thread's
+  ring up front.
+- A record becomes visible with one store, so a producer that dies never leaves a torn one.
+  The collector checks producers by pid and process start time, so a pid the OS reuses is
+  never mistaken for a live producer. Once a dead or closed producer's rings are drained, the
+  collector unlinks its segment and frees its slot.
+- A restarted collector reads only what the previous one had not taken, or nothing with
+  `collect_backlog = false`.
+- The registry has 64 slots. A producer that finds it full logs through the shared ring and
+  warns once.
+- One collector per segment: a second one fails in `init()` while the first is running.
+- On Windows a segment disappears with its last handle. A producer's `shutdown()` waits up
+  to a second for the collector to take what is left, and the records of a producer killed
+  before any collector attached are lost.
+- A burst bigger than a ring spills to the shared ring, which is contended and lossy. Size
+  `shared_thread_ring_size` for your bursts.
 
 #### Startup order and sizing
 
@@ -1247,9 +1283,10 @@ instance already wrote.
   or older, which cannot read that layout. `SLICK_LOGGER_ENABLE_THREAD_ID`,
   `SLICK_LOGGER_ENABLE_LOSS_DETECTION` and `SLICK_LOGGER_ENABLE_CPU_RELAX` do not need to
   match, because none of them changes the segment layout.
-- The ring is lossy, with no backpressure. A collector that cannot keep up loses entries, and
-  string data can be overwritten before the entry referencing it is read. Size
-  `string_buffer_size` generously for high-volume logging, and build the collector with
+- The shared ring is lossy, with no backpressure. A collector that cannot keep up loses
+  entries, and string data can be overwritten before the entry referencing it is read. Thread
+  rings never overwrite; a full one spills into the shared ring. Size `string_buffer_size`
+  generously for high-volume logging, and build the collector with
   `SLICK_LOGGER_ENABLE_LOSS_DETECTION` to count lost entries.
 - Pointer arguments (`ArgType::PTR`) print addresses that only mean something inside the
   producing process.
@@ -1258,23 +1295,26 @@ instance already wrote.
   same epoch.
 - Sink indices used by `log_to_sink()` and `ISink::log()` are resolved against the
   *collector's* sink list.
-- A producer killed between reserve and publish leaves a hole. The collector abandons it
-  after `stalled_entry_timeout_ms` and logs a warning instead of stalling forever.
-- Every attached collector sees every entry, because the ring is a broadcast. Running two
-  collectors on one segment writes each entry twice.
+- A producer killed between reserve and publish leaves a hole in the shared ring. The
+  collector abandons it after `stalled_entry_timeout_ms` and logs a warning instead of
+  stalling forever.
 - `process_tag` is truncated to 15 bytes, on a UTF-8 character boundary so a multi-byte tag is
   never cut mid-sequence.
-- POSIX cleanup is manual, by design. slick-logger never `shm_unlink`s a segment. Unlinking
+- POSIX cleanup is manual, by design. slick-logger never `shm_unlink`s the queue, string or
+  registry segment. Unlinking
   frees the *name* while existing mappings stay valid, so whichever process did it would strand
   everyone still attached: newcomers would create a fresh segment under the same name and their
   entries would silently vanish. Any process may create the segment, so none of them can know
   it is the last user. Segments therefore persist in `/dev/shm/` until removed:
 
   ```bash
-  rm -f /dev/shm/myapp_log /dev/shm/myapp_log_str
+  rm -f /dev/shm/myapp_log /dev/shm/myapp_log_str /dev/shm/myapp_log.reg /dev/shm/myapp_log.r*
   ```
 
-  Remove them only when no participant is running. A stale segment from a previous run is
+  A producer's ring segment is the exception. Once that producer has closed or died and the
+  collector has drained its rings, the collector unlinks the segment.
+
+  Remove the segments only when no participant is running. A stale segment from a previous run is
   attached to rather than recreated, and `collect_backlog` will replay whatever entries it still
   holds, so clear it between unrelated runs or set `collect_backlog = false`. On Windows the
   kernel refcounts the mapping and removes it once the last handle closes, so there is nothing
@@ -1434,14 +1474,14 @@ In Local mode each logging thread writes to a single-producer ring of its own (s
 
 With `thread_rings = false` every thread logs through the shared ring, as in earlier releases.
 
-The same structure spans processes when the queue is placed in shared memory: the producers
-become other processes and the writer thread lives in the collector. See
-[Multi-Process Logging](#multi-process-logging-shared-memory).
+The same structure spans processes in shared memory: each producer process keeps its threads'
+rings in a segment of its own, all of them use the one shared ring, and the writer thread
+lives in the collector. See [Multi-Process Logging](#multi-process-logging-shared-memory).
 
 ```
-[Process A] ──┐
-[Process B] ──┼──► [Shared Memory Queue] ──► [Collector: Writer Thread] ──► Sinks
-[Process C] ──┘
+[Process A rings] ──┐
+[Process B rings] ──┼──► [Collector: Writer Thread, merge by timestamp] ──► Sinks
+[Shared Ring]     ──┘
 ```
 
 ### Design Principles
@@ -1450,7 +1490,7 @@ become other processes and the writer thread lives in the collector. See
 2. Caller threads never block on I/O, and with per-thread rings they share no cache line with each other.
 3. Custom sinks are easy to add.
 4. Queue and sink management are thread-safe, built on atomic operations.
-5. In shared-memory mode, string references are ring indices instead of addresses, so an entry stays valid in any attached process.
+5. In shared-memory mode, string references in the shared queue are ring indices instead of addresses, so an entry stays valid in any attached process. A thread ring record addresses its inline strings in its producer's mapping; the collector shifts those addresses into its own and checks each against the record's bounds.
 
 ### Deferred Formatting
 
