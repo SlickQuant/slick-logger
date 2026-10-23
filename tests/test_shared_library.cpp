@@ -1,5 +1,6 @@
 #include <slick/logger.hpp>
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -270,6 +271,96 @@ TEST_F(SharedLibraryTest, RingClaimedByAnUnloadedPluginIsNotShared) {
             ASSERT_EQ(seqs[i], i) << "thread " << thread;
         }
     }
+}
+
+namespace {
+
+// Holds the writer inside write() on the "gate" entry until release_ is set.
+class GateSink : public CaptureSink {
+public:
+    void write(const slick::logger::LogEntry& entry) override {
+        CaptureSink::write(entry);
+        count_.store(lines_.size(), std::memory_order_release);
+        if (lines_.back() == "gate") {
+            reached_.store(true, std::memory_order_release);
+            while (!release_.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        }
+    }
+    std::atomic<size_t> count_{0};
+    std::atomic<bool> reached_{false};
+    std::atomic<bool> release_{false};
+};
+
+size_t index_of(const std::vector<std::string>& lines, const std::string& text) {
+    return static_cast<size_t>(std::find(lines.begin(), lines.end(), text) - lines.begin());
+}
+
+} // namespace
+
+// A thread that found every ring taken stays on the shared rings for the run,
+// from its plugins too. A plugin that took a ring freed meanwhile split the
+// thread's entries over two sources, and on equal timestamps its first entry
+// overtook the host's earlier one.
+TEST_F(SharedLibraryTest, PluginKeepsAThreadOnTheSharedRings) {
+    auto& logger = slick::logger::Logger::instance();
+    auto sink = std::make_shared<GateSink>();
+    auto config = ring_config(sink);
+    config.max_thread_rings = 2;
+    logger.set_timestamper([]() noexcept { return uint64_t{1}; }); // every entry ties
+
+    std::atomic<int> step{0};
+    const auto wait_step = [&step](int target) {
+        while (step.load(std::memory_order_acquire) < target) {
+            std::this_thread::yield();
+        }
+    };
+    std::thread holder([&] { // ring 0, from init()
+        logger.init(config);
+        step.store(1, std::memory_order_release);
+        wait_step(2);
+        LOG_INFO("gate");
+        wait_step(4);
+    });
+    wait_step(1);
+    std::thread second([&] { // ring 1, free again once it exits
+        LOG_INFO("second");
+        wait_step(3);
+    });
+    while (sink->count_.load(std::memory_order_acquire) < 2) { // the banner and "second": ring 1 is drained
+        std::this_thread::yield();
+    }
+    step.store(2, std::memory_order_release);
+    while (!sink->reached_.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    LOG_INFO("host first"); // both rings taken: the shared rings
+    step.store(3, std::memory_order_release);
+    second.join();
+
+    LibHandle handle = open_lib(PLUGIN_LIB_PATH);
+    ASSERT_NE(handle, LibHandle{}) << "Failed to load plugin: " << lib_error();
+    auto plugin_init     = reinterpret_cast<PluginInitFn>    (get_sym(handle, "plugin_init"));
+    auto plugin_shutdown = reinterpret_cast<PluginShutdownFn>(get_sym(handle, "plugin_shutdown"));
+    ASSERT_TRUE(plugin_init && plugin_shutdown);
+    plugin_init(&logger); // the plugin's first entry on this thread, with ring 1 free
+    LOG_INFO("host after");
+    plugin_shutdown();
+    sink->release_.store(true, std::memory_order_release);
+    logger.flush();
+    close_lib(handle);
+    step.store(4, std::memory_order_release);
+    holder.join();
+    logger.set_timestamper(nullptr);
+
+    const auto& lines = sink->lines_;
+    const size_t first = index_of(lines, "host first");
+    const size_t plugin = index_of(lines, "plugin_init: logger connected to host");
+    const size_t after = index_of(lines, "host after");
+    ASSERT_LT(after, lines.size());
+    EXPECT_LT(first, plugin) << "the plugin's entry overtook the host's earlier one";
+    EXPECT_LT(plugin, after);
 }
 
 int main(int argc, char** argv) {

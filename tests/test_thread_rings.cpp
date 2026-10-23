@@ -611,3 +611,25 @@ TEST_F(ThreadRingTest, ReinitStartsFreshRings) {
         logger.shutdown();
     }
 }
+
+// UINT64_MAX is a timestamp like any other: the merge must not take it for "no
+// source", or such entries are never written, flush() never returns and
+// shutdown() drops them.
+TEST_F(ThreadRingTest, EntriesStampedWithTheLargestTimestampAreWritten) {
+    auto& logger = Logger::instance();
+    auto sink = std::make_shared<CaptureSink>();
+    LogConfig config = ring_config(sink);
+    config.max_thread_rings = 1; // this thread's ring, and a thread on the shared ring
+    logger.init(config);
+    logger.set_timestamper([]() noexcept { return UINT64_MAX; });
+    LOG_INFO("t0 0 ring");
+    std::thread other([] { LOG_INFO("t1 0 shared"); });
+    other.join();
+    LOG_INFO("t0 1 ring");
+    ASSERT_TRUE(eventually([&] { return sink->count_.load(std::memory_order_acquire) == 4; }))
+        << "entries stamped UINT64_MAX were never written";
+    logger.flush();
+    const auto by_thread = sequences(sink->lines_);
+    EXPECT_EQ(by_thread.at(0), (std::vector<int>{0, 1}));
+    EXPECT_EQ(by_thread.at(1), (std::vector<int>{0}));
+}

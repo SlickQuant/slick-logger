@@ -668,7 +668,7 @@ What changes compared to the shared rings (`thread_rings = false`, the default i
 - By default a full ring spills to the shared rings until the writer catches up, so a burst slows calls down but loses nothing, unless the shared rings fill too and overwrite their oldest entries. With `thread_ring_full = RingFullPolicy::Drop`, a full ring drops the newest entry instead and counts it in `LogStats::entry_loss_count`, which keeps calls cheap under overload.
 - One thread's entries stay in order, spilled ones included. Across threads the writer merges them by timestamp, so an entry stamped just before its thread was preempted can land slightly late.
 - Each logging thread gets a ring of `thread_ring_size` on its first log call. Its pages are faulted in as it fills, so a thread that logs little uses little memory, but those first-lap faults land on log calls. Call `Logger::instance().prepare_thread()` at thread start to claim the ring and fault it all in up front; it works at any log level, and `init()` does it for its own thread. A thread that exits hands its ring to the next new thread.
-- A ring belongs to an OS thread. A thread that logs from the host and from a plugin sharing its logger (`Logger::set_instance()`) uses one ring from both, so its entries stay in order.
+- A ring belongs to an OS thread. A thread that logs from the host and from a plugin sharing its logger (`Logger::set_instance()`) uses one ring from both, or the shared rings from both, so its entries stay in order.
 - Threads past `max_thread_rings` use the shared rings for the whole run. So do the strings of a record bigger than half a ring, though the record itself stays in the thread's ring.
 - String-ring statistics describe the shared string ring only.
 

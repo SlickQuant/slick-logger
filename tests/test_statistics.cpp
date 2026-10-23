@@ -1278,3 +1278,141 @@ TEST_F(SlickLoggerStatsTest, StringsLongerThanOneUnitRoundTrip) {
     const std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     EXPECT_NE(contents.find("before=" + before + " big=" + big + " after=" + after), std::string::npos);
 }
+
+// Regression: a record too big for its thread ring keeps its strings in the
+// shared string ring while it waits in the thread ring. Occupancy looked only at
+// the shared entry queue, found it empty, and reported those bytes free.
+TEST_F(SlickLoggerStatsTest, StringOccupancyCountsStringsOfRecordsStillInTheirRing) {
+    auto sink = std::make_shared<StallingSink>();
+    LogConfig config;
+    config.sinks.push_back(sink);
+    config.thread_rings = true;
+    config.thread_ring_size = 4096;
+    config.enable_stats = true;
+    config.stats_interval_ms = 30;
+    config.stats_sample_interval_ms = 2;
+    Logger::instance().init(config);
+    ASSERT_TRUE(wait_for_writes(sink, 1)); // the banner
+
+    sink->set_stall_ms(500);
+    LOG_INFO("holds the writer");
+    ASSERT_TRUE(wait_for_writes(sink, 2));
+    // Over half the 4 KB ring: the record stays there, its string goes to the string ring.
+    LOG_INFO("big {}", std::string(3000, 'x'));
+
+    const LogStats stats = wait_for_sample_after(now_ns(), 300);
+    sink->set_stall_ms(0);
+    ASSERT_GE(stats.string_bytes_written, 3000u);
+    EXPECT_TRUE(stats.string_pct_valid);
+    EXPECT_EQ(stats.string_inflight_bytes, stats.string_bytes_written)
+        << "the pending record's string was reported free";
+}
+
+namespace {
+
+thread_local uint64_t t_stamp = 0; // each test thread picks its own entries' timestamps
+
+/// Holds the writer inside write() on "pre", then on "hold", until each is opened.
+class MessageGateSink : public ISink {
+public:
+    MessageGateSink() : ISink("message-gate") {}
+    void write(const LogEntry& entry) override {
+        const std::string message(formatted_message(entry).first);
+        for (gate& g : gates_) {
+            if (message == g.text) {
+                g.reached.store(true, std::memory_order_release);
+                while (!g.open.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            }
+        }
+    }
+    void flush() override {}
+    struct gate {
+        const char* text;
+        std::atomic<bool> reached{false};
+        std::atomic<bool> open{false};
+    };
+    gate gates_[2] = {{"pre"}, {"hold"}};
+};
+
+bool wait_until(const std::atomic<bool>& flag) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!flag.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+} // namespace
+
+// Regression: the writer moved the string frontier on as soon as the shared entry
+// queue was drained, past the strings of a record still waiting in its thread
+// ring. "pre" goes through the shared queue (past the ring cap); once it is
+// written the queue is empty while the pending record, stamped later, waits in
+// its ring and the writer holds on "hold", from a third ring.
+void expect_frontier_waits_for(void (*log_pending)(), uint64_t min_bytes) {
+    auto sink = std::make_shared<MessageGateSink>();
+    LogConfig config;
+    config.sinks.push_back(sink);
+    config.thread_rings = true;
+    config.thread_ring_size = 4096;
+    config.max_thread_rings = 3; // this thread's, the pending record's and "hold"'s
+    config.enable_stats = true;
+    config.stats_interval_ms = 30;
+    config.stats_sample_interval_ms = 2;
+    Logger::instance().init(config);
+    Logger::instance().set_timestamper([]() noexcept { return t_stamp; });
+
+    std::atomic<int> claimed{0};
+    std::atomic<int> go{0};
+    const auto on_a_ring = [&](int turn, uint64_t stamp, void (*log)()) {
+        return std::thread([&, turn, stamp, log] {
+            Logger::instance().prepare_thread();
+            claimed.fetch_add(1, std::memory_order_acq_rel);
+            while (go.load(std::memory_order_acquire) < turn) {
+                std::this_thread::yield();
+            }
+            t_stamp = stamp;
+            log();
+        });
+    };
+    std::thread pending = on_a_ring(1, 3000, log_pending);
+    std::thread hold = on_a_ring(2, 2000, [] { LOG_INFO("hold"); });
+    while (claimed.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
+    }
+    std::thread([] { t_stamp = 500; LOG_INFO("pre"); }).join(); // every ring taken: the shared queue
+    const bool pre_reached = wait_until(sink->gates_[0].reached);
+    go.store(1, std::memory_order_release);
+    pending.join();
+    go.store(2, std::memory_order_release);
+    hold.join();
+    sink->gates_[0].open.store(true, std::memory_order_release);
+    const bool hold_reached = wait_until(sink->gates_[1].reached); // "pre" is done, the pending record waits
+
+    // Samples carry this test's clock, so wait out a few reports instead.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const LogStats stats = Logger::instance().stats_snapshot();
+    sink->gates_[1].open.store(true, std::memory_order_release);
+    ASSERT_TRUE(pre_reached && hold_reached);
+    ASSERT_GE(stats.string_bytes_written, min_bytes);
+    EXPECT_EQ(stats.string_inflight_bytes, stats.string_bytes_written)
+        << "the frontier passed strings a pending ring record still holds";
+}
+
+TEST_F(SlickLoggerStatsTest, StringFrontierWaitsForRingRecordsHoldingStrings) {
+    // Over half the ring: the record stays there, its string goes to the string ring.
+    expect_frontier_waits_for([] { LOG_INFO("big {}", std::string(3000, 'x')); }, 3000);
+}
+
+TEST_F(SlickLoggerStatsTest, StringFrontierWaitsForRingRecordsWithConvertedArguments) {
+    // Converted by std::to_string, which stores the text in the string ring.
+    expect_frontier_waits_for([] {
+        std::atomic<int> value{42};
+        LOG_INFO("converted {}", value);
+    }, 2);
+}

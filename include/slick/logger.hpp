@@ -2875,6 +2875,13 @@ public:
     /// Records counted by drop().
     uint64_t drops() const noexcept { return drops_.load(std::memory_order_relaxed); }
 
+    /// Where every record holding strings in the shared string ring ends, at most:
+    /// the producer raises it before it reserves them. For statistics.
+    void mark_shared_strings(uint64_t end) noexcept { shared_strings_end_.store(end, std::memory_order_relaxed); }
+    uint64_t shared_strings_end() const noexcept { return shared_strings_end_.load(std::memory_order_relaxed); }
+    /// Where the record try_reserve() handed out ends. Producer side.
+    uint64_t reserved_end() const noexcept { return pending_end_; }
+
     /// While the producer spills elsewhere, the position its spilled records wait
     /// for: the reader holds them until it has released the ring up to here. Kept
     /// in the ring so a reader in another process sees it too.
@@ -2907,10 +2914,11 @@ private:
         return value;
     }
 
-    // Read-only once built.
+    // Read-only once built, but for the rare shared-strings mark.
     alignas(64) uint32_t layout_version_ = kLayoutVersion;
     uint64_t capacity_;
     uint64_t mask_;
+    std::atomic<uint64_t> shared_strings_end_{0};
     // Producer-owned: the reader only ever loads write_pos_.
     alignas(64) std::atomic<uint64_t> write_pos_{0};
     uint64_t pending_end_ = 0;      // what publish() moves write_pos_ to
@@ -3050,6 +3058,25 @@ inline constexpr bool is_copied_string_v = [] {
            (std::is_array_v<B> && std::is_same_v<std::remove_cv_t<std::remove_extent_t<B>>, char>);
 }();
 
+/// Whether enqueue_argument() stores a T through std::to_string in the shared
+/// string ring, so a thread ring's record refers to it there.
+template<typename T>
+inline constexpr bool uses_string_ring_v = [] {
+    using D = std::decay_t<T>;
+    if constexpr (is_copied_string_v<T> || std::is_same_v<D, bool> || std::is_same_v<D, char> ||
+                  std::is_same_v<D, unsigned char> || std::is_same_v<D, wchar_t> ||
+                  std::is_floating_point_v<D> || std::is_pointer_v<D> ||
+                  std::is_same_v<D, std::chrono::system_clock::time_point>) {
+        return false;
+    } else if constexpr (std::is_enum_v<D>) {
+        return uses_string_ring_v<std::underlying_type_t<D>>;
+    } else if constexpr (std::is_integral_v<D>) {
+        return sizeof(D) > sizeof(int64_t);
+    } else {
+        return true; // a class converting to an arithmetic type, e.g. std::atomic<int>
+    }
+}();
+
 /**
  * @brief A thread's claim on a producer_ring in Logger's registry (thread rings)
  *
@@ -3102,6 +3129,13 @@ struct thread_ring_tls {
     uint32_t thread_id;
 };
 inline constinit thread_local thread_ring_tls tls_thread_ring{nullptr, 0, nullptr, nullptr, 0, 0};
+
+/// A thread that found every ring taken. Kept by the Logger rather than in one
+/// module's thread_local, so all of the thread's modules stay on the shared rings.
+struct ring_fallback {
+    uint64_t owner; // os_thread_id()
+    ring_fallback* next;
+};
 
 /// Marks the thread's slot orphaned when the thread exits, or when the module
 /// that claimed it unloads first. Only the claiming module sets it up, when it
@@ -3223,6 +3257,8 @@ struct shm_registry {
     uint32_t slot_count;
     /// Bumped when a producer claims or closes a slot, so the collector looks at once.
     std::atomic<uint64_t> changes;
+    /// Bumped when a producer raises a ring's shared-strings mark; see Logger::string_epoch_.
+    std::atomic<uint64_t> string_epoch;
     /// The attached collector, (pid << 32) | low 32 bits of its start time, or 0.
     alignas(64) std::atomic<uint64_t> collector;
     /// The collector's read cursor on the shared entry queue: a spilling producer
@@ -3993,6 +4029,8 @@ private:
     /// often: the writer's cursor it reads is on a line the writer keeps moving.
     static constexpr uint32_t kSpillCheckCalls = 64;
     uint32_t claim_thread_ring(uint64_t generation) noexcept;
+    /// Record that thread @p owner logs through the shared rings this run. Returns kNoSlot.
+    uint32_t fall_back(uint64_t owner) noexcept;
     /// Finish a claim of slot @p index: exit hook, new ticket, Active.
     uint32_t activate_slot(uint32_t index, uint64_t generation, bool new_owner) noexcept;
     /// Whether @p tls still describes this thread's ring in this run.
@@ -4002,6 +4040,9 @@ private:
     LogEntry& reserve_shared_entry(uint64_t& index, bool use_offsets) noexcept;
     /// Open a spill: what the thread's spilled entries wait for in its ring.
     void begin_spill(detail::thread_ring_slot& slot, detail::producer_ring& ring) noexcept;
+    /// Before a ring record's strings go to the shared string ring: raise the
+    /// ring's mark to @p end and tell the writer. See advance_string_frontier().
+    void mark_shared_strings(detail::producer_ring& ring, uint64_t end) noexcept;
     /// Merge step over every ring and the shared queue: dispatch a run of entries
     /// from the source with the oldest head.
     DrainResult drain_sources();
@@ -4239,6 +4280,9 @@ private:
     uint32_t spill_route_base_ = 0;
     uint32_t spill_route_shift_ = 0;
     const std::atomic<uint64_t>* spill_progress_ = &read_index_;
+    /// Bumped by a producer that raised a ring's shared-strings mark (rare): the
+    /// writer scans the marks only when it moved. In shared memory, the registry's.
+    std::atomic<uint64_t>* string_epoch_ = &ring_string_epoch_;
     std::unordered_map<std::string_view, int> sinkname_index_map_;
     /// Layout handed to sinks that have none of their own, including sinks added
     /// after set_pattern(). Null means the built-in layout. The one compiled copy
@@ -4278,6 +4322,8 @@ private:
     uint32_t max_thread_rings_ = 0;
     int64_t ring_poll_interval_ns_ = 0;
     std::unique_ptr<detail::thread_ring_slot[]> ring_slots_;
+    /// Threads sent to the shared rings this run; push-only, freed by shutdown().
+    std::atomic<detail::ring_fallback*> ring_fallbacks_{nullptr};
     /// Slots ever claimed this run; the writer, flush() and statistics scan these.
     alignas(64) std::atomic<uint32_t> ring_slots_used_{0};
     // Writer thread only. On lines of their own: the writer stores these for every
@@ -4318,6 +4364,7 @@ private:
     std::atomic<uint64_t> remote_consumed_{0};
     std::atomic<uint64_t> remote_dropped_{0};
     std::atomic<uint32_t> remote_rings_{0};
+    alignas(64) std::atomic<uint64_t> ring_string_epoch_{0};
     // Counters of producers already detached, so the totals never go backwards.
     uint64_t remote_retired_produced_ = 0;
     uint64_t remote_retired_consumed_ = 0;
@@ -4368,7 +4415,8 @@ private:
     // snapshot too, so the whole string ring below it is provably free, whatever
     // order the producers published in. Between promotions the frontier simply
     // stays put, which is the conservative direction: the span grows and the
-    // gauge reads fuller, which is what a stalled writer means.
+    // gauge reads fuller, which is what a stalled writer means. A thread ring's
+    // record with strings here announces them first; see advance_string_frontier().
     //
     // The one window it cannot see is a producer that has reserved string bytes
     // and not yet taken a slot: it is invisible in both orderings, so a producer
@@ -4381,6 +4429,10 @@ private:
     uint64_t stats_gen_entry_ = 0;
     uint64_t stats_gen_string_ = 0;
     bool stats_gen_open_ = false;
+    // Thread rings with records holding strings in the string ring, and how far
+    // each must drain; rescanned when *string_epoch_ moves past stats_seen_epoch_.
+    std::vector<std::pair<const detail::producer_ring*, uint64_t>> stats_gen_rings_;
+    uint64_t stats_seen_epoch_ = UINT64_MAX;
     // Configuration, written by init() before the thread starts and read only by
     // it afterwards, so it needs no synchronization.
     bool stats_enabled_ = false;
@@ -6779,11 +6831,48 @@ inline void Logger::advance_string_frontier() noexcept {
         // between, and the promotion would free bytes still in use.
         stats_gen_entry_ = log_queue_->initial_reading_index();
         stats_gen_string_ = string_queue_->initial_reading_index();
+        // A thread ring's record holding strings below S raised its ring's mark
+        // and the epoch before reserving them, then fenced: with S read, this
+        // fence makes both visible. The marks are scanned only when it moved.
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const uint64_t epoch = string_epoch_->load(std::memory_order_relaxed);
+        if (epoch != stats_seen_epoch_) {
+            try {
+                stats_gen_rings_.clear();
+                const auto note = [this](const detail::producer_ring* ring) {
+                    const uint64_t end = ring->shared_strings_end();
+                    if (end > ring->released()) {
+                        stats_gen_rings_.emplace_back(ring, end);
+                    }
+                };
+                const uint32_t used = ring_slots_used_.load(std::memory_order_acquire);
+                for (uint32_t i = 0; i < used; ++i) {
+                    if (const detail::producer_ring* ring = ring_slots_[i].ring.load(std::memory_order_acquire)) {
+                        note(ring);
+                    }
+                }
+                for (const detail::ring_view* view : remote_views_) {
+                    note(view->ring);
+                }
+                stats_seen_epoch_ = epoch;
+            } catch (...) {
+                return; // no snapshot, so the frontier holds: the safe direction
+            }
+        }
         stats_gen_open_ = true;
+    }
+    // Noted rings the writer has drained past their mark. A producer may lower a
+    // mark it overestimated, so the current one counts too.
+    while (!stats_gen_rings_.empty()) {
+        const auto& [ring, end] = stats_gen_rings_.back();
+        if (ring->released() < std::min(end, ring->shared_strings_end())) {
+            break;
+        }
+        stats_gen_rings_.pop_back();
     }
     // read_index_ is this thread's own cursor, already advanced past the batch
     // just written, so a relaxed load sees the writer's own last store.
-    if (read_index_.load(std::memory_order_relaxed) >= stats_gen_entry_) {
+    if (stats_gen_rings_.empty() && read_index_.load(std::memory_order_relaxed) >= stats_gen_entry_) {
         stats_string_frontier_.store(stats_gen_string_, std::memory_order_relaxed);
         stats_gen_open_ = false;
     }
@@ -6803,8 +6892,14 @@ inline bool Logger::sample_string_occupancy(LogStats& stats) noexcept {
     // cursor would race the fill and yield torn data, so the statistics thread
     // never touches the entry ring directly. The writer thread instead publishes
     // the frontier below, taken from an entry read() has already handed it.
-    if (read_index_.load(std::memory_order_relaxed) >=
-        log_queue_->initial_reading_index()) {
+    const auto rings_drained = [this]() noexcept {
+        if (!thread_rings_ && !registry_) {
+            return true;
+        }
+        const ring_totals rings = thread_ring_totals(); // a ring record may hold strings here too
+        return rings.consumed >= rings.produced;
+    };
+    if (read_index_.load(std::memory_order_relaxed) >= log_queue_->initial_reading_index() && rings_drained()) {
         // Nothing outstanding, so nothing in the string ring is still needed.
         // This zero is a measurement, and reporting it as invalid would hide the
         // healthiest state the pipeline has.
@@ -7165,6 +7260,7 @@ inline std::string Logger::create_thread_rings() {
                          << (detail::kRouteSlotBits + detail::kRouteRingBits)) | registry_slot_;
     spill_route_shift_ = detail::kRouteSlotBits;
     spill_progress_ = &registry_->read_index;
+    string_epoch_ = &registry_->string_epoch;
     return {};
 }
 
@@ -7201,6 +7297,8 @@ inline void Logger::start() {
         stats_gen_entry_ = 0;
         stats_gen_string_ = 0;
         stats_gen_open_ = false;
+        stats_gen_rings_.clear();
+        stats_seen_epoch_ = UINT64_MAX;
         uint64_t string_floor =
             string_queue_ ? string_queue_->initial_reading_index() : 0;
         if (mode_ == QueueMode::SharedCollector && collect_backlog_) {
@@ -7515,6 +7613,7 @@ inline void Logger::setup_registry(const LogConfig& config) {
         }
     }
     collector_lease_ = lease;
+    string_epoch_ = &registry_->string_epoch;
     registry_backlog_ = config.collect_backlog;
     remote_ = std::make_unique<detail::remote_producer[]>(registry_t::kSlotCount);
     remote_views_.clear();
@@ -7775,6 +7874,15 @@ inline void Logger::detach_producer(uint32_t index, bool free_slot) {
         shared_gate_view_ = nullptr; // drained by now, so the spill waiting on it may go
         shared_gate_ring_ = nullptr;
     }
+    // The statistics snapshot must not hold on to rings about to be unmapped.
+    std::erase_if(stats_gen_rings_, [&](const auto& noted) {
+        for (uint32_t r = 0; r < producer.ring_count; ++r) {
+            if (noted.first == producer.views[r].ring) {
+                return true;
+            }
+        }
+        return false;
+    });
     for (uint32_t r = 0; r < producer.ring_count; ++r) {
         const detail::producer_ring* const ring = producer.views[r].ring;
         remote_retired_produced_ += ring->records();
@@ -8294,6 +8402,12 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
     }
     constexpr size_t kMaxArgCount = is_single_format_args_v<Args...> ? SLICK_LOGGER_MAX_ARGS : sizeof...(Args);
     static_assert(kMaxArgCount <= SLICK_LOGGER_MAX_ARGS, "Too many log arguments");
+    // Converted by std::to_string into the shared string ring while staging, before
+    // the record has a place: mark as far as it could end, and lower it once placed.
+    constexpr bool kArgsUseStringRing = !is_single_format_args_v<Args...> && (detail::uses_string_ring_v<Args> || ...);
+    if constexpr (kArgsUseStringRing) {
+        mark_shared_strings(*ring, ring->written() + ring->capacity());
+    }
     std::array<LogArgument, kMaxArgCount> staged_args;
     uint8_t arg_count = 0;
     if constexpr (is_single_format_args_v<Args...>) {
@@ -8369,6 +8483,9 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
     if (!record) [[unlikely]] {
         if (ring_full_drops_) {
             ring->drop(); // counted in LogStats::entry_loss_count
+            if constexpr (kArgsUseStringRing) {
+                ring->mark_shared_strings(ring->written());
+            }
             return true;
         }
         // Full, or an earlier spill is still pending: the shared queue instead of a
@@ -8388,18 +8505,35 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
         entry.pid = spill_route_base_ | (static_cast<uint32_t>(tls.slot - ring_slots_.get()) << spill_route_shift_);
         log_queue_->publish(index);
         slot.spill_end = index + 1;
+        if constexpr (kArgsUseStringRing) {
+            ring->mark_shared_strings(ring->written());
+        }
         wake_writer();
         return true;
+    }
+    if (!inline_strings) [[unlikely]] {
+        mark_shared_strings(*ring, ring->reserved_end());
     }
     place_strings(inline_strings ? reinterpret_cast<char*>(record) + offsetof(LogEntry, args) + arg_bytes : nullptr);
     write_entry(*reinterpret_cast<LogEntry*>(record), format_ref, timestamp, file, tls.thread_id, line, sink_index,
                 level, flags, arg_count, staged_args.data(), arg_bytes);
     ring->publish();
+    if constexpr (kArgsUseStringRing) {
+        ring->mark_shared_strings(ring->written()); // the record's own end, now it has one
+    }
     if (ring_fence_) {
         std::atomic_thread_fence(std::memory_order_seq_cst); // see detail::writer_barrier_available()
     }
     wake_writer();
     return true;
+}
+
+SLICK_LOGGER_NOINLINE inline void Logger::mark_shared_strings(detail::producer_ring& ring, uint64_t end) noexcept {
+    ring.mark_shared_strings(end);
+    string_epoch_->fetch_add(1, std::memory_order_relaxed);
+    // Before the string ring reservation that follows; pairs with the fence in
+    // advance_string_frontier().
+    std::atomic_thread_fence(std::memory_order_release);
 }
 
 SLICK_LOGGER_NOINLINE inline void Logger::begin_spill(detail::thread_ring_slot& slot,
@@ -8445,7 +8579,8 @@ SLICK_LOGGER_NOINLINE inline detail::producer_ring* Logger::attach_thread_ring(d
     const uint32_t thread_id = 0;
 #endif
     // No ring when the registry is full: the thread then stays on the shared path
-    // for the rest of the run, so its entries never split across two sources.
+    // for the rest of the run, from every module, so its entries never split
+    // across two sources.
     const uint32_t index = claim_thread_ring(generation);
     detail::thread_ring_slot* const slot = index == kNoSlot ? nullptr : &ring_slots_[index];
     detail::producer_ring* const ring = slot ? slot->ring.load(std::memory_order_relaxed) : nullptr;
@@ -8478,6 +8613,14 @@ inline uint32_t Logger::claim_thread_ring(uint64_t generation) noexcept {
             return activate_slot(i, generation, false); // spills still pending stay ordered
         }
     }
+    // Sent to the shared rings already, maybe from another module: a ring now would
+    // put this thread's entries in two sources, where they can come out reordered.
+    for (const detail::ring_fallback* node = ring_fallbacks_.load(std::memory_order_acquire); node;
+         node = node->next) {
+        if (node->owner == me) {
+            return kNoSlot;
+        }
+    }
     for (uint32_t i = 0; i < max_thread_rings_; ++i) {
         uint32_t expected = slots[i].state.load(std::memory_order_acquire);
         if (expected == slot_t::kOrphaned) {
@@ -8502,7 +8645,7 @@ inline uint32_t Logger::claim_thread_ring(uint64_t generation) noexcept {
                                     std::memory_order_release);
             } catch (...) {
                 slots[i].state.store(slot_t::kFree, std::memory_order_release);
-                return kNoSlot;
+                return fall_back(me);
             }
         }
         slots[i].owner.store(me, std::memory_order_relaxed);
@@ -8511,6 +8654,17 @@ inline uint32_t Logger::claim_thread_ring(uint64_t generation) noexcept {
                                                                     std::memory_order_relaxed)) {
         }
         return activate_slot(i, generation, true);
+    }
+    return fall_back(me);
+}
+
+inline uint32_t Logger::fall_back(uint64_t owner) noexcept {
+    // Once per thread per run. A thread that later reuses the id inherits the
+    // decision, which costs it speed, never order.
+    if (auto* node = new (std::nothrow) detail::ring_fallback{owner, ring_fallbacks_.load(std::memory_order_relaxed)}) {
+        while (!ring_fallbacks_.compare_exchange_weak(node->next, node, std::memory_order_release,
+                                                      std::memory_order_relaxed)) {
+        }
     }
     return kNoSlot;
 }
@@ -8895,6 +9049,11 @@ inline void Logger::shutdown(bool clear_sinks) {
     ring_views_.reset();
     ring_slots_.reset();
     ring_slots_used_.store(0, std::memory_order_relaxed);
+    for (detail::ring_fallback* node = ring_fallbacks_.exchange(nullptr, std::memory_order_acq_rel); node;) {
+        detail::ring_fallback* const next = node->next;
+        delete node;
+        node = next;
+    }
     thread_rings_ = false;
     local_rings_ = false;
     close_registry();
@@ -8902,6 +9061,7 @@ inline void Logger::shutdown(bool clear_sinks) {
     spill_route_base_ = 0;
     spill_route_shift_ = 0;
     spill_progress_ = &read_index_;
+    string_epoch_ = &ring_string_epoch_;
     shared_head_ready_ = false;
     shared_gate_ring_ = nullptr;
     shared_gate_view_ = nullptr;
@@ -9010,6 +9170,8 @@ inline void Logger::reset() {
     stats_gen_entry_ = 0;
     stats_gen_string_ = 0;
     stats_gen_open_ = false;
+    stats_gen_rings_.clear();
+    stats_seen_epoch_ = UINT64_MAX;
     stats_depth_max_ = 0;
     stats_depth_sum_ = 0;
     stats_sample_count_ = 0;
@@ -9090,14 +9252,16 @@ inline Logger::DrainResult Logger::drain_sources() {
     // Each source is in order, so the oldest entry overall is the oldest head.
     int64_t now_ns = INT64_MIN; // read once, only if a ring needs it
     bool polling = false;
+    // A source is compared only once there is one: UINT64_MAX is a timestamp
+    // like any other, so it cannot double as "none yet".
     detail::ring_view* best = nullptr;
     uint64_t best_ts = UINT64_MAX;
-    uint64_t next_ts = UINT64_MAX; // the oldest head of every other source
+    uint64_t next_ts = UINT64_MAX; // the oldest head of every other source, if any
     const auto consider = [&](detail::ring_view& view, detail::thread_ring_slot* slot) {
         if (!view.head && !load_ring_head(view, slot, &view == urgent, now_ns, polling)) {
             return;
         }
-        if (view.head_timestamp < best_ts) {
+        if (!best || view.head_timestamp < best_ts) {
             next_ts = best_ts;
             best_ts = view.head_timestamp;
             best = &view;
@@ -9114,7 +9278,7 @@ inline Logger::DrainResult Logger::drain_sources() {
     }
 
     if (shared_open) {
-        if (shared_head_.timestamp < best_ts) {
+        if (!best || shared_head_.timestamp < best_ts) {
             // A run from the shared queue, until a ring's head is older. Under
             // overload most entries are spills, so this is most of the work.
             do {
@@ -9124,7 +9288,7 @@ inline Logger::DrainResult Logger::drain_sources() {
                 if (stats_enabled_ && string_queue_) {
                     advance_string_frontier();
                 }
-            } while (load_shared_head() && shared_head_released() && shared_head_.timestamp < best_ts);
+            } while (load_shared_head() && shared_head_released() && (!best || shared_head_.timestamp < best_ts));
             publish_shared_cursor();
             return DrainResult::Wrote;
         }
@@ -9144,6 +9308,12 @@ inline Logger::DrainResult Logger::drain_sources() {
     do {
         dispatch_ring_head(*best);
     } while (best->head && best->head_timestamp <= next_ts);
+    // A ring run moves the frontier only when a ring record has strings in the
+    // string ring: a mark is pending, or one was raised since the last look.
+    if (stats_enabled_ && string_queue_ &&
+        (!stats_gen_rings_.empty() || string_epoch_->load(std::memory_order_relaxed) != stats_seen_epoch_)) {
+        advance_string_frontier();
+    }
     return DrainResult::Wrote;
 }
 
