@@ -37,7 +37,7 @@ int usage() {
                  "                [--string-items-per-slot <n>] [--thread-rings 0|1]\n"
                  "                [--rings <n>] [--ring-size <bytes>] [--threads <n>]\n"
                  "                [--pace-us <n>] [--crash-after <n>] [--flush-first]\n"
-                 "                [--log <label> <n>] [--wait <file>] [--touch <file>]\n"
+                 "                [--log <label> <n>] [--big <bytes>] [--wait <file>] [--touch <file>]\n"
                  "                [--flush] [--crash] [--collector <log>]\n"
                  "                [--linger-ms <n>] [--ready-file <path>]\n");
     return 2;
@@ -72,7 +72,7 @@ bool wait_file(const std::string& path) {
 }
 
 struct step {
-    enum kind_t { Log, Wait, Touch, Flush, Crash } kind;
+    enum kind_t { Log, Big, Wait, Touch, Flush, Crash } kind;
     std::string text;
     int count = 0;
 };
@@ -143,6 +143,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--log" && i + 2 < argc) {
             steps.push_back({step::Log, argv[i + 1], std::atoi(argv[i + 2])});
             i += 2;
+        } else if (arg == "--big" && has_value) {
+            steps.push_back({step::Big, {}, std::atoi(argv[++i])}); // one entry with a string this long
         } else if (arg == "--wait" && has_value) {
             steps.push_back({step::Wait, argv[++i]});
         } else if (arg == "--touch" && has_value) {
@@ -200,6 +202,9 @@ int main(int argc, char** argv) {
             for (int i = 0; i < s.count; ++i) {
                 LOG_INFO("step {} {} from {}", s.text, i, tag);
             }
+            break;
+        case step::Big:
+            LOG_INFO("big {} from {}", std::string(static_cast<size_t>(s.count), 'x'), tag);
             break;
         case step::Wait:
             if (!wait_file(s.text)) {

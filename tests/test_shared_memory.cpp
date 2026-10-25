@@ -16,6 +16,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1148,4 +1149,244 @@ TEST_F(SharedMemoryTest, ProducerWithAnotherLayoutIsRefusedWithOneWarning) {
     Logger::instance().shutdown();
     EXPECT_EQ(count_lines_containing(read_lines(log_path), "another slick-logger layout"), 1u);
     slick::shm::shared_memory::remove(name.c_str());
+}
+
+namespace {
+
+/// Holds the writer inside write() on a message containing "step gate", then on
+/// one containing "step hold", until each is opened. Counts every write, and the
+/// "step hold" ones.
+class GateSink : public slick::logger::ISink {
+public:
+    GateSink() : ISink("gate") {}
+    void write(const slick::logger::LogEntry& entry) override {
+        const std::string message(formatted_message(entry).first);
+        writes_.fetch_add(1, std::memory_order_release);
+        if (message.find("step hold") != std::string::npos) {
+            holds_.fetch_add(1, std::memory_order_release);
+        }
+        for (gate& g : gates_) {
+            if (message.find(g.text) != std::string::npos) {
+                g.reached.store(true, std::memory_order_release);
+                while (!g.open.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            }
+        }
+    }
+    void flush() override {}
+    void open_all() {
+        for (gate& g : gates_) {
+            g.open.store(true, std::memory_order_release);
+        }
+    }
+    struct gate {
+        const char* text;
+        std::atomic<bool> reached{false};
+        std::atomic<bool> open{false};
+    };
+    gate gates_[2] = {{"step gate"}, {"step hold"}};
+    std::atomic<int> writes_{0};
+    std::atomic<int> holds_{0};
+};
+
+LogConfig gated_collector_config(const std::string& segment, std::shared_ptr<GateSink> sink) {
+    LogConfig config;
+    config.mode = QueueMode::SharedCollector;
+    config.shared_memory_name = segment;
+    config.log_queue_size = 1024;
+    config.string_buffer_size = 1 << 16;
+    config.sinks.push_back(std::move(sink));
+    return config;
+}
+
+} // namespace
+
+// A producer that registers while the writer is stuck in a sink is not attached
+// yet when the writer gets to a flush() request: its rings must still count. Its
+// entries hold the writer too, so a flush() that ignored them returns early.
+TEST_F(SharedMemoryTest, FlushWaitsForAProducerThatRegisteredWhileTheWriterWasBusy) {
+    const auto segment = unique_segment_name("slt_fl_");
+    const auto gate_logged = temp_log("test_shm_flush_gate.marker");
+    const auto late_logged = temp_log("test_shm_flush_late.marker");
+    const auto release = temp_log("test_shm_flush_release.marker");
+    auto sink = std::make_shared<GateSink>();
+    Logger::instance().init(gated_collector_config(segment, sink));
+
+    const std::string tail = " --queue-size 1024 --string-buffer-size 65536 --touch ";
+    std::thread first([&] {
+        run_producer("--name " + segment + " --tag p1 --log gate 1" + tail + gate_logged.string() + " --wait " +
+                     release.string());
+    });
+    const bool gated = wait_for([&] { return sink->gates_[0].reached.load(); });
+    std::thread second([&] {
+        run_producer("--name " + segment + " --tag p2 --log hold 5" + tail + late_logged.string() + " --wait " +
+                     release.string());
+    });
+    const bool logged = wait_for([&] { return std::filesystem::exists(late_logged); });
+    std::atomic<int> holds_at_return{-1};
+    std::thread flusher([&] {
+        Logger::instance().flush();
+        holds_at_return.store(sink->holds_.load(std::memory_order_acquire), std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // the request is in
+    sink->gates_[0].open.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // time to return early, if it would
+    sink->open_all();
+    flusher.join();
+    touch_file(release);
+    first.join();
+    second.join();
+    Logger::instance().shutdown();
+
+    ASSERT_TRUE(gated && logged);
+    EXPECT_EQ(holds_at_return.load(), 5) << "flush() returned before a newly registered producer's entries";
+}
+
+// Spills stuck behind a hole in the shared queue outlive their producer, and the
+// next owner of its registry slot. They must keep that producer's pid.
+TEST_F(SharedMemoryTest, SpillsKeepTheirPidAfterTheSlotIsReused) {
+    const auto log_path = temp_log("test_shm_spill_pid.log");
+    const auto segment = unique_segment_name("slt_sr_");
+    LogConfig config = collector_config(segment, log_path);
+    config.stalled_entry_timeout_ms = 8000;
+    Logger::instance().init(config);
+    ASSERT_TRUE(wait_for([&] { return read_all(log_path).find("SlickLogger") != std::string::npos; }));
+    {
+        slick::queue<slick::logger::LogEntry, slick::logger::detail::logger_queue_traits> raw(segment.c_str());
+        (void)raw.reserve(); // a hole: everything queued behind it waits out the timeout
+    }
+
+    // Its tiny ring fills at once, so most of its entries spill behind the hole.
+    ASSERT_EQ(run_producer("--name " + segment + " --tag p1 --threads 1 --count 100 --ring-size 4096"
+                           " --queue-size 1024 --string-buffer-size 65536"),
+              0);
+    registry_mapping registry(segment);
+    const auto freed_at = [&](uint32_t generation) {
+        const uint64_t control = registry.slot(0).control.load();
+        return shm_registry_slot::state_of(control) == shm_registry_slot::kFree &&
+               shm_registry_slot::generation_of(control) == generation;
+    };
+    ASSERT_TRUE(wait_for([&] { return freed_at(1); })) << "the first producer was never detached";
+    // A second producer takes the same slot and goes too.
+    ASSERT_EQ(run_producer("--name " + segment + " --tag p2 --count 1 --queue-size 1024 --string-buffer-size 65536"),
+              0);
+    ASSERT_TRUE(wait_for([&] { return freed_at(2); })) << "the second producer did not reuse the slot";
+
+    const bool spilled_out = wait_for([&] { return count_lines_containing(read_lines(log_path), "seq p1 ") == 100; },
+                                      std::chrono::seconds(20));
+    Logger::instance().shutdown();
+    ASSERT_TRUE(spilled_out);
+
+    std::set<std::string> stamps; // "[<pid>:p1]" of every one of them
+    for (const auto& line : read_lines(log_path)) {
+        if (line.find("seq p1 ") == std::string::npos) {
+            continue;
+        }
+        const size_t end = line.find(":p1]");
+        const size_t begin = end == std::string::npos ? end : line.rfind('[', end);
+        stamps.insert(begin == std::string::npos ? std::string("none") : line.substr(begin, end - begin));
+    }
+    EXPECT_EQ(stamps.size(), 1u) << "some of the producer's entries lost its pid";
+    EXPECT_EQ(stamps.count("[" + std::to_string(this_pid())), 0u) << "they carry the collector's pid";
+}
+
+// String accounting with a producer that registered while the writer was busy:
+// its record's strings were reported free while the record still waited.
+TEST_F(SharedMemoryTest, StringFrontierWaitsForAProducerNotAttachedYet) {
+    const auto segment = unique_segment_name("slt_sf_");
+    const auto gate_logged = temp_log("test_shm_frontier_gate.marker");
+    const auto go_hold = temp_log("test_shm_frontier_go.marker");
+    const auto hold_logged = temp_log("test_shm_frontier_hold.marker");
+    const auto big_logged = temp_log("test_shm_frontier_big.marker");
+    const auto release = temp_log("test_shm_frontier_release.marker");
+    auto sink = std::make_shared<GateSink>();
+    LogConfig config = gated_collector_config(segment, sink);
+    config.enable_stats = true;
+    config.stats_interval_ms = 30;
+    config.stats_sample_interval_ms = 2;
+    Logger::instance().init(config);
+
+    const std::string sizes = " --queue-size 1024 --string-buffer-size 65536";
+    // "hold" is logged after "gate" was taken, so it is not in that batch, and
+    // before "big", so the writer reaches it first.
+    std::thread first([&] {
+        run_producer("--name " + segment + " --tag p1 --log gate 1 --touch " + gate_logged.string() + " --wait " +
+                     go_hold.string() + " --log hold 1 --touch " + hold_logged.string() + " --wait " +
+                     release.string() + sizes);
+    });
+    const bool gated = wait_for([&] { return sink->gates_[0].reached.load(); });
+    touch_file(go_hold);
+    const bool held = wait_for([&] { return std::filesystem::exists(hold_logged); });
+    // Registers while the writer is stuck in the sink, so it is not attached yet.
+    std::thread second([&] {
+        run_producer("--name " + segment + " --tag p2 --ring-size 4096 --big 3000 --touch " + big_logged.string() +
+                     " --wait " + release.string() + sizes);
+    });
+    const bool big = wait_for([&] { return std::filesystem::exists(big_logged); });
+    sink->gates_[0].open.store(true, std::memory_order_release);
+    const bool on_hold = wait_for([&] { return sink->gates_[1].reached.load(); }); // "big" still waits
+    std::this_thread::sleep_for(std::chrono::milliseconds(150)); // a few reports
+    const slick::logger::LogStats stats = Logger::instance().stats_snapshot();
+    sink->open_all();
+    touch_file(release);
+    first.join();
+    second.join();
+    Logger::instance().shutdown();
+
+    ASSERT_TRUE(gated && held && big && on_hold);
+    EXPECT_GE(stats.string_inflight_bytes, 3000u)
+        << "the pending record's string was reported free; written " << stats.string_bytes_written;
+}
+
+// A collector's ring totals are refreshed by its registry scans. Between two of
+// them the totals can read "drained" while a new record waits, so they must not
+// short-circuit the string ring gauge to zero.
+TEST_F(SharedMemoryTest, StringGaugeDoesNotTrustRingTotalsBetweenScans) {
+    const auto segment = unique_segment_name("slt_st_");
+    const auto ready = temp_log("test_shm_totals_ready.marker");
+    const auto hello = temp_log("test_shm_totals_hello.marker");
+    const auto go_gate = temp_log("test_shm_totals_go_gate.marker");
+    const auto go_big = temp_log("test_shm_totals_go_big.marker");
+    const auto big_logged = temp_log("test_shm_totals_big.marker");
+    const auto release = temp_log("test_shm_totals_release.marker");
+    auto sink = std::make_shared<GateSink>();
+    LogConfig config = gated_collector_config(segment, sink);
+    config.enable_stats = true;
+    config.stats_interval_ms = 30;
+    config.stats_sample_interval_ms = 2;
+    Logger::instance().init(config);
+
+    const std::string sizes = " --queue-size 1024 --string-buffer-size 65536";
+    std::thread big([&] {
+        run_producer("--name " + segment + " --tag p1 --ring-size 4096 --log ready 1 --touch " + ready.string() +
+                     " --wait " + go_big.string() + " --big 3000 --touch " + big_logged.string() + " --wait " +
+                     release.string() + sizes);
+    });
+    std::thread gate([&] {
+        run_producer("--name " + segment + " --tag p0 --log hello 1 --touch " + hello.string() + " --wait " +
+                     go_gate.string() + " --log gate 1 --wait " + release.string() + sizes);
+    });
+    // Both banners and both first entries written, then a scan or two: the
+    // totals now say every ring is drained.
+    const bool started = wait_for([&] {
+        return std::filesystem::exists(ready) && std::filesystem::exists(hello) &&
+               sink->writes_.load(std::memory_order_acquire) >= 5;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    touch_file(go_gate);
+    const bool gated = wait_for([&] { return sink->gates_[0].reached.load(); }); // the writer is stuck: no scans
+    touch_file(go_big);
+    const bool logged = wait_for([&] { return std::filesystem::exists(big_logged); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150)); // a few reports
+    const slick::logger::LogStats stats = Logger::instance().stats_snapshot();
+    sink->open_all();
+    touch_file(release);
+    big.join();
+    gate.join();
+    Logger::instance().shutdown();
+
+    ASSERT_TRUE(started && gated && logged);
+    EXPECT_GE(stats.string_inflight_bytes, 3000u)
+        << "the waiting record's string was reported free; written " << stats.string_bytes_written;
 }

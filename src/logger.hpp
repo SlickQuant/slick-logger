@@ -3327,9 +3327,6 @@ struct remote_producer {
     uint64_t start_time = 0;
     bool closing = false;               // nothing more is coming: detach once drained
     bool owns_slot = true;              // the registry slot still names it: free it on detach
-    // The previous attachment, for spills that outlive it.
-    uint32_t last_generation = UINT32_MAX;
-    uint32_t last_pid = 0;
     // A slot seen in kClaiming: freed if it stays so, and its claimer is gone.
     uint64_t claiming_control = 0;
     int64_t claiming_since_ns = 0;
@@ -4080,6 +4077,9 @@ private:
     /// every kRegistryScanMs for liveness.
     void poll_registry();
     bool attach_producer(uint32_t index, bool skip_backlog);
+    /// Collector: attach every registered producer not attached yet, so flush()
+    /// and the string frontier see one that registered since the last scan.
+    void attach_new_producers() noexcept;
     void detach_producer(uint32_t index, bool free_slot);
     /// Unlink slot @p index's segment, then free the slot if it still holds @p control.
     void free_registry_slot(uint32_t index, uint64_t control) noexcept;
@@ -4347,6 +4347,15 @@ private:
     bool registry_backlog_ = true;
     std::unique_ptr<detail::remote_producer[]> remote_;
     std::vector<detail::ring_view*> remote_views_; // every attached producer ring, for the merge
+    // Detached producers whose spills may still be in the shared queue: kept
+    // until the read cursor passes where the queue's write cursor stood then.
+    struct retired_producer {
+        uint32_t slot;
+        uint32_t generation;
+        uint32_t pid;
+        uint64_t drain_point;
+    };
+    std::vector<retired_producer> retired_producers_;
     uint64_t registry_changes_seen_ = 0;
     int64_t next_registry_scan_ns_ = 0;
     struct flush_target {
@@ -6836,6 +6845,9 @@ inline void Logger::advance_string_frontier() noexcept {
         const uint64_t epoch = string_epoch_->load(std::memory_order_relaxed);
         if (epoch != stats_seen_epoch_) {
             try {
+                if (remote_) {
+                    attach_new_producers(); // the mark may be a producer's not attached yet
+                }
                 stats_gen_rings_.clear();
                 const auto note = [this](const detail::producer_ring* ring) {
                     const uint64_t end = ring->shared_strings_end();
@@ -6893,6 +6905,9 @@ inline bool Logger::sample_string_occupancy(LogStats& stats) noexcept {
     const auto rings_drained = [this]() noexcept {
         if (!thread_rings_ && !registry_) {
             return true;
+        }
+        if (registry_ && remote_rings_.load(std::memory_order_relaxed) != 0) {
+            return false; // a collector's ring totals are only as fresh as its last scan: ask the frontier
         }
         const ring_totals rings = thread_ring_totals(); // a ring record may hold strings here too
         return rings.consumed >= rings.produced;
@@ -7714,6 +7729,7 @@ inline void Logger::close_registry() noexcept {
         }
         remote_.reset();
         remote_views_.clear();
+        retired_producers_.clear();
         remote_flush_targets_.clear();
         collector_lease_ = 0;
         remote_retired_produced_ = remote_retired_consumed_ = remote_retired_dropped_ = 0;
@@ -7754,6 +7770,8 @@ inline void Logger::scan_registry(bool initial) {
     using slot_t = detail::shm_registry_slot;
     const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+    const uint64_t dispatched = read_index_.load(std::memory_order_relaxed);
+    std::erase_if(retired_producers_, [dispatched](const retired_producer& r) { return r.drain_point <= dispatched; });
     for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
         slot_t& slot = registry_->slots[i];
         detail::remote_producer& producer = remote_[i];
@@ -7860,6 +7878,19 @@ inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
     }
 }
 
+inline void Logger::attach_new_producers() noexcept {
+    using slot_t = detail::shm_registry_slot;
+    for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
+        if (remote_[i].views) {
+            continue;
+        }
+        const uint32_t state = slot_t::state_of(registry_->slots[i].control.load(std::memory_order_acquire));
+        if (state == slot_t::kActive || state == slot_t::kClosing) {
+            attach_producer(i, false); // a producer logs only once active, so nothing it logged is missed
+        }
+    }
+}
+
 inline void Logger::detach_producer(uint32_t index, bool free_slot) {
     using slot_t = detail::shm_registry_slot;
     detail::remote_producer& producer = remote_[index];
@@ -7887,15 +7918,24 @@ inline void Logger::detach_producer(uint32_t index, bool free_slot) {
         remote_retired_consumed_ += ring->released_records();
         remote_retired_dropped_ += ring->drops();
     }
-    producer.last_generation = producer.generation;
-    producer.last_pid = producer.pid;
+    try {
+        // Every spill it made is below this: it is closed or dead. Not when the
+        // collector shuts down, which has already let go of the queue.
+        if (log_queue_) {
+            retired_producers_.push_back(
+                {index, producer.generation, producer.pid, log_queue_->initial_reading_index()});
+        }
+    } catch (...) {
+        // Its late spills would show pid 0; nothing worse.
+    }
+    const uint32_t generation = producer.generation;
     producer.views.reset();
     producer.segment = slick::shm::shared_memory{};
     producer.ring_count = 0;
     producer.closing = false;
     if (free_slot) {
-        const uint64_t closing = slot_t::make(slot_t::kClosing, producer.last_generation);
-        const uint64_t active = slot_t::make(slot_t::kActive, producer.last_generation);
+        const uint64_t closing = slot_t::make(slot_t::kClosing, generation);
+        const uint64_t active = slot_t::make(slot_t::kActive, generation);
         free_registry_slot(index, slot_t::state_of(registry_->slots[index].control.load(std::memory_order_acquire)) ==
                                           slot_t::kClosing ? closing : active);
     }
@@ -7937,9 +7977,11 @@ inline void Logger::publish_remote_totals() noexcept {
 
 inline bool Logger::remote_flush_ready(uint64_t generation) {
     if (remote_flush_generation_ != generation) {
-        // A new request: everything published by now has to be taken first.
+        // A new request: everything published by now has to be taken first,
+        // including from producers that registered while the writer was busy.
         remote_flush_generation_ = generation;
         remote_flush_targets_.clear();
+        attach_new_producers();
         for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
             const detail::remote_producer& producer = remote_[i];
             for (uint32_t r = 0; producer.views && r < producer.ring_count; ++r) {
@@ -9363,8 +9405,12 @@ inline void Logger::resolve_spill() {
             shared_gate_view_ = &producer.views[ring];
             shared_gate_ring_ = shared_gate_view_->ring;
         }
-    } else if (producer.last_generation != UINT32_MAX && matches(producer.last_generation)) {
-        shared_head_.pid = producer.last_pid; // detached, so drained: nothing to wait for
+    } else if (const auto retired = std::find_if(retired_producers_.begin(), retired_producers_.end(),
+                                                 [&](const retired_producer& r) {
+                                                     return r.slot == index && matches(r.generation);
+                                                 });
+               retired != retired_producers_.end()) {
+        shared_head_.pid = retired->pid; // detached, so drained: nothing to wait for
     } else if (const detail::shm_registry_slot& slot = registry_->slots[index];
                matches(slot_t::generation_of(slot.control.load(std::memory_order_acquire)))) {
         shared_head_.pid = slot.pid.load(std::memory_order_relaxed);
