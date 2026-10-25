@@ -6905,11 +6905,13 @@ inline bool Logger::sample_string_occupancy(LogStats& stats) noexcept {
     // never touches the entry ring directly. The writer thread instead publishes
     // the frontier below, taken from an entry read() has already handed it.
     const auto rings_drained = [this]() noexcept {
-        if (!thread_rings_ && !registry_) {
-            return true;
+        if (registry_) {
+            // A collector cannot see a producer it has not attached, and its ring
+            // totals are a scan old: only its frontier knows. See advance_string_frontier().
+            return false;
         }
-        if (registry_ && remote_rings_.load(std::memory_order_relaxed) != 0) {
-            return false; // a collector's ring totals are only as fresh as its last scan: ask the frontier
+        if (!thread_rings_) {
+            return true;
         }
         const ring_totals rings = thread_ring_totals(); // a ring record may hold strings here too
         return rings.consumed >= rings.produced;
@@ -7874,6 +7876,7 @@ inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
         for (uint32_t r = 0; r < count; ++r) {
             remote_views_.push_back(&producer.views[r]);
         }
+        publish_remote_totals(); // attached outside a scan too: flush(), the frontier, a spill
         return true;
     } catch (const std::exception&) {
         return false; // not there yet, or already gone

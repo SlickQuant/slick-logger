@@ -1390,3 +1390,39 @@ TEST_F(SharedMemoryTest, StringGaugeDoesNotTrustRingTotalsBetweenScans) {
     EXPECT_GE(stats.string_inflight_bytes, 3000u)
         << "the waiting record's string was reported free; written " << stats.string_bytes_written;
 }
+
+// The first producer, attached outside a registry scan (here by the frontier),
+// left the collector's cached ring count at zero, and the string gauge read
+// "nothing pending" while its big record waited.
+TEST_F(SharedMemoryTest, StringGaugeCountsTheFirstProducerAttachedOutsideAScan) {
+    const auto segment = unique_segment_name("slt_fp_");
+    const auto logged = temp_log("test_shm_first_logged.marker");
+    const auto release = temp_log("test_shm_first_release.marker");
+    auto sink = std::make_shared<GateSink>();
+    LogConfig config = gated_collector_config(segment, sink);
+    config.enable_stats = true;
+    config.stats_interval_ms = 30;
+    config.stats_sample_interval_ms = 2;
+    Logger::instance().init(config);
+    ASSERT_TRUE(wait_for([&] { return sink->writes_.load(std::memory_order_acquire) >= 1; })); // the banner
+
+    LOG_INFO("step gate"); // the writer is stuck on this, so it scans nothing
+    const bool gated = wait_for([&] { return sink->gates_[0].reached.load(); });
+    std::thread producer([&] {
+        run_producer("--name " + segment + " --tag p1 --ring-size 4096 --log hold 1 --big 3000 --touch " +
+                     logged.string() + " --wait " + release.string() + " --queue-size 1024 --string-buffer-size 65536");
+    });
+    const bool big = wait_for([&] { return std::filesystem::exists(logged); });
+    sink->gates_[0].open.store(true, std::memory_order_release);
+    const bool on_hold = wait_for([&] { return sink->gates_[1].reached.load(); }); // "big" still waits
+    std::this_thread::sleep_for(std::chrono::milliseconds(150)); // a few reports
+    const slick::logger::LogStats stats = Logger::instance().stats_snapshot();
+    sink->open_all();
+    touch_file(release);
+    producer.join();
+    Logger::instance().shutdown();
+
+    ASSERT_TRUE(gated && big && on_hold);
+    EXPECT_GE(stats.string_inflight_bytes, 3000u)
+        << "the waiting record's string was reported free; written " << stats.string_bytes_written;
+}
