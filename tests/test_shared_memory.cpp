@@ -957,13 +957,18 @@ TEST_F(SharedMemoryTest, RecoversFromAProducerKilledMidBurst) {
     const auto segment = unique_segment_name("slt_kl_");
     constexpr int kThreads = 3;
     constexpr int kCrashAfter = 3000;
+    // Fits a thread's 1 MB ring (about 6,900 of these records). More would spill
+    // into the shared queue, which overwrites its oldest entries when the
+    // collector falls behind: a loss this test is not about.
+    constexpr int kCount = 4000;
 
     Logger::instance().init(collector_config(segment, log_path));
     // --flush-first: the collector holds the segment before the burst, so it
     // outlives the producer on Windows too.
     const int rc = run_producer("--name " + segment + " --tag crash --flush-first --threads " +
-                                std::to_string(kThreads) + " --count 100000000 --crash-after " +
-                                std::to_string(kCrashAfter) + " --queue-size 1024 --string-buffer-size 65536");
+                                std::to_string(kThreads) + " --count " + std::to_string(kCount) +
+                                " --crash-after " + std::to_string(kCrashAfter) +
+                                " --queue-size 1024 --string-buffer-size 65536");
     ASSERT_NE(rc, 0) << "the producer was meant to be killed";
 
     registry_mapping registry(segment);
