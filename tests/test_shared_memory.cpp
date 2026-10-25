@@ -8,6 +8,8 @@
 #include <slick/logger.hpp>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -26,9 +28,11 @@
 #  include <process.h>
 #  define SLICK_TEST_GETPID _getpid
 #else
+#  include <spawn.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
 #  define SLICK_TEST_GETPID getpid
+extern char** environ;
 #endif
 
 // Resolved at cmake configure time; the build system defines this macro.
@@ -88,10 +92,31 @@ int run_producer(const std::string& args) {
     const std::string command = std::string("\"\"") + SHM_PRODUCER_EXE_PATH + "\" " + args + "\"";
     return std::system(command.c_str());
 #else
-    const std::string command = std::string("\"") + SHM_PRODUCER_EXE_PATH + "\" " + args;
-    const int status = std::system(command.c_str());
-    if (status == -1) {
+    // posix_spawn, not std::system: macOS runs one system() at a time, so a
+    // second producer would wait for the first to exit. The arguments hold no
+    // spaces of their own, so splitting on spaces is enough.
+    std::vector<std::string> words{SHM_PRODUCER_EXE_PATH};
+    for (size_t at = 0; at < args.size();) {
+        const size_t end = std::min(args.find(' ', at), args.size());
+        if (end > at) {
+            words.push_back(args.substr(at, end - at));
+        }
+        at = end + 1;
+    }
+    std::vector<char*> argv;
+    for (std::string& word : words) {
+        argv.push_back(word.data());
+    }
+    argv.push_back(nullptr);
+    pid_t pid = 0;
+    if (::posix_spawn(&pid, SHM_PRODUCER_EXE_PATH, nullptr, nullptr, argv.data(), environ) != 0) {
         return -1;
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) {
+            return -1;
+        }
     }
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
