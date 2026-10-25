@@ -10,6 +10,7 @@
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,6 +29,7 @@ protected:
         std::filesystem::remove("test_mt.log");
         std::filesystem::remove("test_json.log");
         std::filesystem::remove("test_format_error.log");
+        std::filesystem::remove("test_long_double.log");
         std::filesystem::remove("test_no_args.log");
         std::filesystem::remove("test_mixed.log");
         std::filesystem::remove("test_char_array.log");
@@ -927,6 +929,24 @@ TEST_F(SlickLoggerTest, FormatArgsLogging) {
     }
 
     EXPECT_NE(file_contents.find("int=42 double=3.14 str=hello bool=true"), std::string::npos);
+}
+
+// Regression: long double is 16 bytes on GCC and clang for x86, and argument
+// staging only knew 4 and 8, so it logged an untyped argument. It is kept as a
+// double now, directly and through std::format_args.
+TEST_F(SlickLoggerTest, LongDoubleArgumentsAreLogged) {
+    std::filesystem::remove("test_long_double.log");
+    slick::logger::Logger::instance().init("test_long_double.log", 1024);
+
+    long double quarter = 0.75L;
+    LOG_INFO("long double {} and {:.3f}", 2.5L, 3.14159L);
+    LOG_INFO("format_args {}", std::make_format_args(quarter));
+    slick::logger::Logger::instance().shutdown();
+
+    std::ifstream log_file("test_long_double.log");
+    const std::string contents((std::istreambuf_iterator<char>(log_file)), std::istreambuf_iterator<char>());
+    EXPECT_NE(contents.find("long double 2.5 and 3.142"), std::string::npos) << contents;
+    EXPECT_NE(contents.find("format_args 0.75"), std::string::npos) << contents;
 }
 
 TEST_F(SlickLoggerTest, FormatArgsConstCharBridgeLogging) {

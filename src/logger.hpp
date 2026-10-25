@@ -8859,15 +8859,16 @@ inline void Logger::enqueue_argument(LogArgument& arg, T&& value) {
         }
     }
     else if constexpr (std::is_floating_point_v<DecayedT>) {
-        switch (sizeof(DecayedT)) {
-        case sizeof(float):
+        // Every floating type gets a case: long double is 16 bytes on GCC and
+        // clang for x86, where a switch on 4 and 8 left it untyped. Wider than a
+        // double is kept as a double, the widest a LogArgument holds, as the
+        // std::format_args path does for __float128.
+        if constexpr (sizeof(DecayedT) <= sizeof(float)) {
             arg.type = ArgType::FLOAT;
             arg.value.f = static_cast<float>(value);
-            return;
-        case sizeof(double):    
+        } else {
             arg.type = ArgType::DOUBLE;
             arg.value.d = static_cast<double>(value);
-            return;
         }
     }
     else if constexpr (std::is_enum_v<DecayedT>) {
