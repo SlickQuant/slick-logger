@@ -3225,12 +3225,17 @@ struct alignas(64) shm_registry_slot {
     static constexpr uint32_t kClaiming = 1; // a producer is building its segment
     static constexpr uint32_t kActive = 2;
     static constexpr uint32_t kClosing = 3;  // shut down: the collector drains it, then frees it
+    /// Its process is gone, but entries it spilled may still be unread. The slot
+    /// keeps its pid until the read cursor passes drain_point, so any collector,
+    /// a restarted one included, can still stamp those entries with it.
+    static constexpr uint32_t kDraining = 4;
 
     /// State in the low 32 bits, generation in the high 32: one CAS changes both,
     /// so a slot freed and claimed again never passes for the one a CAS expects.
     std::atomic<uint64_t> control{0};
     std::atomic<uint32_t> pid{0};
     std::atomic<uint64_t> start_time{0}; // process_start_time(pid)
+    std::atomic<uint64_t> drain_point{0}; // kDraining: the shared queue's write cursor at retirement
 
     static constexpr uint32_t state_of(uint64_t control) noexcept { return static_cast<uint32_t>(control); }
     static constexpr uint32_t generation_of(uint64_t control) noexcept { return static_cast<uint32_t>(control >> 32); }
@@ -4083,8 +4088,9 @@ private:
     /// and the string frontier see one that registered since the last scan.
     void attach_new_producers() noexcept;
     void detach_producer(uint32_t index, bool free_slot);
-    /// Unlink slot @p index's segment, then free the slot if it still holds @p control.
-    void free_registry_slot(uint32_t index, uint64_t control) noexcept;
+    /// Unlink slot @p index's segment, then move the slot to kDraining if it still
+    /// holds @p control. scan_registry() frees it once its spills are read.
+    void retire_registry_slot(uint32_t index, uint64_t control) noexcept;
     static bool producer_drained(const detail::remote_producer& producer) noexcept;
     /// Point a producer process's record at this process's copy of its strings.
     void resolve_remote_record(LogEntry& entry, const detail::ring_view& view) const noexcept;
@@ -4349,15 +4355,6 @@ private:
     bool registry_backlog_ = true;
     std::unique_ptr<detail::remote_producer[]> remote_;
     std::vector<detail::ring_view*> remote_views_; // every attached producer ring, for the merge
-    // Detached producers whose spills may still be in the shared queue: kept
-    // until the read cursor passes where the queue's write cursor stood then.
-    struct retired_producer {
-        uint32_t slot;
-        uint32_t generation;
-        uint32_t pid;
-        uint64_t drain_point;
-    };
-    std::vector<retired_producer> retired_producers_;
     uint64_t registry_changes_seen_ = 0;
     int64_t next_registry_scan_ns_ = 0;
     struct flush_target {
@@ -7647,8 +7644,11 @@ inline bool Logger::claim_registry_slot(std::string& why) noexcept {
         const uint64_t start_time = detail::process_start_time(pid);
         const size_t bytes = detail::shm_ring_segment::bytes(max_thread_rings_, thread_ring_size_);
         // A free slot first. Failing that, one whose owner closed or died and whose
-        // segment went with it, so nothing in it can still be read.
-        for (int pass = 0; pass < 2; ++pass) {
+        // segment went with it, so nothing in it can still be read. That second pass
+        // runs only once the shared queue is read through, or the old owner's unread
+        // spills would lose their pid.
+        const bool queue_read = registry_->read_index.load(std::memory_order_acquire) >= log_queue_->initial_reading_index();
+        for (int pass = 0; pass < (queue_read ? 2 : 1); ++pass) {
             for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
                 slot_t& slot = registry_->slots[i];
                 uint64_t control = slot.control.load(std::memory_order_acquire);
@@ -7733,7 +7733,6 @@ inline void Logger::close_registry() noexcept {
         }
         remote_.reset();
         remote_views_.clear();
-        retired_producers_.clear();
         remote_flush_targets_.clear();
         collector_lease_ = 0;
         remote_retired_produced_ = remote_retired_consumed_ = remote_retired_dropped_ = 0;
@@ -7775,7 +7774,6 @@ inline void Logger::scan_registry(bool initial) {
     const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const uint64_t dispatched = read_index_.load(std::memory_order_relaxed);
-    std::erase_if(retired_producers_, [dispatched](const retired_producer& r) { return r.drain_point <= dispatched; });
     for (uint32_t i = 0; i < detail::shm_registry::kSlotCount; ++i) {
         slot_t& slot = registry_->slots[i];
         detail::remote_producer& producer = remote_[i];
@@ -7798,7 +7796,13 @@ inline void Logger::scan_registry(bool initial) {
             if (!attach_producer(i, initial && !registry_backlog_) &&
                 (state == slot_t::kClosing || !detail::process_running(slot.pid.load(std::memory_order_relaxed),
                                                                        slot.start_time.load(std::memory_order_relaxed)))) {
-                free_registry_slot(i, control); // nothing to read, and nobody left to write it
+                retire_registry_slot(i, control); // nothing to read, and nobody left to write it
+            }
+        } else if (state == slot_t::kDraining) {
+            if (dispatched >= slot.drain_point.load(std::memory_order_relaxed)) {
+                uint64_t expected = control; // every spill it made is read: the slot may go
+                slot.control.compare_exchange_strong(expected, slot_t::make(slot_t::kFree, slot_t::generation_of(control)),
+                                                     std::memory_order_acq_rel, std::memory_order_relaxed);
             }
         } else if (state == slot_t::kClaiming) {
             // A claimer records its pid just after it claims, so give it time.
@@ -7808,7 +7812,7 @@ inline void Logger::scan_registry(bool initial) {
             } else if (now_ns - producer.claiming_since_ns > 1000000000 &&
                        !detail::process_running(slot.pid.load(std::memory_order_relaxed),
                                                 slot.start_time.load(std::memory_order_relaxed))) {
-                free_registry_slot(i, control); // died building its segment
+                retire_registry_slot(i, control); // died building its segment
             }
         }
     }
@@ -7923,16 +7927,6 @@ inline void Logger::detach_producer(uint32_t index, bool free_slot) {
         remote_retired_consumed_ += ring->released_records();
         remote_retired_dropped_ += ring->drops();
     }
-    try {
-        // Every spill it made is below this: it is closed or dead. Not when the
-        // collector shuts down, which has already let go of the queue.
-        if (log_queue_) {
-            retired_producers_.push_back(
-                {index, producer.generation, producer.pid, log_queue_->initial_reading_index()});
-        }
-    } catch (...) {
-        // Its late spills would show pid 0; nothing worse.
-    }
     const uint32_t generation = producer.generation;
     producer.views.reset();
     producer.segment = slick::shm::shared_memory{};
@@ -7941,18 +7935,23 @@ inline void Logger::detach_producer(uint32_t index, bool free_slot) {
     if (free_slot) {
         const uint64_t closing = slot_t::make(slot_t::kClosing, generation);
         const uint64_t active = slot_t::make(slot_t::kActive, generation);
-        free_registry_slot(index, slot_t::state_of(registry_->slots[index].control.load(std::memory_order_acquire)) ==
-                                          slot_t::kClosing ? closing : active);
+        retire_registry_slot(index, slot_t::state_of(registry_->slots[index].control.load(std::memory_order_acquire)) ==
+                                            slot_t::kClosing ? closing : active);
     }
 }
 
-inline void Logger::free_registry_slot(uint32_t index, uint64_t control) noexcept {
+inline void Logger::retire_registry_slot(uint32_t index, uint64_t control) noexcept {
     using slot_t = detail::shm_registry_slot;
-    // Unlinked before the slot is free, so no new owner's segment can be unlinked.
+    // Unlinked before the slot can be free, so no new owner's segment can be unlinked.
     slick::shm::shared_memory::remove(producer_segment_name(index).c_str());
-    registry_->slots[index].control.compare_exchange_strong(
-        control, slot_t::make(slot_t::kFree, slot_t::generation_of(control)), std::memory_order_acq_rel,
-        std::memory_order_relaxed);
+    // It is closed or dead, so every spill it made sits below the write cursor.
+    // A collector shutting down has already released the queue, but drained it
+    // first, so its read cursor marks the same point.
+    slot_t& slot = registry_->slots[index];
+    slot.drain_point.store(log_queue_ ? log_queue_->initial_reading_index() : read_index_.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+    slot.control.compare_exchange_strong(control, slot_t::make(slot_t::kDraining, slot_t::generation_of(control)),
+                                         std::memory_order_acq_rel, std::memory_order_relaxed);
 }
 
 inline bool Logger::producer_drained(const detail::remote_producer& producer) noexcept {
@@ -9411,14 +9410,10 @@ inline void Logger::resolve_spill() {
             shared_gate_view_ = &producer.views[ring];
             shared_gate_ring_ = shared_gate_view_->ring;
         }
-    } else if (const auto retired = std::find_if(retired_producers_.begin(), retired_producers_.end(),
-                                                 [&](const retired_producer& r) {
-                                                     return r.slot == index && matches(r.generation);
-                                                 });
-               retired != retired_producers_.end()) {
-        shared_head_.pid = retired->pid; // detached, so drained: nothing to wait for
     } else if (const detail::shm_registry_slot& slot = registry_->slots[index];
                matches(slot_t::generation_of(slot.control.load(std::memory_order_acquire)))) {
+        // Gone, so drained: nothing to wait for. Its slot stays kDraining with its
+        // pid until its spills are read, so a restarted collector finds the pid too.
         shared_head_.pid = slot.pid.load(std::memory_order_relaxed);
     }
 }

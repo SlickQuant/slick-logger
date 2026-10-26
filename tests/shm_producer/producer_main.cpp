@@ -38,7 +38,7 @@ int usage() {
                  "                [--rings <n>] [--ring-size <bytes>] [--threads <n>]\n"
                  "                [--pace-us <n>] [--crash-after <n>] [--flush-first]\n"
                  "                [--log <label> <n>] [--big <bytes>] [--wait <file>] [--touch <file>]\n"
-                 "                [--flush] [--crash] [--collector <log>]\n"
+                 "                [--flush] [--crash] [--collector <log>] [--stall-ms <n>]\n"
                  "                [--linger-ms <n>] [--ready-file <path>]\n");
     return 2;
 }
@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
     int pace_us = 0;
     bool flush_first = false;
     std::string collector_log;
+    int stall_ms = -1;
     std::vector<step> steps;
 
     for (int i = 1; i < argc; ++i) {
@@ -140,6 +141,8 @@ int main(int argc, char** argv) {
             flush_first = true;
         } else if (arg == "--collector" && has_value) {
             collector_log = argv[++i];
+        } else if (arg == "--stall-ms" && has_value) {
+            stall_ms = std::atoi(argv[++i]); // stalled_entry_timeout_ms for --collector
         } else if (arg == "--log" && i + 2 < argc) {
             steps.push_back({step::Log, argv[i + 1], std::atoi(argv[i + 2])});
             i += 2;
@@ -183,6 +186,9 @@ int main(int argc, char** argv) {
         }
         if (!collector_log.empty()) {
             config.sinks.push_back(std::make_shared<slick::logger::FileSink>(collector_log));
+        }
+        if (stall_ms >= 0) {
+            config.stalled_entry_timeout_ms = static_cast<uint32_t>(stall_ms);
         }
         logger.init(config);
     } catch (const std::exception& e) {

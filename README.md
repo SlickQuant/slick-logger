@@ -1250,7 +1250,9 @@ timestamp.
 - A record becomes visible with one store, so a producer that dies never leaves a torn one.
   The collector checks producers by pid and process start time, so a pid the OS reuses is
   never mistaken for a live producer. Once a dead or closed producer's rings are drained, the
-  collector unlinks its segment and frees its slot.
+  collector unlinks its segment. The producer's registry slot keeps the pid until every entry
+  it spilled has been read, and is freed only then. That way spilled entries keep their pid
+  even if the collector restarts in between.
 - A restarted collector reads only what the previous one had not taken, or nothing with
   `collect_backlog = false`.
 - The registry has 64 slots. A producer that finds it full logs through the shared ring and

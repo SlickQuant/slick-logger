@@ -25,6 +25,8 @@
 #include <thread>
 #include <vector>
 
+#include "../tests/run_process.hpp" // std::system would run the producers one at a time on macOS
+
 #ifdef _WIN32
 #  include <process.h>
 #  define BENCH_GETPID _getpid
@@ -138,16 +140,11 @@ round_result run_round(const std::string& exe, int round, int producers, const l
     for (int p = 0; p < producers; ++p) {
         outs.push_back(name + "_" + std::to_string(p) + ".out");
         std::filesystem::remove(outs.back());
-        const std::string command = "\"" + exe + "\" --producer " + name + " --threads " +
-                                    std::to_string(work.threads) + " --burst " + std::to_string(work.burst) +
-                                    " --bursts " + std::to_string(work.bursts) + " --pause-ms " +
-                                    std::to_string(work.pause_ms) + " --rings " + (rings ? "1" : "0") + " --out " +
-                                    outs.back();
-#ifdef _WIN32
-        launches.emplace_back([command] { std::system(("\"" + command + "\"").c_str()); });
-#else
-        launches.emplace_back([command] { std::system(command.c_str()); });
-#endif
+        const std::string args = "--producer " + name + " --threads " + std::to_string(work.threads) + " --burst " +
+                                 std::to_string(work.burst) + " --bursts " + std::to_string(work.bursts) +
+                                 " --pause-ms " + std::to_string(work.pause_ms) + " --rings " + (rings ? "1" : "0") +
+                                 " --out " + outs.back();
+        launches.emplace_back([&exe, args] { run_process(exe, args); });
     }
     for (auto& launch : launches) {
         launch.join();

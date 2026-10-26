@@ -9,7 +9,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,12 +27,11 @@
 #  include <process.h>
 #  define SLICK_TEST_GETPID _getpid
 #else
-#  include <spawn.h>
-#  include <sys/wait.h>
 #  include <unistd.h>
 #  define SLICK_TEST_GETPID getpid
-extern char** environ;
 #endif
+
+#include "run_process.hpp"
 
 // Resolved at cmake configure time; the build system defines this macro.
 #ifndef SHM_PRODUCER_EXE_PATH
@@ -86,40 +84,7 @@ void touch_file(const std::filesystem::path& path) {
 
 // Launch the producer executable and wait for it to exit, returning its exit code.
 int run_producer(const std::string& args) {
-#ifdef _WIN32
-    // cmd.exe strips the outer pair of quotes, so the whole command needs one
-    // extra layer for paths that contain spaces.
-    const std::string command = std::string("\"\"") + SHM_PRODUCER_EXE_PATH + "\" " + args + "\"";
-    return std::system(command.c_str());
-#else
-    // posix_spawn, not std::system: macOS runs one system() at a time, so a
-    // second producer would wait for the first to exit. The arguments hold no
-    // spaces of their own, so splitting on spaces is enough.
-    std::vector<std::string> words{SHM_PRODUCER_EXE_PATH};
-    for (size_t at = 0; at < args.size();) {
-        const size_t end = std::min(args.find(' ', at), args.size());
-        if (end > at) {
-            words.push_back(args.substr(at, end - at));
-        }
-        at = end + 1;
-    }
-    std::vector<char*> argv;
-    for (std::string& word : words) {
-        argv.push_back(word.data());
-    }
-    argv.push_back(nullptr);
-    pid_t pid = 0;
-    if (::posix_spawn(&pid, SHM_PRODUCER_EXE_PATH, nullptr, nullptr, argv.data(), environ) != 0) {
-        return -1;
-    }
-    int status = 0;
-    while (::waitpid(pid, &status, 0) == -1) {
-        if (errno != EINTR) {
-            return -1;
-        }
-    }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-#endif
+    return run_process(SHM_PRODUCER_EXE_PATH, args);
 }
 
 // Wait until `predicate` holds or the timeout expires. The collector drains on a
@@ -1273,9 +1238,33 @@ TEST_F(SharedMemoryTest, FlushWaitsForAProducerThatRegisteredWhileTheWriterWasBu
     EXPECT_EQ(holds_at_return.load(), 5) << "flush() returned before a newly registered producer's entries";
 }
 
-// Spills stuck behind a hole in the shared queue outlive their producer, and the
-// next owner of its registry slot. They must keep that producer's pid.
-TEST_F(SharedMemoryTest, SpillsKeepTheirPidAfterTheSlotIsReused) {
+namespace {
+
+/// The "[<pid>" part of the "[<pid>:<tag>]" stamp on each line holding
+/// "seq <tag> ". A line without a stamp gives "none".
+std::set<std::string> seq_stamps(const std::vector<std::string>& lines, const std::string& tag) {
+    std::set<std::string> stamps;
+    for (const auto& line : lines) {
+        if (line.find("seq " + tag + " ") == std::string::npos) {
+            continue;
+        }
+        const size_t end = line.find(":" + tag + "]");
+        const size_t begin = end == std::string::npos ? end : line.rfind('[', end);
+        stamps.insert(begin == std::string::npos ? std::string("none") : line.substr(begin, end - begin));
+    }
+    return stamps;
+}
+
+bool slot_is(registry_mapping& registry, uint32_t index, uint32_t state, uint32_t generation) {
+    const uint64_t control = registry.slot(index).control.load();
+    return shm_registry_slot::state_of(control) == state && shm_registry_slot::generation_of(control) == generation;
+}
+
+} // namespace
+
+// Spills stuck behind a hole in the shared queue outlive their producer. Its
+// registry slot keeps its pid until they are read, and no other producer takes it meanwhile.
+TEST_F(SharedMemoryTest, SpillsKeepTheirPidAfterTheirProducerLeaves) {
     const auto log_path = temp_log("test_shm_spill_pid.log");
     const auto segment = unique_segment_name("slt_sr_");
     LogConfig config = collector_config(segment, log_path);
@@ -1292,33 +1281,76 @@ TEST_F(SharedMemoryTest, SpillsKeepTheirPidAfterTheSlotIsReused) {
                            " --queue-size 1024 --string-buffer-size 65536"),
               0);
     registry_mapping registry(segment);
-    const auto freed_at = [&](uint32_t generation) {
-        const uint64_t control = registry.slot(0).control.load();
-        return shm_registry_slot::state_of(control) == shm_registry_slot::kFree &&
-               shm_registry_slot::generation_of(control) == generation;
-    };
-    ASSERT_TRUE(wait_for([&] { return freed_at(1); })) << "the first producer was never detached";
-    // A second producer takes the same slot and goes too.
+    ASSERT_TRUE(wait_for([&] { return slot_is(registry, 0, shm_registry_slot::kDraining, 1); }))
+        << "the first producer's slot did not wait for its spills";
+    // The next producer gets another slot.
     ASSERT_EQ(run_producer("--name " + segment + " --tag p2 --count 1 --queue-size 1024 --string-buffer-size 65536"),
               0);
-    ASSERT_TRUE(wait_for([&] { return freed_at(2); })) << "the second producer did not reuse the slot";
+    EXPECT_TRUE(slot_is(registry, 0, shm_registry_slot::kDraining, 1)) << "the slot was reused while its spills waited";
 
     const bool spilled_out = wait_for([&] { return count_lines_containing(read_lines(log_path), "seq p1 ") == 100; },
                                       std::chrono::seconds(20));
+    const bool freed = wait_for([&] { return slot_is(registry, 0, shm_registry_slot::kFree, 1); });
     Logger::instance().shutdown();
     ASSERT_TRUE(spilled_out);
+    EXPECT_TRUE(freed) << "the slot stayed taken once its spills were read";
 
-    std::set<std::string> stamps; // "[<pid>:p1]" of every one of them
-    for (const auto& line : read_lines(log_path)) {
-        if (line.find("seq p1 ") == std::string::npos) {
-            continue;
-        }
-        const size_t end = line.find(":p1]");
-        const size_t begin = end == std::string::npos ? end : line.rfind('[', end);
-        stamps.insert(begin == std::string::npos ? std::string("none") : line.substr(begin, end - begin));
-    }
+    const auto stamps = seq_stamps(read_lines(log_path), "p1");
     EXPECT_EQ(stamps.size(), 1u) << "some of the producer's entries lost its pid";
-    EXPECT_EQ(stamps.count("[" + std::to_string(this_pid())), 0u) << "they carry the collector's pid";
+    EXPECT_EQ(stamps.count("none"), 0u) << "they carry no pid";
+}
+
+// As above, but the collector is killed before it reads the spills. The next
+// collector replays them and has only the registry to find their pid in.
+TEST_F(SharedMemoryTest, SpillsKeepTheirPidAcrossACollectorCrash) {
+    const auto first_log = temp_log("test_shm_crash_first.log");
+    const auto log_path = temp_log("test_shm_crash_second.log");
+    const auto go = temp_log("test_shm_crash_go.marker");
+    const auto segment = unique_segment_name("slt_cc_");
+
+    // The first collector is another process, so it can be killed.
+    int first_rc = 0;
+    std::thread first([&] {
+        first_rc = run_producer("--name " + segment + " --collector " + first_log.string() +
+                                " --stall-ms 60000 --queue-size 1024 --string-buffer-size 65536 --wait " + go.string() +
+                                " --crash");
+    });
+    ASSERT_TRUE(wait_for([&] { return read_all(first_log).find("SlickLogger") != std::string::npos; }));
+    // Held here so the segments outlive both collectors on Windows too.
+    slick::queue<slick::logger::LogEntry, slick::logger::detail::logger_queue_traits> raw(segment.c_str());
+    slick::shm::shared_memory strings((segment + "_str").c_str(), slick::shm::open_existing);
+    registry_mapping registry(segment);
+    (void)raw.reserve(); // a hole the first collector never gets past
+
+    ASSERT_EQ(run_producer("--name " + segment + " --tag p1 --threads 1 --count 100 --ring-size 4096"
+                           " --queue-size 1024 --string-buffer-size 65536"),
+              0);
+    // Retired by the first collector: free, or waiting for its spills.
+    const bool draining = wait_for([&] {
+        const uint32_t state = registry.state(0);
+        return state != shm_registry_slot::kActive && state != shm_registry_slot::kClosing;
+    });
+    const int second_rc =
+        run_producer("--name " + segment + " --tag p2 --count 1 --queue-size 1024 --string-buffer-size 65536");
+    touch_file(go); // the first collector dies with the spills unread
+    first.join();
+    ASSERT_TRUE(draining && second_rc == 0);
+    ASSERT_NE(first_rc, 0) << "the first collector was meant to be killed";
+
+    LogConfig config = collector_config(segment, log_path);
+    config.stalled_entry_timeout_ms = 300;
+    Logger::instance().init(config); // replays the backlog, hole and spills
+    const bool spilled_out = wait_for([&] { return count_lines_containing(read_lines(log_path), "seq p1 ") > 0; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    Logger::instance().shutdown();
+    ASSERT_TRUE(spilled_out) << "the second collector replayed none of the spills";
+
+    // p1's ring records went to the first collector with its pid, so that log has
+    // the stamp to expect. A line with no pid prints no stamp, which reads as "none".
+    const auto expected = seq_stamps(read_lines(first_log), "p1");
+    ASSERT_EQ(expected.size(), 1u);
+    ASSERT_EQ(expected.count("none"), 0u);
+    EXPECT_EQ(seq_stamps(read_lines(log_path), "p1"), expected) << "the replayed spills lost their producer's pid";
 }
 
 // String accounting with a producer that registered while the writer was busy:
@@ -1455,4 +1487,42 @@ TEST_F(SharedMemoryTest, StringGaugeCountsTheFirstProducerAttachedOutsideAScan) 
     ASSERT_TRUE(gated && big && on_hold);
     EXPECT_GE(stats.string_inflight_bytes, 3000u)
         << "the waiting record's string was reported free; written " << stats.string_bytes_written;
+}
+
+// With every other slot taken, a producer may take over the slot of one that
+// closed and whose segment is gone. It must not take one whose spills are still
+// unread in the shared queue, or they would lose its pid. No collector runs here.
+TEST_F(SharedMemoryTest, ProducerDoesNotTakeOverASlotWithUnreadSpills) {
+    const auto segment = unique_segment_name("slt_to_");
+    const auto ready = temp_log("test_shm_takeover_ready.marker");
+    const auto go = temp_log("test_shm_takeover_go.marker");
+
+    std::thread first([&] {
+        run_producer("--name " + segment + " --tag p0 --ring-size 4096 --log spill 100 --touch " + ready.string() +
+                     " --wait " + go.string() + " --queue-size 1024 --string-buffer-size 65536");
+    });
+    ASSERT_TRUE(wait_for([&] { return std::filesystem::exists(ready); }));
+    // Held so the registry and the spills outlive the producer on Windows. Its ring
+    // segment still goes with it there, which makes its slot a takeover candidate.
+    slick::queue<slick::logger::LogEntry, slick::logger::detail::logger_queue_traits> raw(segment.c_str());
+    slick::shm::shared_memory strings((segment + "_str").c_str(), slick::shm::open_existing);
+    registry_mapping registry(segment);
+    ASSERT_GT(raw.initial_reading_index(), 0u) << "nothing spilled";
+    touch_file(go);
+    first.join();
+    ASSERT_TRUE(slot_is(registry, 0, shm_registry_slot::kClosing, 1));
+
+    const uint64_t start_time = slick::logger::detail::process_start_time(this_pid());
+    for (uint32_t i = 1; i < shm_registry::kSlotCount; ++i) { // every other slot held by a live process
+        registry.slot(i).pid.store(this_pid());
+        registry.slot(i).start_time.store(start_time);
+        registry.slot(i).control.store(shm_registry_slot::make(shm_registry_slot::kActive, 1));
+    }
+    const int rc = run_producer("--name " + segment + " --tag p1 --count 1 --queue-size 1024 --string-buffer-size 65536");
+    const bool kept = slot_is(registry, 0, shm_registry_slot::kClosing, 1);
+    for (uint32_t i = 0; i < shm_registry::kSlotCount; ++i) {
+        registry.slot(i).control.store(shm_registry_slot::make(shm_registry_slot::kFree, 1));
+    }
+    ASSERT_EQ(rc, 0);
+    EXPECT_TRUE(kept) << "the closed producer's slot was taken while its spills were unread";
 }
