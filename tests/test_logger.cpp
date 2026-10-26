@@ -1594,6 +1594,54 @@ TEST_F(SlickLoggerTest, SinkMacrosCaptureCallSiteSourceLocation) {
     EXPECT_NE(content.find("Sink macro source location"), std::string::npos);
 }
 
+namespace {
+
+/// Records each located entry's file name, and the length it carries it with.
+class FileNameSink : public slick::logger::ISink {
+public:
+    FileNameSink() : ISink("file_names") {}
+    void write(const slick::logger::LogEntry& entry) override {
+        if (slick::logger::has_source_location(entry)) {
+            const uint32_t length = entry.file.length; // by value: LogEntry is packed
+            lengths_.push_back(length);
+            names_.emplace_back(slick::logger::view_string_ref(entry.file));
+        }
+    }
+    void flush() override {}
+    std::vector<uint32_t> lengths_;
+    std::vector<std::string> names_;
+};
+
+} // namespace
+
+// A LOG_* call site knows its file name's length at compile time. Its entries
+// carry it, through the thread rings and the shared queue alike, so no line
+// needs a strlen of the name.
+TEST_F(SlickLoggerTest, MacroEntriesCarryTheirFileNameLength) {
+    constexpr uint32_t kLength = sizeof("test_logger.cpp") - 1;
+    for (const bool rings : {true, false}) {
+        auto sink = std::make_shared<FileNameSink>();
+        slick::logger::LogConfig config;
+        config.sinks.push_back(sink);
+        config.thread_rings = rings;
+        slick::logger::Logger::instance().init(config);
+        LOG_INFO("from a macro");
+        LOG_SINK_INFO(sink, "from a sink macro");
+        // No length given: still rendered, the writer measures it.
+        slick::logger::Logger::instance().log_to_sink_with_location(-1, slick::logger::LogLevel::L_INFO, "direct.cpp",
+                                                                    7, false, "direct");
+        slick::logger::Logger::instance().shutdown();
+        slick::logger::Logger::instance().reset();
+
+        ASSERT_EQ(sink->names_.size(), 3u) << "rings " << rings;
+        EXPECT_EQ(sink->names_[0], "test_logger.cpp") << "rings " << rings;
+        EXPECT_EQ(sink->lengths_[0], kLength) << "rings " << rings;
+        EXPECT_EQ(sink->names_[1], "test_logger.cpp") << "rings " << rings;
+        EXPECT_EQ(sink->lengths_[1], kLength) << "rings " << rings;
+        EXPECT_EQ(sink->names_[2], "direct.cpp") << "rings " << rings;
+    }
+}
+
 TEST_F(SlickLoggerTest, SinkMacrosAcceptRefPointerAndSharedPtr) {
     slick::logger::Logger::instance().clear_sinks();
     slick::logger::Logger::instance().add_file_sink("test_sink_macro.log", "macro_sink");

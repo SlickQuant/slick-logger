@@ -3849,9 +3849,11 @@ public:
      */
     struct StaticSourceLocation {
         const char* file_name;
+        uint32_t file_length; // so neither the producer nor the writer runs strlen on it
 
         consteval StaticSourceLocation(const char* static_file_name) noexcept
-            : file_name(static_file_name) {
+            : file_name(static_file_name),
+              file_length(static_file_name ? static_cast<uint32_t>(std::char_traits<char>::length(static_file_name)) : 0) {
         }
     };
 
@@ -4005,6 +4007,11 @@ private:
     bool snapshot_entry(LogEntry& copy, const LogEntry& slot, uint64_t index);
     void dispatch_entry(const LogEntry& entry);
 
+    /// log_to_sink_with_location(), given @p file_name's length, or 0 if unknown.
+    template<typename FormatT, typename... Args>
+    void log_at_location(int sink_index, LogLevel level, const char* file_name, uint32_t file_length, uint32_t line,
+                         bool copy_file_name, FormatT&& format, Args&&... args);
+
     // ---- Per-thread rings (LogConfig::thread_rings) ----
 
     void configure_thread_rings(const LogConfig& config) noexcept;
@@ -4016,13 +4023,14 @@ private:
     /// call down the shared path. @p InShm: a SharedProducer, whose records
     /// another process reads, so they must not point into this one.
     template<bool InShm, typename FormatT, typename... Args>
-    bool log_to_thread_ring(int sink_index, LogLevel level, const char* file_name, uint32_t line,
-                            bool copy_file_name, uint64_t timestamp, FormatT&& format, Args&&... args);
+    bool log_to_thread_ring(int sink_index, LogLevel level, const char* file_name, uint32_t file_length,
+                            uint32_t line, bool copy_file_name, uint64_t timestamp, FormatT&& format,
+                            Args&&... args);
     /// log_to_thread_ring<true>, out of line, so Local mode's inlined path does not grow.
     /// @p packed holds the format, then the arguments.
     template<typename Packed>
-    bool log_to_shared_thread_ring(int sink_index, LogLevel level, const char* file_name, uint32_t line,
-                                   bool copy_file_name, uint64_t timestamp, const Packed& packed);
+    bool log_to_shared_thread_ring(int sink_index, LogLevel level, const char* file_name, uint32_t file_length,
+                                   uint32_t line, bool copy_file_name, uint64_t timestamp, const Packed& packed);
     /// The calling thread's ring, claiming one if it has none in this run.
     detail::producer_ring* attach_thread_ring(detail::thread_ring_tls& tls) noexcept;
     /// The calling thread's registry slot, claiming one if it holds none, or
@@ -8223,12 +8231,13 @@ template<typename FormatT, typename... Args>
 inline void Logger::log_to_sink_with_static_location(int sink_index, LogLevel level, StaticSourceLocation location,
                                                      uint32_t line, FormatT&& format, Args&&... args) {
     const bool include_source_location = (source_location_options_.load(std::memory_order_relaxed) & kSourceLocationEnabled) != 0;
-    log_to_sink_with_location(sink_index, level,
-                              include_source_location ? location.file_name : nullptr,
-                              include_source_location ? line : 0,
-                              false,
-                              std::forward<FormatT>(format),
-                              std::forward<Args>(args)...);
+    log_at_location(sink_index, level,
+                    include_source_location ? location.file_name : nullptr,
+                    include_source_location ? location.file_length : 0,
+                    include_source_location ? line : 0,
+                    false,
+                    std::forward<FormatT>(format),
+                    std::forward<Args>(args)...);
 }
 
 // #define IS_STRING_LITERAL(x) ([&]<class T = char>() { \
@@ -8248,6 +8257,13 @@ template<typename FormatT, typename... Args>
 inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, const char* file_name, uint32_t line,
                                               bool copy_file_name,
                                               FormatT&& format, Args&&... args) {
+    log_at_location(sink_index, level, file_name, 0, line, copy_file_name, std::forward<FormatT>(format),
+                    std::forward<Args>(args)...);
+}
+
+template<typename FormatT, typename... Args>
+inline void Logger::log_at_location(int sink_index, LogLevel level, const char* file_name, uint32_t file_length,
+                                    uint32_t line, bool copy_file_name, FormatT&& format, Args&&... args) {
     if (!running_.load(std::memory_order_relaxed) || !log_queue_ || level < log_level_.load(std::memory_order_relaxed))
     {
         return;
@@ -8257,7 +8273,8 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
 
     // One test for Local mode's rings; a SharedProducer's are checked only past it.
     if (local_rings_) {
-        if (log_to_thread_ring<false>(sink_index, level, file_name, line, copy_file_name, timestamp, format, args...)) {
+        if (log_to_thread_ring<false>(sink_index, level, file_name, file_length, line, copy_file_name, timestamp,
+                                      format, args...)) {
             return;
         }
     } else if (ring_in_shm_) [[unlikely]] {
@@ -8266,7 +8283,8 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
         // when this branch is not taken.
         const std::tuple<FormatT&&, detail::cold_arg_t<Args>...> packed(
             std::forward<FormatT>(format), static_cast<detail::cold_arg_t<Args>>(args)...);
-        if (log_to_shared_thread_ring(sink_index, level, file_name, line, copy_file_name, timestamp, packed)) {
+        if (log_to_shared_thread_ring(sink_index, level, file_name, file_length, line, copy_file_name, timestamp,
+                                      packed)) {
             return;
         }
     }
@@ -8283,9 +8301,10 @@ inline void Logger::log_to_sink_with_location(int sink_index, LogLevel level, co
     if (has_source_location(file_name, line)) {
         // A static file name lives in the caller's read-only data, which no other
         // process can address, so shared mode always copies it into the ring.
+        // A length of 0 is unknown: measured here only when copying, else by the writer.
         file = (copy_file_name || use_offsets)
-            ? store_string_in_queue(file_name)
-            : StringRef{file_name, 0};
+            ? store_string_in_queue(file_length ? std::string_view{file_name, file_length} : std::string_view{file_name})
+            : StringRef{file_name, file_length};
         flags |= kEntryHasSourceLocation;
     } else {
         line = 0;
@@ -8383,20 +8402,20 @@ SLICK_LOGGER_FORCE_INLINE void Logger::write_entry(LogEntry& entry, StringRef fo
 
 template<typename Packed>
 SLICK_LOGGER_NOINLINE bool Logger::log_to_shared_thread_ring(int sink_index, LogLevel level, const char* file_name,
-                                                             uint32_t line, bool copy_file_name, uint64_t timestamp,
-                                                             const Packed& packed) {
+                                                             uint32_t file_length, uint32_t line, bool copy_file_name,
+                                                             uint64_t timestamp, const Packed& packed) {
     return std::apply(
         [&](auto&& format, auto&&... args) {
-            return log_to_thread_ring<true>(sink_index, level, file_name, line, copy_file_name, timestamp, format,
-                                            args...);
+            return log_to_thread_ring<true>(sink_index, level, file_name, file_length, line, copy_file_name,
+                                            timestamp, format, args...);
         },
         packed);
 }
 
 template<bool InShm, typename FormatT, typename... Args>
 SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLevel level, const char* file_name,
-                                                          uint32_t line, bool copy_file_name, uint64_t timestamp,
-                                                          FormatT&& format, Args&&... args) {
+                                                          uint32_t file_length, uint32_t line, bool copy_file_name,
+                                                          uint64_t timestamp, FormatT&& format, Args&&... args) {
     detail::thread_ring_tls& tls = detail::tls_thread_ring;
     detail::producer_ring* ring = tls.ring;
     if (!thread_ring_current(tls)) [[unlikely]] {
@@ -8413,10 +8432,10 @@ SLICK_LOGGER_FORCE_INLINE bool Logger::log_to_thread_ring(int sink_index, LogLev
     bool copy_file = false;
     if (has_source_location(file_name, line)) {
         if (copy_file_name) {
-            string_bytes += stage_bytes(file, file_name, std::strlen(file_name), true);
+            string_bytes += stage_bytes(file, file_name, file_length ? file_length : std::strlen(file_name), true);
             copy_file = true;
         } else {
-            file = StringRef{file_name, 0};
+            file = StringRef{file_name, file_length}; // a length of 0 is unknown: the writer measures it
         }
         flags |= kEntryHasSourceLocation;
     } else {
@@ -8754,7 +8773,7 @@ inline size_t Logger::stage_static_strings(StringRef& file, bool& copy_file, Str
     // the collector process cannot read: copy them too.
     size_t bytes = 0;
     if ((flags & kEntryHasSourceLocation) && !copy_file) {
-        bytes += stage_bytes(file, file.ptr, std::strlen(file.ptr), true);
+        bytes += stage_bytes(file, file.ptr, file.length ? file.length : std::strlen(file.ptr), true);
         copy_file = true;
     }
     if (flags & kEntryStaticFormat) {
