@@ -150,14 +150,29 @@ protected:
         if (text_table_limit) {
             encoded_sink->set_text_table_limit(text_table_limit);
         }
+        log_to_both(text, encoded_sink, body, rings);
+    }
+
+    /// Log @p body to a FileSink at @p text and to @p encoded.
+    template<typename Body>
+    void log_to_both(const std::filesystem::path& text, std::shared_ptr<EncodedFileSink> encoded, Body body,
+                     bool rings = true) {
         LogConfig config;
         config.sinks.push_back(std::make_shared<FileSink>(text));
-        config.sinks.push_back(encoded_sink);
+        config.sinks.push_back(std::move(encoded));
         config.thread_rings = rings;
         Logger::instance().init(config);
         body();
         Logger::instance().shutdown();
         Logger::instance().reset();
+    }
+
+    /// Mark @p base's files for @p date as temp: the dated one and _001 to _<count>.
+    void temp_dated(const std::filesystem::path& base, const std::string& date, int count) {
+        temp(slick::logger::detail::suffixed_path(base, date).string());
+        for (int i = 1; i <= count; ++i) {
+            temp(slick::logger::detail::dated_indexed_path(base, date, i).string());
+        }
     }
 
     std::vector<std::filesystem::path> temp_files_;
@@ -339,4 +354,156 @@ TEST_F(EncodedSinkTest, DecodeToolWritesWhatFileSinkWrote) {
     const std::string partial = read_all(decoded);
     EXPECT_GT(partial.size(), expected.size() / 2);
     EXPECT_EQ(expected.compare(0, partial.size(), partial), 0) << "not a prefix of FileSink's file";
+}
+
+namespace {
+
+/// Local noon @p days after today, in ns since epoch.
+uint64_t noon_after(int days) {
+    std::tm tm;
+    EXPECT_TRUE(slick::logger::detail::to_local_tm(std::time(nullptr), tm));
+    tm.tm_mday += days;
+    tm.tm_hour = 12;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    return static_cast<uint64_t>(std::mktime(&tm)) * 1'000'000'000ull;
+}
+
+std::string date_of(uint64_t timestamp) {
+    return slick::logger::detail::local_date(static_cast<time_t>(timestamp / 1'000'000'000ull));
+}
+
+/// "<label> <i>" for i in [0, count).
+std::vector<std::string> numbered(const std::string& label, int count) {
+    std::vector<std::string> messages;
+    for (int i = 0; i < count; ++i) {
+        messages.push_back(label + " " + std::to_string(i));
+    }
+    return messages;
+}
+
+/// The messages of @p files in order, each file read by its own reader.
+std::vector<std::string> messages_of(const std::vector<std::filesystem::path>& files) {
+    std::vector<std::string> messages;
+    for (const auto& file : files) {
+        std::string error;
+        const auto some = decoded_messages(file, &error);
+        EXPECT_EQ(error, "") << file;
+        messages.insert(messages.end(), some.begin(), some.end());
+    }
+    return messages;
+}
+
+} // namespace
+
+// Each rotated file starts its own session and defines the texts it uses, so it
+// decodes alone. Read oldest first, the files reproduce FileSink's output.
+TEST_F(EncodedSinkTest, SizeRotatedFilesEachDecodeOnTheirOwn) {
+    const auto text = temp("enc_rot_text.log");
+    const auto base = temp("enc_rot.slog");
+    const auto decoded = temp("enc_rot_decoded.log");
+    slick::logger::RotationConfig rotation;
+    rotation.max_file_size = 4096;
+    rotation.max_files = 16;
+    for (size_t i = 1; i < rotation.max_files; ++i) {
+        temp(slick::logger::detail::suffixed_path(base, std::to_string(i)).string());
+    }
+    log_to_both(text, std::make_shared<slick::logger::RotatingEncodedFileSink>(base, rotation), log_every_kind);
+
+    std::vector<std::filesystem::path> files; // oldest first: the highest index down to the base file
+    for (size_t i = rotation.max_files - 1; i > 0; --i) {
+        const auto rotated = slick::logger::detail::suffixed_path(base, std::to_string(i));
+        if (std::filesystem::exists(rotated)) {
+            files.push_back(rotated);
+            EXPECT_LT(std::filesystem::file_size(rotated), rotation.max_file_size + 4096) << rotated;
+        }
+    }
+    files.push_back(base);
+    ASSERT_GE(files.size(), 4u) << "never rotated";
+    {
+        FileSink sink(decoded);
+        for (const auto& file : files) {
+            EncodedLogReader reader(file); // a new reader: nothing carries over from the previous file
+            while (const LogEntry* entry = reader.next()) {
+                sink.write(*entry);
+            }
+            EXPECT_EQ(reader.error(), "") << file;
+        }
+    }
+    const std::string expected = read_all(text);
+    EXPECT_EQ(read_all(decoded), expected);
+
+    // The tool decodes them all in one run.
+    std::string args;
+    for (const auto& file : files) {
+        args += file.string() + " ";
+    }
+    ASSERT_EQ(run_process(DECODE_EXE_PATH, args + "-o " + decoded.string()), 0);
+    EXPECT_EQ(read_all(decoded), expected);
+}
+
+// Each entry lands in its own date's file. A date that also rotated by size
+// keeps all its files when midnight retires the last one.
+TEST_F(EncodedSinkTest, DateRotatedFilesHoldTheirDatesEntries) {
+    const auto base = temp("enc_daily.slog");
+    const uint64_t today = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const uint64_t tomorrow = noon_after(1);
+    const uint64_t later = noon_after(2);
+    for (const uint64_t day : {today, tomorrow, later}) {
+        temp_dated(base, date_of(day), 12);
+    }
+    slick::logger::RotationConfig rotation;
+    rotation.max_file_size = 512; // tomorrow fills several
+    rotation.max_files = 12;
+    {
+        slick::logger::DailyEncodedFileSink sink(base, rotation);
+        const auto write = [&](const char* format, uint64_t timestamp, int count) {
+            for (int i = 0; i < count; ++i) {
+                LogEntry entry = make_entry(format, "daily.cpp");
+                entry.timestamp = timestamp + static_cast<uint64_t>(i);
+                entry.arg_count = 1;
+                entry.args[0].type = slick::logger::ArgType::INT32_T;
+                entry.args[0].value.i32 = i;
+                sink.write(entry);
+            }
+        };
+        write("today {}", today, 5);
+        write("tomorrow {}", tomorrow, 60);
+        write("later {}", later, 5);
+    }
+
+    EXPECT_EQ(messages_of({slick::logger::detail::suffixed_path(base, date_of(today))}), numbered("today", 5));
+    std::vector<std::filesystem::path> tomorrows; // oldest first: the highest index, then the dated file
+    for (int i = 12; i >= 1; --i) {
+        const auto file = slick::logger::detail::dated_indexed_path(base, date_of(tomorrow), i);
+        if (std::filesystem::exists(file)) {
+            tomorrows.push_back(file);
+        }
+    }
+    ASSERT_GE(tomorrows.size(), 2u) << "tomorrow never rotated by size";
+    tomorrows.push_back(slick::logger::detail::suffixed_path(base, date_of(tomorrow)));
+    EXPECT_EQ(messages_of(tomorrows), numbered("tomorrow", 60));
+    EXPECT_EQ(messages_of({base}), numbered("later", 5));
+}
+
+// A file last written on an earlier date moves aside when the sink opens.
+TEST_F(EncodedSinkTest, DailyFileFromAnEarlierDateMovesAsideOnOpen) {
+    const auto base = temp("enc_stale.slog");
+    {
+        EncodedFileSink sink(base);
+        sink.write(make_entry("from before", "stale.cpp"));
+    }
+    std::filesystem::last_write_time(base, std::filesystem::file_time_type::clock::now() - std::chrono::hours(72));
+    const std::string written = slick::logger::detail::file_write_date(base);
+    ASSERT_FALSE(written.empty());
+    const auto dated = temp(slick::logger::detail::suffixed_path(base, written).string());
+    {
+        slick::logger::DailyEncodedFileSink sink(base, slick::logger::RotationConfig{});
+        sink.write(make_entry("from today", "stale.cpp"));
+    }
+    EXPECT_EQ(messages_of({dated}), (std::vector<std::string>{"from before"}));
+    EXPECT_EQ(messages_of({base}), (std::vector<std::string>{"from today"}));
 }

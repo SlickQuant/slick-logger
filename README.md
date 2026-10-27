@@ -1217,7 +1217,8 @@ cmake --build build
 
 ```
 slick_log_collector --name <shm-name>
-                    [--console] [--file PATH] [--rotating PATH] [--daily PATH] [--encoded PATH]
+                    [--console] [--file PATH] [--rotating PATH] [--daily PATH]
+                    [--encoded PATH] [--rotating-encoded PATH] [--daily-encoded PATH]
                     [--max-size BYTES] [--max-files N]
                     [--level trace|debug|info|warn|error|fatal]
                     [--queue-size N] [--string-buffer-size N]
@@ -1393,7 +1394,15 @@ Writer thread cost per entry on Windows/MSVC `/O2`, with the entries already que
 | Three scalars and a string | 611 ns | 141 ns | 4.3x / 3.6x / 3.4x | 100 / 64 |
 | Eight scalars | 888 ns | 172 ns | 5.2x / 4.6x / 4.4x | 95 / 80 |
 
-Each sink starts its session with a header, so appending to an existing file is fine. It does not rotate. It keeps up to 16 MiB of format strings and file names to refer to by id (`set_text_table_limit()`), and writes newer text inline in each entry. A collector's entries arrive with their text copied, so the sink matches it by content, which costs a little more than a `LOG_*` literal matched by its address. The collector writes one with `--encoded <path>`.
+Each sink starts its session with a header, so appending to an existing file is fine. It keeps up to 16 MiB of format strings and file names to refer to by id (`set_text_table_limit()`), and writes newer text inline in each entry. A collector's entries arrive with their text copied, so the sink matches it by content, which costs a little more than a `LOG_*` literal matched by its address. The collector writes one with `--encoded <path>`.
+
+`RotatingEncodedFileSink` rotates by size and `DailyEncodedFileSink` by date, with the same `RotationConfig` and file names as `RotatingFileSink` and `DailyFileSink`. Add them with `add_rotating_encoded_file_sink()` and `add_daily_encoded_file_sink()`, or with `--rotating-encoded` and `--daily-encoded` on the collector. Every file starts with a header and defines the texts it uses, so each one decodes alone. Pass several to decode them together, oldest first:
+
+```bash
+slick_log_decode app_2.slog app_1.slog app.slog -o app.log
+```
+
+The daily sink switches files when an entry's timestamp reaches local midnight, so each entry lands in its own date's file. The check is one comparison per entry.
 
 ## Binary logging
 

@@ -42,6 +42,8 @@ int usage() {
         "  --rotating <path>            write to a size-rotated file set\n"
         "  --daily <path>               write to a date-rotated file set\n"
         "  --encoded <path>             write entries in binary, for slick_log_decode to render\n"
+        "  --rotating-encoded <path>    --encoded with size rotation, like --rotating\n"
+        "  --daily-encoded <path>       --encoded with date rotation, like --daily\n"
         "\n"
         "options:\n"
         "  --max-size <bytes>           rotation size threshold (default 10485760)\n"
@@ -68,6 +70,8 @@ int main(int argc, char** argv) {
     std::string rotating_path;
     std::string daily_path;
     std::string encoded_path;
+    std::string rotating_encoded_path;
+    std::string daily_encoded_path;
     bool console = false;
     size_t max_size = 10 * 1024 * 1024;
     size_t max_files = 5;
@@ -96,6 +100,10 @@ int main(int argc, char** argv) {
             daily_path = argv[++i];
         } else if (arg == "--encoded") {
             encoded_path = argv[++i];
+        } else if (arg == "--rotating-encoded") {
+            rotating_encoded_path = argv[++i];
+        } else if (arg == "--daily-encoded") {
+            daily_encoded_path = argv[++i];
         } else if (arg == "--level") {
             level = argv[++i];
         } else if (arg == "--pattern") {
@@ -120,7 +128,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--name is required\n\n");
         return usage();
     }
-    if (!console && file_path.empty() && rotating_path.empty() && daily_path.empty() && encoded_path.empty()) {
+    if (!console && file_path.empty() && rotating_path.empty() && daily_path.empty() && encoded_path.empty() &&
+        rotating_encoded_path.empty() && daily_encoded_path.empty()) {
         std::fprintf(stderr, "at least one sink is required\n\n");
         return usage();
     }
@@ -171,6 +180,13 @@ int main(int argc, char** argv) {
         }
         if (!encoded_path.empty()) {
             config.sinks.push_back(std::make_shared<slick::logger::EncodedFileSink>(encoded_path));
+        }
+        if (!rotating_encoded_path.empty()) {
+            config.sinks.push_back(
+                std::make_shared<slick::logger::RotatingEncodedFileSink>(rotating_encoded_path, rotation));
+        }
+        if (!daily_encoded_path.empty()) {
+            config.sinks.push_back(std::make_shared<slick::logger::DailyEncodedFileSink>(daily_encoded_path, rotation));
         }
 
         slick::logger::Logger::instance().init(config);

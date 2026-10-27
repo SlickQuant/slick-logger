@@ -555,23 +555,25 @@ struct second_cache {
     std::tm tm = {};                          // for CUSTOM formats, which still need put_time
 };
 
+/// localtime() into @p tm rather than a shared buffer, so any thread may call it.
+inline bool to_local_tm(time_t time_val, std::tm& tm) noexcept {
+#if defined(_WIN32)
+    return localtime_s(&tm, &time_val) == 0;
+#else
+    return localtime_r(&time_val, &tm) != nullptr;
+#endif
+}
+
 /**
  * @brief Return the cache filled for @p seconds, or nullptr if it cannot be converted.
  */
 inline const second_cache* cached_second(int64_t seconds) noexcept {
     thread_local second_cache cache;
     if (cache.seconds != seconds) [[unlikely]] {
-        const time_t time_val = static_cast<time_t>(seconds);
         std::tm tm;
-    #if defined(_WIN32)
-        if (localtime_s(&tm, &time_val) != 0) {
+        if (!to_local_tm(static_cast<time_t>(seconds), tm)) {
             return nullptr;
         }
-    #else
-        if (!localtime_r(&time_val, &tm)) {
-            return nullptr;
-        }
-    #endif
         char* out = cache.date_time;
         const uint32_t year = static_cast<uint32_t>(tm.tm_year + 1900);
         write_2_digits(out, year / 100);
@@ -2220,7 +2222,6 @@ public:
 private:
     void check_rotation();
     void rotate_files();
-    std::filesystem::path get_rotated_filename(size_t index);
     
     RotationConfig config_;
     std::filesystem::path base_path_;
@@ -2364,6 +2365,18 @@ public:
     /// Bytes the table may hold, counting a fixed overhead per text.
     void set_limit(size_t bytes) noexcept { limit_ = bytes; }
 
+    /// Drop every text, so a new file can define them again from id 1.
+    void clear() noexcept {
+        std::fill_n(hints_.get(), kHints, hint{});
+        slots_.clear();
+        blocks_.clear();
+        block_at_ = nullptr;
+        block_left_ = 0;
+        count_ = 0;
+        used_ = 0;
+        next_id_ = 1;
+    }
+
 private:
     struct hint {
         const char* ptr = nullptr;  // where the text was last seen
@@ -2472,7 +2485,30 @@ public:
     /// Set before logging: the writer thread reads it.
     void set_text_table_limit(size_t bytes) noexcept { texts_.set_limit(bytes); }
 
+protected:
+    /// Bytes in the current file, written or still buffered.
+    size_t file_size() const noexcept { return file_bytes_ + used_; }
+
+    /**
+     * @brief Close the current file, let @p retire move it aside, then start a new one
+     *
+     * The new file, at the same path, starts with a header and defines each text
+     * again as entries use it, so every file decodes on its own. Call it only
+     * between entries, since an entry refers to texts defined in its own file.
+     */
+    template<typename Retire>
+    void restart_file(Retire&& retire) {
+        drain();
+        close_stream();
+        retire();
+        open_stream(file_path_, std::ios::binary | std::ios::out | std::ios::trunc);
+        file_bytes_ = 0;
+        texts_.clear();
+        write_header();
+    }
+
 private:
+    void write_header();
     /// The id of @p text, writing its definition first when new, or 0 to inline it.
     SLICK_LOGGER_FORCE_INLINE uint32_t text_id(std::string_view text) {
         bool added = false;
@@ -2502,6 +2538,52 @@ private:
     // record, as text sinks do, cost a third of the time an entry takes here.
     std::vector<char> buffer_;
     size_t used_ = 0;
+    size_t file_bytes_ = 0; // bytes already written to the current file
+};
+
+/**
+ * @brief EncodedFileSink that rotates by size, with RotatingFileSink's file names
+ *
+ * When app.slog reaches RotationConfig::max_file_size it moves to app_1.slog and
+ * older files shift to _2 and up, keeping max_files. Each file starts with a
+ * header and defines the texts it uses, so each decodes on its own. Decode several
+ * oldest first: slick_log_decode app_2.slog app_1.slog app.slog.
+ */
+class RotatingEncodedFileSink : public EncodedFileSink {
+public:
+    RotatingEncodedFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
+                            std::string&& name = "");
+
+    void write(const LogEntry& entry) override;
+
+private:
+    RotationConfig config_;
+};
+
+/**
+ * @brief EncodedFileSink that rotates by date, with DailyFileSink's file names
+ *
+ * app.slog holds the current date's entries. When an entry's timestamp reaches
+ * local midnight, the file moves to app_YYYY-MM-DD.slog, so every entry lands in
+ * its own date's file. If RotationConfig::max_file_size is set it also rotates
+ * within a date, to app_YYYY-MM-DD_001.slog and up, keeping max_files per date.
+ * On open, the sink moves aside a file left from an earlier date.
+ */
+class DailyEncodedFileSink : public EncodedFileSink {
+public:
+    DailyEncodedFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
+                         std::string&& name = "");
+
+    void write(const LogEntry& entry) override;
+
+private:
+    /// Make the date of @p timestamp (ns since epoch) the current one.
+    void start_date(uint64_t timestamp);
+    void rotate(uint64_t timestamp);
+
+    RotationConfig config_;
+    std::string date_;      // the current file's date
+    uint64_t next_day_ = 0; // start of the next date in ns since epoch, checked against each entry
 };
 
 /**
@@ -3913,6 +3995,16 @@ public:
     std::shared_ptr<EncodedFileSink> add_encoded_file_sink(const std::filesystem::path& path,
                                                            std::string&& name = "");
 
+    /// add_encoded_file_sink() with size rotation, like add_rotating_file_sink().
+    std::shared_ptr<RotatingEncodedFileSink> add_rotating_encoded_file_sink(const std::filesystem::path& path,
+                                                                            const RotationConfig& config,
+                                                                            std::string&& name = "");
+
+    /// add_encoded_file_sink() with date rotation, like add_daily_file_sink().
+    std::shared_ptr<DailyEncodedFileSink> add_daily_encoded_file_sink(const std::filesystem::path& path,
+                                                                      const RotationConfig& config,
+                                                                      std::string&& name = "");
+
     /**
      * @brief Set the line layout for every sink that has no pattern of its own
      * @param pattern An spdlog-style pattern; empty restores the built-in layout
@@ -4248,6 +4340,10 @@ public:
 private:
     Logger() = default;
     ~Logger();
+
+    /// Construct a sink, add it and return it, for the add_*_sink() calls that return one.
+    template<typename SinkT, typename... CtorArgs>
+    std::shared_ptr<SinkT> emplace_sink(CtorArgs&&... args);
 
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
@@ -6663,21 +6759,137 @@ inline void FileSink::write(const LogEntry& entry) {
     }
 }
 
-inline RotatingFileSink::RotatingFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
-                                          TimestampFormatter::Format timestamp_format, std::string&& name)
-    : FileSink(base_path, timestamp_format, std::move(name)), config_(config), base_path_(base_path), current_file_size_(0) {
-    if (std::filesystem::exists(base_path_)) {
-        current_file_size_ = std::filesystem::file_size(base_path_);
+namespace detail {
+
+// File naming and moving shared by the rotating sinks, text and encoded.
+
+/// Size of @p path in bytes, or 0 if it does not exist.
+inline size_t existing_file_size(const std::filesystem::path& path) noexcept {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    return ec ? 0 : static_cast<size_t>(size);
+}
+
+/// "YYYY-MM-DD" of @p time in local time, or empty if it cannot be converted.
+inline std::string local_date(time_t time) {
+    std::tm tm;
+    if (!to_local_tm(time, tm)) {
+        return {};
+    }
+    char date[11];
+    std::strftime(date, sizeof(date), "%Y-%m-%d", &tm);
+    return date;
+}
+
+/// The local date @p path was last written on, or empty if that can't be read.
+inline std::string file_write_date(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto written = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return {};
+    }
+    const auto system_time = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        written - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+    return local_date(std::chrono::system_clock::to_time_t(system_time));
+}
+
+/// @p base with "_<suffix>" before its extension: log.txt and "1" make log_1.txt.
+inline std::filesystem::path suffixed_path(const std::filesystem::path& base, const std::string& suffix) {
+    return base.parent_path() / (base.stem().string() + "_" + suffix + base.extension().string());
+}
+
+/// An indexed file of @p date, e.g. log_2025-08-25_001.txt.
+inline std::filesystem::path dated_indexed_path(const std::filesystem::path& base, const std::string& date,
+                                                size_t index) {
+    char number[24];
+    std::snprintf(number, sizeof(number), "%03zu", index);
+    return suffixed_path(base, date + "_" + number);
+}
+
+/// Rename, or copy and remove when the rename fails (across volumes, for example).
+inline void move_file(const std::filesystem::path& from, const std::filesystem::path& to) {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    if (ec) {
+        std::filesystem::copy_file(from, to, ec);
+        if (!ec) {
+            std::filesystem::remove(from, ec);
+        }
     }
 }
 
-inline RotatingFileSink::RotatingFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
-                                        const std::string& custom_timestamp_format, std::string&& name)
-    : FileSink(base_path, custom_timestamp_format, std::move(name)), config_(config), base_path_(base_path), current_file_size_(0) {
-    if (std::filesystem::exists(base_path_)) {
-        current_file_size_ = std::filesystem::file_size(base_path_);
+/// Shift RotatingFileSink's files: @p base moves to _1, _1 to _2 and so on.
+/// The oldest, _<max_files - 1>, is deleted.
+inline void shift_rotated_files(const std::filesystem::path& base, size_t max_files) {
+    const auto rotated = [&](size_t index) { return suffixed_path(base, std::to_string(index)); };
+    std::error_code ec;
+    std::filesystem::remove(rotated(max_files - 1), ec);
+    for (size_t i = max_files - 1; i > 0; --i) {
+        const auto from = i == 1 ? base : rotated(i - 1);
+        if (std::filesystem::exists(from, ec)) {
+            move_file(from, rotated(i));
+        }
     }
 }
+
+/// Make room for another file of @p date, with DailyFileSink's names: the dated
+/// file moves to _001, _001 to _002 and so on. The oldest, _<max_files - 1>, is deleted.
+inline void shift_dated_files(const std::filesystem::path& base, const std::string& date, size_t max_files) {
+    const auto dated = suffixed_path(base, date);
+    std::error_code ec;
+    if (max_files == 1) {
+        std::filesystem::remove(dated, ec); // only the dated file is kept, so the new one replaces it
+        return;
+    }
+    if (max_files == 0) {
+        return;
+    }
+    std::filesystem::remove(dated_indexed_path(base, date, max_files - 1), ec);
+    for (size_t i = max_files - 1; i >= 2; --i) {
+        const auto from = dated_indexed_path(base, date, i - 1);
+        if (std::filesystem::exists(from, ec)) {
+            move_file(from, dated_indexed_path(base, date, i));
+        }
+    }
+    if (std::filesystem::exists(dated, ec)) {
+        move_file(dated, dated_indexed_path(base, date, 1));
+    }
+}
+
+/// Move @p base to @p date's name, as a daily sink does at midnight and when it
+/// fills up during the day. If a file from earlier that day already has the
+/// name, that date's files shift first so the move doesn't overwrite it.
+inline void retire_daily_file(const std::filesystem::path& base, const std::string& date, size_t max_files) {
+    std::error_code ec;
+    if (std::filesystem::exists(suffixed_path(base, date), ec)) {
+        shift_dated_files(base, date, max_files);
+    }
+    if (std::filesystem::exists(base, ec)) {
+        move_file(base, suffixed_path(base, date));
+    }
+}
+
+/// If @p base was last written before today, retire it under that date as
+/// midnight would. Returns @p base so a constructor's initializer list can call it.
+inline const std::filesystem::path& retire_stale_daily_file(const std::filesystem::path& base, size_t max_files) {
+    const std::string written = file_write_date(base);
+    if (!written.empty() && written != local_date(std::time(nullptr))) {
+        retire_daily_file(base, written, max_files);
+    }
+    return base;
+}
+
+} // namespace detail
+
+inline RotatingFileSink::RotatingFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
+                                          TimestampFormatter::Format timestamp_format, std::string&& name)
+    : FileSink(base_path, timestamp_format, std::move(name)), config_(config), base_path_(base_path),
+      current_file_size_(detail::existing_file_size(base_path)) {}
+
+inline RotatingFileSink::RotatingFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
+                                        const std::string& custom_timestamp_format, std::string&& name)
+    : FileSink(base_path, custom_timestamp_format, std::move(name)), config_(config), base_path_(base_path),
+      current_file_size_(detail::existing_file_size(base_path)) {}
 
 inline void RotatingFileSink::write(const LogEntry& entry) {
     check_rotation();
@@ -6695,152 +6907,25 @@ inline void RotatingFileSink::check_rotation() {
 
 inline void RotatingFileSink::rotate_files() {
     close_stream();
-
-    // Remove the oldest file if it exists
-    auto oldest_file = get_rotated_filename(config_.max_files - 1);
-    if (std::filesystem::exists(oldest_file)) {
-        std::filesystem::remove(oldest_file);
-    }
-    
-    // Rotate existing files
-    for (size_t i = config_.max_files - 1; i > 0; --i) {
-        auto src = (i == 1) ? base_path_ : get_rotated_filename(i - 1);
-        auto dst = get_rotated_filename(i);
-        
-        if (std::filesystem::exists(src)) {
-            std::filesystem::rename(src, dst);
-        }
-    }
-    
-    // Create new current file
+    detail::shift_rotated_files(base_path_, config_.max_files);
     open_stream(base_path_, kTruncateMode);
     current_file_size_ = 0;
 }
 
-inline std::filesystem::path RotatingFileSink::get_rotated_filename(size_t index) {
-    std::string filename = base_path_.stem().string() + "_" + std::to_string(index) + base_path_.extension().string();
-    return base_path_.parent_path() / filename;
-}
-
+// Retire a file left from an earlier date before FileSink opens the path, so
+// the sink always starts on today's file.
 inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
                                     TimestampFormatter::Format timestamp_format, std::string&& name)
-    : FileSink(base_path, timestamp_format, std::move(name)), config_(config), base_path_(base_path),
-      current_file_size_(0) {
-    current_date_ = get_date_string();
-
-    // Check if file already exists and is from a previous day
-    if (std::filesystem::exists(base_path_)) {
-        auto last_write_time = std::filesystem::last_write_time(base_path_);
-        auto last_write_time_t = std::chrono::system_clock::to_time_t(
-            std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                last_write_time - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now()
-            )
-        );
-        std::tm* tm_ptr = std::localtime(&last_write_time_t);
-        if (tm_ptr) {
-            char date_str[11];
-            std::strftime(date_str, sizeof(date_str), "%Y-%m-%d", tm_ptr);
-            std::string file_date = std::string(date_str);
-
-            // If the existing file is from a previous day, rotate it
-            if (file_date != current_date_) {
-                close_stream();
-
-                // Check if dated file already exists, if so rotate all files for that date
-                std::filesystem::path dated_file = get_dated_filename(file_date);
-                if (std::filesystem::exists(dated_file)) {
-                    rotate_files_for_date(file_date);
-                }
-
-                // Now rename current base file to dated filename
-                std::error_code ec;
-                std::filesystem::rename(base_path_, dated_file, ec);
-                if (ec) {
-                    // If rename fails, try copy and remove
-                    std::filesystem::copy_file(base_path_, dated_file, ec);
-                    if (!ec) {
-                        std::filesystem::remove(base_path_, ec);
-                    }
-                }
-
-                // Reopen file for today
-                open_stream(base_path_, kTruncateMode);
-                if (!file_stream_) {
-                    throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
-                }
-                current_file_size_ = 0;
-            } else {
-                // File is from today, continue appending
-                current_file_size_ = std::filesystem::file_size(base_path_);
-            }
-        } else {
-            // Could not get file date, just continue with current file
-            current_file_size_ = std::filesystem::file_size(base_path_);
-        }
-    }
-    // Keep logging to base_path (e.g., daily.log); the FileSink constructor already opened it
-}
+    : FileSink(detail::retire_stale_daily_file(base_path, config.max_files), timestamp_format, std::move(name)),
+      config_(config), base_path_(base_path), current_date_(get_date_string()),
+      current_file_size_(detail::existing_file_size(base_path)) {}
 
 inline DailyFileSink::DailyFileSink(const std::filesystem::path& base_path, const RotationConfig& config,
                                   const std::string& custom_timestamp_format, std::string&& name)
-    : FileSink(base_path, custom_timestamp_format, std::move(name))
-    , config_(config)
-    , base_path_(base_path)
-    , current_file_size_(0) {
-    current_date_ = get_date_string();
-
-    // Check if file already exists and is from a previous day
-    if (std::filesystem::exists(base_path_)) {
-        auto last_write_time = std::filesystem::last_write_time(base_path_);
-        auto last_write_time_t = std::chrono::system_clock::to_time_t(
-            std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                last_write_time - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now()
-            )
-        );
-        std::tm* tm_ptr = std::localtime(&last_write_time_t);
-        if (tm_ptr) {
-            char date_str[11];
-            std::strftime(date_str, sizeof(date_str), "%Y-%m-%d", tm_ptr);
-            std::string file_date = std::string(date_str);
-
-            // If the existing file is from a previous day, rotate it
-            if (file_date != current_date_) {
-                close_stream();
-
-                // Check if dated file already exists, if so rotate all files for that date
-                std::filesystem::path dated_file = get_dated_filename(file_date);
-                if (std::filesystem::exists(dated_file)) {
-                    rotate_files_for_date(file_date);
-                }
-
-                // Now rename current base file to dated filename
-                std::error_code ec;
-                std::filesystem::rename(base_path_, dated_file, ec);
-                if (ec) {
-                    // If rename fails, try copy and remove
-                    std::filesystem::copy_file(base_path_, dated_file, ec);
-                    if (!ec) {
-                        std::filesystem::remove(base_path_, ec);
-                    }
-                }
-
-                // Reopen file for today
-                open_stream(base_path_, kTruncateMode);
-                if (!file_stream_) {
-                    throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
-                }
-                current_file_size_ = 0;
-            } else {
-                // File is from today, continue appending
-                current_file_size_ = std::filesystem::file_size(base_path_);
-            }
-        } else {
-            // Could not get file date, just continue with current file
-            current_file_size_ = std::filesystem::file_size(base_path_);
-        }
-    }
-    // Keep logging to base_path (e.g., daily.log); the FileSink constructor already opened it
-}
+    : FileSink(detail::retire_stale_daily_file(base_path, config.max_files), custom_timestamp_format,
+               std::move(name)),
+      config_(config), base_path_(base_path), current_date_(get_date_string()),
+      current_file_size_(detail::existing_file_size(base_path)) {}
 
 inline void DailyFileSink::write(const LogEntry& entry) {
     check_rotation();
@@ -6853,106 +6938,25 @@ inline void DailyFileSink::write(const LogEntry& entry) {
 inline void DailyFileSink::check_rotation() {
     std::string today = get_date_string();
 
-    // Check for date-based rotation
+    // Date-based rotation: the file retires under the date it was written on.
     if (today != current_date_) {
-        // Close current file
-        close_stream();
-
-        // Rename current base file to dated filename (e.g., daily.log -> daily_2025-08-24.log)
-        std::filesystem::path old_dated_file = get_dated_filename(current_date_);
-        std::error_code ec;
-        if (std::filesystem::exists(base_path_)) {
-            std::filesystem::rename(base_path_, old_dated_file, ec);
-            if (ec) {
-                // If rename fails, try copy and remove
-                std::filesystem::copy_file(base_path_, old_dated_file, ec);
-                if (!ec) {
-                    std::filesystem::remove(base_path_, ec);
-                }
-            }
-        }
-
-        // Reopen base file for new day's logs
-        open_stream(base_path_, kTruncateMode); // Start fresh for new day
-        if (!file_stream_) {
-            throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
-        }
-
-        current_file_size_ = 0;
+        rotate_daily_files();
         current_date_ = today;
     }
 
-    // Check for size-based rotation
+    // Size-based rotation
     if (config_.max_file_size && current_file_size_ >= config_.max_file_size) {
         rotate_daily_files();
     }
 }
 
 inline void DailyFileSink::rotate_files_for_date(const std::string& date) {
-    // Remove the oldest file if it exists and max_files is configured
-    // Files are: daily_DATE.log (index 0), daily_DATE_001.log (index 1), ..., daily_DATE_<max_files-1>.log (index max_files-1)
-
-    auto dated_file = get_dated_filename(date);
-
-    if (config_.max_files == 1) {
-        // If max_files is 1, we only keep the dated file (no indexed files)
-        // Just remove the old dated file; the new one replaces it
-        if (std::filesystem::exists(dated_file)) {
-            std::filesystem::remove(dated_file);
-        }
-    } else if (config_.max_files > 1) {
-        // Remove the oldest indexed file
-        auto oldest_file = get_dated_indexed_filename(date, config_.max_files - 1);
-        if (std::filesystem::exists(oldest_file)) {
-            std::filesystem::remove(oldest_file);
-        }
-
-        // Rotate existing indexed files for the given date
-        // Start from the highest index and work down to 2
-        for (size_t i = config_.max_files - 1; i >= 2; --i) {
-            auto src = get_dated_indexed_filename(date, i - 1);
-            auto dst = get_dated_indexed_filename(date, i);
-
-            if (std::filesystem::exists(src)) {
-                std::filesystem::rename(src, dst);
-            }
-        }
-
-        // Rotate the dated file (without index) to _001.log
-        if (std::filesystem::exists(dated_file)) {
-            auto indexed_file_1 = get_dated_indexed_filename(date, 1);
-            std::filesystem::rename(dated_file, indexed_file_1);
-        }
-    }
+    detail::shift_dated_files(base_path_, date, config_.max_files);
 }
 
 inline void DailyFileSink::rotate_daily_files() {
     close_stream();
-
-    // Rotate all existing files for the current date (if any)
-    std::filesystem::path dated_file = get_dated_filename(current_date_);
-
-    // Always rotate if dated file exists, which will shift:
-    // daily_2025-10-02.log -> _001.log
-    // _001.log -> _002.log, etc.
-    if (std::filesystem::exists(dated_file)) {
-        rotate_files_for_date(current_date_);
-    }
-
-    // Rename current base file to dated filename (e.g., daily.log -> daily_2025-10-02.log)
-    std::error_code ec;
-    if (std::filesystem::exists(base_path_)) {
-        std::filesystem::rename(base_path_, dated_file, ec);
-        if (ec) {
-            // If rename fails, try copy and remove
-            std::filesystem::copy_file(base_path_, dated_file, ec);
-            if (!ec) {
-                std::filesystem::remove(base_path_, ec);
-            }
-        }
-    }
-
-    // Create new current file
+    detail::retire_daily_file(base_path_, current_date_, config_.max_files);
     open_stream(base_path_, kTruncateMode);
     if (!file_stream_) {
         throw std::runtime_error("Failed to reopen daily log file: " + base_path_.string());
@@ -6961,33 +6965,20 @@ inline void DailyFileSink::rotate_daily_files() {
 }
 
 inline std::filesystem::path DailyFileSink::get_daily_filename() const {
-    std::string date_str = get_date_string();
-    return get_dated_filename(date_str);
+    return get_dated_filename(get_date_string());
 }
 
 inline std::filesystem::path DailyFileSink::get_dated_filename(const std::string& date) const {
-    std::string filename = base_path_.stem().string() + "_" + date + base_path_.extension().string();
-    return base_path_.parent_path() / filename;
+    return detail::suffixed_path(base_path_, date);
 }
 
 inline std::filesystem::path DailyFileSink::get_dated_indexed_filename(const std::string& date, size_t index) const {
-    std::ostringstream oss;
-    oss << base_path_.stem().string() << "_" << date << "_" << std::setfill('0') << std::setw(3) << index << base_path_.extension().string();
-    return base_path_.parent_path() / oss.str();
+    return detail::dated_indexed_path(base_path_, date, index);
 }
 
 inline std::string DailyFileSink::get_date_string() const {
-    auto now = std::chrono::system_clock::now();
-    time_t time_val = std::chrono::system_clock::to_time_t(now);
-    std::tm* tm_ptr = std::localtime(&time_val);
-    if (!tm_ptr) {
-        return "1970-01-01"; // fallback date
-    }
-    std::tm tm = *tm_ptr;
-
-    char date_str[11];
-    std::strftime(date_str, sizeof(date_str), "%Y-%m-%d", &tm);
-    return std::string(date_str);
+    const std::string date = detail::local_date(std::time(nullptr));
+    return date.empty() ? "1970-01-01" : date; // fallback date
 }
 
 inline BinarySink::BinarySink(const std::filesystem::path& file_path, std::string&& name)
@@ -7137,7 +7128,12 @@ inline std::string_view encoded_text_arg(const LogArgument& arg) noexcept {
 
 inline EncodedFileSink::EncodedFileSink(const std::filesystem::path& file_path, std::string&& name)
     // Binary, or Windows would expand every 0x0A byte into CR LF.
-    : FileSinkBase(file_path, std::ios::binary | std::ios::app, std::move(name)) {
+    : FileSinkBase(file_path, std::ios::binary | std::ios::app, std::move(name)),
+      file_bytes_(detail::existing_file_size(file_path)) {
+    write_header();
+}
+
+inline void EncodedFileSink::write_header() {
     detail::record_cursor out{reserve(detail::kEncodedHeaderSize)};
     out.put(detail::kEncodedHeader);
     out.put_bytes(detail::kEncodedMagic, sizeof(detail::kEncodedMagic));
@@ -7160,6 +7156,7 @@ SLICK_LOGGER_NOINLINE inline void EncodedFileSink::drain() {
     if (used_ != 0) {
         // A failed stream drops the batch, as FileSinkBase::write_cached() does.
         file_stream_.write(buffer_.data(), static_cast<std::streamsize>(used_));
+        file_bytes_ += used_;
         used_ = 0;
     }
 }
@@ -7251,6 +7248,62 @@ inline void EncodedFileSink::write(const LogEntry& entry) {
     used_ = static_cast<size_t>(out.at - buffer_.data());
     if (used_ >= write_cache_size_) {
         drain();
+    }
+}
+
+inline RotatingEncodedFileSink::RotatingEncodedFileSink(const std::filesystem::path& base_path,
+                                                        const RotationConfig& config, std::string&& name)
+    : EncodedFileSink(base_path, std::move(name)), config_(config) {}
+
+inline void RotatingEncodedFileSink::write(const LogEntry& entry) {
+    if (file_size() >= config_.max_file_size) [[unlikely]] {
+        restart_file([this] { detail::shift_rotated_files(file_path_, config_.max_files); });
+    }
+    EncodedFileSink::write(entry);
+}
+
+// Retire a file left from an earlier date before the base class opens the
+// path, so the sink always starts on today's file.
+inline DailyEncodedFileSink::DailyEncodedFileSink(const std::filesystem::path& base_path,
+                                                  const RotationConfig& config, std::string&& name)
+    : EncodedFileSink(detail::retire_stale_daily_file(base_path, config.max_files), std::move(name)),
+      config_(config) {
+    start_date(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count()));
+}
+
+inline void DailyEncodedFileSink::start_date(uint64_t timestamp) {
+    const auto seconds = static_cast<time_t>(timestamp / 1'000'000'000);
+    date_ = detail::local_date(seconds);
+    std::tm tm;
+    if (date_.empty() || !detail::to_local_tm(seconds, tm)) {
+        date_ = "1970-01-01";
+        next_day_ = UINT64_MAX; // date unknown, so never switch files
+        return;
+    }
+    tm.tm_mday += 1; // mktime() normalizes this to the next local midnight, DST included
+    tm.tm_hour = 0;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    const time_t next = std::mktime(&tm);
+    next_day_ = next < 0 ? UINT64_MAX : static_cast<uint64_t>(next) * 1'000'000'000;
+}
+
+inline void DailyEncodedFileSink::write(const LogEntry& entry) {
+    const uint64_t timestamp = entry.timestamp;
+    if (timestamp >= next_day_ || (config_.max_file_size && file_size() >= config_.max_file_size)) [[unlikely]] {
+        rotate(timestamp);
+    }
+    EncodedFileSink::write(entry);
+}
+
+inline void DailyEncodedFileSink::rotate(uint64_t timestamp) {
+    // Like DailyFileSink, retire the file under the date it was written on.
+    restart_file([this] { detail::retire_daily_file(file_path_, date_, config_.max_files); });
+    if (timestamp >= next_day_) {
+        start_date(timestamp);
     }
 }
 
@@ -8976,17 +9029,30 @@ inline void Logger::add_daily_file_sink(const std::filesystem::path& path, const
     add_sink(std::make_shared<DailyFileSink>(path, config, custom_timestamp_format, std::move(name)));
 }
 
-inline std::shared_ptr<BinarySink> Logger::add_binary_sink(const std::filesystem::path& path, std::string&& name) {
-    auto sink = std::make_shared<BinarySink>(path, std::move(name));
+template<typename SinkT, typename... CtorArgs>
+inline std::shared_ptr<SinkT> Logger::emplace_sink(CtorArgs&&... args) {
+    auto sink = std::make_shared<SinkT>(std::forward<CtorArgs>(args)...);
     add_sink(sink);
     return sink;
 }
 
+inline std::shared_ptr<BinarySink> Logger::add_binary_sink(const std::filesystem::path& path, std::string&& name) {
+    return emplace_sink<BinarySink>(path, std::move(name));
+}
+
 inline std::shared_ptr<EncodedFileSink> Logger::add_encoded_file_sink(const std::filesystem::path& path,
                                                                       std::string&& name) {
-    auto sink = std::make_shared<EncodedFileSink>(path, std::move(name));
-    add_sink(sink);
-    return sink;
+    return emplace_sink<EncodedFileSink>(path, std::move(name));
+}
+
+inline std::shared_ptr<RotatingEncodedFileSink> Logger::add_rotating_encoded_file_sink(
+    const std::filesystem::path& path, const RotationConfig& config, std::string&& name) {
+    return emplace_sink<RotatingEncodedFileSink>(path, config, std::move(name));
+}
+
+inline std::shared_ptr<DailyEncodedFileSink> Logger::add_daily_encoded_file_sink(
+    const std::filesystem::path& path, const RotationConfig& config, std::string&& name) {
+    return emplace_sink<DailyEncodedFileSink>(path, config, std::move(name));
 }
 
 template<typename FormatT, typename... Args>

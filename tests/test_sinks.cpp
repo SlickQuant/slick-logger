@@ -29,6 +29,7 @@ protected:
             "location_sink1.log", "location_sink2.log",
             "named_sink1.log", "named_sink2.log", "regular_sink.log", "daily_no_size_rotation.log",
             "daily_multi_rotation.log", "daily_restart_test.log", "daily_restart_existing.log",
+            "daily_midnight_test.log",
             "binary_basic.bin", "binary_multi.bin", "binary_empty.bin", "binary_newline.bin",
             "binary_truncate.bin", "binary_framed.bin", "binary_dedicated.bin",
             "binary_chunked.bin",
@@ -50,7 +51,8 @@ protected:
                     filename.find("daily_no_size_rotation_") == 0 ||
                     filename.find("daily_multi_rotation_") == 0 ||
                     filename.find("daily_restart_test_") == 0 ||
-                    filename.find("daily_restart_existing_") == 0) {
+                    filename.find("daily_restart_existing_") == 0 ||
+                    filename.find("daily_midnight_test_") == 0) {
                     std::filesystem::remove(entry.path(), ec);
                 }
             }
@@ -179,31 +181,34 @@ TEST_F(SinkTest, DailyFileSinkTest) {
     EXPECT_TRUE(line.find("Daily sink test message") != std::string::npos);
 }
 
+namespace {
+
+// DailyFileSink with a date the test sets
+class TestDailyFileSink : public slick::logger::DailyFileSink {
+public:
+    TestDailyFileSink(const std::filesystem::path& base_path, const slick::logger::RotationConfig& config)
+        : DailyFileSink(base_path, config), test_date_("2025-08-25")
+    {
+        current_date_ = test_date_;
+    }
+
+    std::string get_date_string() const override {
+        return test_date_;
+    }
+
+    // Set the date and run the rotation check, which rotates when the date changed
+    void change_date_and_check(const std::string& new_date) {
+        test_date_ = new_date;
+        check_rotation();
+    }
+
+private:
+    std::string test_date_;
+};
+
+} // namespace
+
 TEST_F(SinkTest, DailyFileSinkRotation) {
-    // Create a testable DailyFileSink that allows us to control the date
-    class TestDailyFileSink : public slick::logger::DailyFileSink {
-    public:
-        TestDailyFileSink(const std::filesystem::path& base_path, const slick::logger::RotationConfig& config)
-            : DailyFileSink(base_path, config), test_date_("2025-08-25")
-        {
-            current_date_ = test_date_;
-        }
-        
-        // Override to return our controlled test date
-        std::string get_date_string() const override {
-            return test_date_;
-        }
-        
-        // Method to change the date and trigger rotation check
-        void change_date_and_check(const std::string& new_date) {
-            test_date_ = new_date;
-            check_rotation(); // This should trigger rotation when date changes
-        }
-        
-    private:
-        std::string test_date_;
-    };
-    
     slick::logger::RotationConfig daily_config;
     
     slick::logger::Logger::instance().clear_sinks();
@@ -276,6 +281,37 @@ TEST_F(SinkTest, DailyFileSinkRotation) {
     
     // Ensure day 1 messages are not in the current base file
     EXPECT_FALSE(final_base_content.find("Message from day 1") != std::string::npos);
+}
+
+// By midnight, a date that rotated by size already has files under its name.
+// Retiring the day's last file must shift them along instead of overwriting the newest.
+TEST_F(SinkTest, DailyFileSinkKeepsEveryFileOfTheDayAtMidnight) {
+    slick::logger::RotationConfig config;
+    config.max_file_size = 300;
+    config.max_files = 50;
+    slick::logger::Logger::instance().clear_sinks();
+    auto sink = std::make_shared<TestDailyFileSink>("daily_midnight_test.log", config);
+    slick::logger::Logger::instance().add_sink(sink);
+    slick::logger::Logger::instance().init(1024);
+    constexpr int kMessages = 30;
+    for (int i = 0; i < kMessages; ++i) {
+        LOG_INFO("midnight test message {} padded so that a few fill a file", i);
+    }
+    slick::logger::Logger::instance().reset();
+    ASSERT_TRUE(std::filesystem::exists("daily_midnight_test_2025-08-25.log")) << "never rotated by size";
+
+    sink->change_date_and_check("2025-08-26");
+
+    int found = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(".")) {
+        if (entry.path().filename().string().starts_with("daily_midnight_test_2025-08-25")) {
+            std::ifstream file(entry.path());
+            for (std::string line; std::getline(file, line);) {
+                found += line.find("midnight test message") != std::string::npos;
+            }
+        }
+    }
+    EXPECT_EQ(found, kMessages) << "a file of the day was lost at midnight";
 }
 
 TEST_F(SinkTest, DailyFileSinkSizeRotation) {
