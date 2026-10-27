@@ -10,6 +10,19 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
+
 using slick::logger::detail::producer_ring;
 using slick::logger::detail::ring_reader;
 
@@ -344,4 +357,89 @@ TEST(ProducerRing, ConcurrentProducerAndReaderNeverSeeABadRecord) {
     EXPECT_EQ(expected, kRecords);
     EXPECT_EQ(reader.corrupt(), 0u);
     EXPECT_GT(ring->drops(), 0u) << "the ring never filled, so the full path went untested";
+}
+
+namespace {
+
+/// @p size bytes followed by an inaccessible page, so reading one byte past
+/// them faults, as reading past the end of a producer's mapping would.
+class guarded_block {
+public:
+    explicit guarded_block(size_t size) {
+#ifdef _WIN32
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        page_ = info.dwPageSize;
+#else
+        page_ = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#endif
+        span_ = (size + page_ - 1) / page_ * page_;
+#ifdef _WIN32
+        base_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, span_ + page_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        DWORD old_protection = 0;
+        guarded_ = base_ && VirtualProtect(base_ + span_, page_, PAGE_NOACCESS, &old_protection);
+#else
+        void* const mapping = mmap(nullptr, span_ + page_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        base_ = mapping == MAP_FAILED ? nullptr : static_cast<uint8_t*>(mapping);
+        guarded_ = base_ && mprotect(base_ + span_, page_, PROT_NONE) == 0;
+#endif
+        data_ = base_ ? base_ + span_ - size : nullptr;
+    }
+    ~guarded_block() {
+        if (base_) {
+#ifdef _WIN32
+            VirtualFree(base_, 0, MEM_RELEASE);
+#else
+            munmap(base_, span_ + page_);
+#endif
+        }
+    }
+    guarded_block(const guarded_block&) = delete;
+    guarded_block& operator=(const guarded_block&) = delete;
+
+    uint8_t* data() const noexcept { return data_; }
+    bool guarded() const noexcept { return guarded_; }
+
+private:
+    size_t page_ = 0;
+    size_t span_ = 0;
+    uint8_t* base_ = nullptr;
+    uint8_t* data_ = nullptr;
+    bool guarded_ = false;
+};
+
+} // namespace
+
+// A record too short to be an entry can end where the ring does, and the memory
+// after the ring can be unmapped (a producer's mapping ends there). The writer
+// must not read a timestamp out of it.
+TEST(RingView, RecordTooShortForAnEntryIsNotReadPastItsEnd) {
+    constexpr uint64_t kCapacity = 4096;
+    guarded_block block(producer_ring::block_size(kCapacity));
+    ASSERT_TRUE(block.guarded());
+    producer_ring* ring = producer_ring::create(block.data(), kCapacity);
+    // 16-byte records fill the ring exactly, so the last one ends at the guard page.
+    constexpr uint32_t kPayload = 8;
+    const uint64_t records = kCapacity / footprint(kPayload);
+    for (uint64_t i = 0; i < records; ++i) {
+        uint8_t* const payload = ring->try_reserve(kPayload);
+        ASSERT_NE(payload, nullptr);
+        fill(payload, kPayload, i);
+        ring->publish();
+    }
+
+    slick::logger::detail::ring_view view;
+    view.ring = ring;
+    view.reader = ring_reader(*ring);
+    ASSERT_TRUE(view.reader.refresh());
+    uint64_t held = 0;
+    while (view.hold_next()) {
+        EXPECT_EQ(view.head_timestamp, 0u) << "a timestamp read from a record too short to hold one";
+        ++held;
+        view.reader.pop();
+        if (view.reader.batch_done()) {
+            break;
+        }
+    }
+    EXPECT_EQ(held, records);
 }

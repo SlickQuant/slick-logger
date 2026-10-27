@@ -729,6 +729,19 @@ TEST_F(TimestamperTest, SwapWhileLoggingIsSafe) {
 
 // ------------------------------------------------------------- TscTimestamper
 
+// A re-anchor takes two clock reads, so an interval of 0 or less must not make
+// every now() pay for one.
+TEST(TscTimestamperTest, ResyncIntervalHasAFloor) {
+    const std::chrono::nanoseconds too_short[] = {std::chrono::nanoseconds(0), std::chrono::seconds(-5),
+                                                  std::chrono::nanoseconds(1), std::chrono::microseconds(999)};
+    for (const auto interval : too_short) {
+        TscTimestamper tsc(std::chrono::milliseconds(1), interval);
+        EXPECT_EQ(tsc.resync_interval().count(), 1'000'000) << interval.count();
+    }
+    TscTimestamper tsc(std::chrono::milliseconds(1), std::chrono::seconds(2));
+    EXPECT_EQ(tsc.resync_interval().count(), 2'000'000'000);
+}
+
 namespace {
 
 // Far wider than the timestamper's own error, which is a few microseconds at

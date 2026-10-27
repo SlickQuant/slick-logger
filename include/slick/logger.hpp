@@ -2905,6 +2905,10 @@ inline uint64_t mul_shift_32(uint64_t a, uint64_t b) noexcept {
  * followed by a step, as system_clock itself would show it. Readers never wait
  * on a re-anchor in progress.
  *
+ * Both @p calibration and @p resync_interval are at least 1 ms. A shorter one,
+ * 0 or negative included, is raised to 1 ms. Without that floor on
+ * resync_interval, every now() would pay for a re-anchor, which takes two clock reads.
+ *
  * Where the counter cannot stand in for a clock (x86 without an invariant TSC,
  * as some virtual machines report, or an architecture with no counter),
  * uses_cycle_counter() is false and now() is simply system_clock. The counter
@@ -2927,7 +2931,15 @@ public:
     /// case now() returns system_clock's time instead.
     bool uses_cycle_counter() const noexcept { return use_counter_; }
 
+    /// How often now() re-anchors: resync_interval, raised to 1 ms if shorter.
+    std::chrono::nanoseconds resync_interval() const noexcept {
+        return std::chrono::nanoseconds(static_cast<int64_t>(resync_interval_ns_));
+    }
+
 private:
+    /// Floor for calibration and resync_interval (see the class comment).
+    static constexpr std::chrono::nanoseconds kMinInterval = std::chrono::milliseconds(1);
+
     /// One mapping from counter ticks to wall time: ns + (t - ticks) * rate.
     struct Anchor {
         std::atomic<uint64_t> ticks{0};
@@ -2963,12 +2975,13 @@ private:
 };
 
 inline TscTimestamper::TscTimestamper(std::chrono::nanoseconds calibration,
-                                      std::chrono::nanoseconds resync_interval) {
+                                      std::chrono::nanoseconds resync_interval)
+    : resync_interval_ns_(static_cast<uint64_t>(std::max(resync_interval, kMinInterval).count())) {
     if (!detail::cycle_counter_is_steady()) {
         return;
     }
     sample<std::chrono::steady_clock>(base_ticks_, base_steady_ns_);
-    std::this_thread::sleep_for(std::max(calibration, std::chrono::nanoseconds(std::chrono::milliseconds(1))));
+    std::this_thread::sleep_for(std::max(calibration, kMinInterval));
     uint64_t ticks = 0, steady_ns = 0;
     sample<std::chrono::steady_clock>(ticks, steady_ns);
     if (ticks <= base_ticks_ || steady_ns <= base_steady_ns_) {
@@ -2976,7 +2989,6 @@ inline TscTimestamper::TscTimestamper(std::chrono::nanoseconds calibration,
     }
     rate_q32_ = static_cast<uint64_t>(static_cast<double>(steady_ns - base_steady_ns_) * 4294967296.0 /
                                       static_cast<double>(ticks - base_ticks_));
-    resync_interval_ns_ = static_cast<uint64_t>(std::max<int64_t>(resync_interval.count(), 1));
     resync_ticks_ = static_cast<uint64_t>(static_cast<double>(resync_interval_ns_) * 4294967296.0 /
                                           static_cast<double>(std::max<uint64_t>(rate_q32_, 1)));
 
@@ -3501,6 +3513,9 @@ struct thread_ring_exit {
 };
 inline thread_local thread_ring_exit tls_thread_ring_exit;
 
+/// Bytes of a LogEntry before its args, the smallest ring record that can hold an entry.
+inline constexpr size_t kEntryHeaderBytes = offsetof(LogEntry, args);
+
 /// The writer thread's view of one registry slot.
 struct ring_view {
     producer_ring* ring = nullptr;
@@ -3522,7 +3537,13 @@ struct ring_view {
         }
         head = payload->data();
         head_size = static_cast<uint32_t>(payload->size());
-        std::memcpy(&head_timestamp, head + offsetof(LogEntry, timestamp), sizeof(head_timestamp));
+        // A record too short for an entry is corrupt, and dispatch_ring_head()
+        // drops it. Don't read its timestamp, since the record can end at the end
+        // of the ring or of a producer's mapping. Its timestamp stays 0, so it goes first.
+        head_timestamp = 0;
+        if (head_size >= kEntryHeaderBytes) [[likely]] {
+            std::memcpy(&head_timestamp, head + offsetof(LogEntry, timestamp), sizeof(head_timestamp));
+        }
         return true;
     }
 };
@@ -10356,7 +10377,7 @@ inline bool Logger::load_ring_head(detail::ring_view& view, detail::thread_ring_
 }
 
 inline void Logger::dispatch_ring_head(detail::ring_view& view) {
-    constexpr size_t kHeader = offsetof(LogEntry, args);
+    constexpr size_t kHeader = detail::kEntryHeaderBytes;
     if (view.head_size >= kHeader) {
         // Sinks get a full LogEntry they can copy, never the shorter record.
         uint8_t arg_count;
