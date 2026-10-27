@@ -31,7 +31,7 @@ Call timings exclude the writer's drain and flush time. A burst a thread ring ca
 - **Get started:** [Requirements](#requirements), [Installation](#installation), [Basic usage](#basic-usage)
 - **Configure logging:** [Advanced configuration](#advanced-configuration), [Lifecycle and runtime controls](#lifecycle-and-runtime-controls), [Log macros and levels](#log-macros-and-levels)
 - **Format output:** [String formatting](#string-formatting-with-stdformat), [Log patterns](#log-pattern-formatting), [Timestamps](#timestamp-formatting), [Custom timestamper](#custom-timestamper), [Source locations](#source-location-logging)
-- **Choose destinations:** [Sink types](#sink-types), [Custom sinks](#custom-sinks), [Binary logging](#binary-logging)
+- **Choose destinations:** [Sink types](#sink-types), [Encoded log files](#encodedfilesink), [Custom sinks](#custom-sinks), [Binary logging](#binary-logging)
 - **Share the logger:** [Shared libraries](#sharing-the-logger-across-shared-libraries-plugin--strategy-pattern), [Multi-process logging](#multi-process-logging-shared-memory)
 - **Monitor and tune:** [Benchmark highlights](#benchmark-highlights), [Runtime statistics](#runtime-statistics), [Queue tuning](#queue-tuning), [Architecture](#architecture)
 - **Build and explore:** [Examples](#examples), [Building examples/tests](#building-examplestests)
@@ -49,6 +49,7 @@ Call timings exclude the writer's drain and flush time. A burst a thread ring ca
 - **Macro Fast Path**: Disabled log levels skip argument evaluation before anything is queued, both globally and per sink
 - **Direct Sink Logging**: Messages can go to one named sink, or a sink reference, instead of being broadcast
 - **Binary Payloads**: Raw byte payloads, written to a file verbatim by `BinarySink`, with the encoding left entirely to you
+- **Encoded Log Files**: `EncodedFileSink` writes entries in binary and skips formatting, so the writer thread drains them several times faster. `slick_log_decode` renders the file later, exactly as `FileSink` would have
 - **Shared-Library Redirection**: Plugin or strategy libraries can route their logs into the host application's logger
 - **Multi-Process Logging**: Several processes log through shared memory, each thread into a ring of its own, and one collector process drains them all
 - **Runtime Statistics**: An optional background thread samples throughput, queue fullness and drop counts, and writes them to a CSV
@@ -135,6 +136,9 @@ set(SLICK_LOGGER_ENABLE_SOURCE_LOCATION OFF CACHE BOOL "" FORCE)
 # Optional: build the standalone multi-process collector executable (OFF by default).
 # The shared-memory feature itself is header-only and always available.
 set(BUILD_SLICK_LOGGER_COLLECTOR ON CACHE BOOL "" FORCE)
+
+# Optional: build slick_log_decode, which renders EncodedFileSink files as text (OFF by default).
+set(BUILD_SLICK_LOGGER_DECODER ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     slick-logger
@@ -1213,7 +1217,7 @@ cmake --build build
 
 ```
 slick_log_collector --name <shm-name>
-                    [--console] [--file PATH] [--rotating PATH] [--daily PATH]
+                    [--console] [--file PATH] [--rotating PATH] [--daily PATH] [--encoded PATH]
                     [--max-size BYTES] [--max-files N]
                     [--level trace|debug|info|warn|error|fatal]
                     [--queue-size N] [--string-buffer-size N]
@@ -1353,6 +1357,43 @@ Date-based log rotation. It starts a new file each day, switching at midnight, n
 ### BinarySink
 
 Raw byte capture; see [Binary Logging](#binary-logging). It writes binary payloads byte for byte and adds nothing of its own (no header, framing or separators), so the file's format is whatever you wrote into it. The file is opened with `std::ios::binary`, so `0x0A` bytes survive on Windows. Override `write_payload()` to add framing. The sink is dedicated by default, so it only receives entries addressed to it.
+
+### EncodedFileSink
+
+Writes entries in binary and leaves the formatting for later. A text sink spends most of the writer thread's time turning entries into text. This one writes what the entry holds: timestamp, level, thread, pid and tag, source location, and each argument as its bytes. A format string or file name goes in once, and entries refer to it by id after that.
+
+```cpp
+auto& logger = Logger::instance();
+logger.add_encoded_file_sink("app.slog");
+logger.init(1 << 16);
+LOG_INFO("order {} filled {} @ {}", id, qty, price);
+```
+
+`slick_log_decode` renders the file, each line exactly as `FileSink` would have written it. Build it with `-DBUILD_SLICK_LOGGER_DECODER=ON`.
+
+```bash
+slick_log_decode app.slog -o app.log                 # stdout without -o
+slick_log_decode app.slog --pattern "%T.%e %l %v"
+```
+
+It exits with 1 when a crash cut the last record short, after writing everything before it. In code, `EncodedLogReader` hands back each `LogEntry` for any sink to render:
+
+```cpp
+EncodedLogReader reader("app.slog");
+FileSink text("app.log");
+while (const LogEntry* entry = reader.next()) text.write(*entry);
+```
+
+Writer thread cost per entry on Windows/MSVC `/O2`, with the entries already queued when it starts. About 50-100 ns of each is the writer reading and merging the rings.
+
+| Entry | FileSink | EncodedFileSink | Speed-up, 1 / 4 / 8 producers | Bytes per entry, text / encoded |
+| --- | ---: | ---: | ---: | ---: |
+| No arguments | 292 ns | 133 ns | 2.2x / 2.0x / 2.5x | 70 / 28 |
+| Four scalars | 513 ns | 150 ns | 3.4x / 3.2x / 3.5x | 93 / 45 |
+| Three scalars and a string | 611 ns | 141 ns | 4.3x / 3.6x / 3.4x | 100 / 64 |
+| Eight scalars | 888 ns | 172 ns | 5.2x / 4.6x / 4.4x | 95 / 80 |
+
+Each sink starts its session with a header, so appending to an existing file is fine. It does not rotate. It keeps up to 16 MiB of format strings and file names to refer to by id (`set_text_table_limit()`), and writes newer text inline in each entry. A collector's entries arrive with their text copied, so the sink matches it by content, which costs a little more than a `LOG_*` literal matched by its address. The collector writes one with `--encoded <path>`.
 
 ## Binary logging
 

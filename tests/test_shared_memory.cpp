@@ -213,6 +213,42 @@ TEST_F(SharedMemoryTest, CollectsEntriesFromAnotherProcess) {
     EXPECT_EQ(producer_lines, static_cast<size_t>(kMessageCount));
 }
 
+// A collector's formats and file names arrive copied, at a new address each
+// time: an EncodedFileSink must still render them, pid and tag included, as
+// FileSink did.
+TEST_F(SharedMemoryTest, EncodedSinkRendersAnotherProcessAsFileSinkDoes) {
+    const auto log_path = temp_log("test_shm_encoded.log");
+    const auto encoded_path = temp_log("test_shm_encoded.slog");
+    const auto decoded_path = temp_log("test_shm_decoded.log");
+    const auto segment = unique_segment_name("slt_enc_");
+
+    LogConfig config;
+    config.mode = QueueMode::SharedCollector;
+    config.shared_memory_name = segment;
+    config.process_tag = "collector";
+    config.log_queue_size = 1024;
+    config.string_buffer_size = 1 << 16;
+    config.sinks.push_back(std::make_shared<slick::logger::FileSink>(log_path));
+    config.sinks.push_back(std::make_shared<slick::logger::EncodedFileSink>(encoded_path));
+    Logger::instance().init(config);
+    ASSERT_EQ(run_producer("--name " + segment + " --tag prod --count 50 --queue-size 1024 --string-buffer-size 65536"),
+              0);
+    ASSERT_TRUE(wait_for([&] { return read_all(log_path).find("producer done") != std::string::npos; }));
+    Logger::instance().shutdown();
+
+    {
+        slick::logger::EncodedLogReader reader(encoded_path);
+        slick::logger::FileSink decoded(decoded_path);
+        while (const slick::logger::LogEntry* entry = reader.next()) {
+            decoded.write(*entry);
+        }
+        EXPECT_EQ(reader.error(), "");
+    }
+    const std::string expected = read_all(log_path);
+    EXPECT_NE(expected.find(":prod]"), std::string::npos);
+    EXPECT_EQ(read_all(decoded_path), expected);
+}
+
 // Startup order must not matter: the producer creates the segment here.
 TEST_F(SharedMemoryTest, ProducerMayStartBeforeCollector) {
     const auto log_path = temp_log("test_shm_producer_first.log");

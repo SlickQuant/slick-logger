@@ -2300,6 +2300,264 @@ protected:
     std::atomic<size_t> bytes_written_{0};
 };
 
+namespace detail {
+
+// EncodedFileSink's file: records, each a kind byte then its fields, unaligned,
+// in the writer's byte order (the reader checks the header's 0x01020304).
+//   'H' "SLICKLOG" u16 version, u16 0, u32 0x01020304 - starts every session
+//   'T' u32 id, u32 size, bytes - a format string or file name; ids count from 1
+//   'E' u8 level, u8 bits, u8 arg_count, u64 timestamp, u32 thread_id, u32 format,
+//       [u32 file, u32 line], [u32 pid, u8 tag size, tag], then per argument
+//       u8 ArgType and its value: 1, 2, 4 or 8 bytes (a wchar_t as 4, a pointer
+//       as 8), or u32 size and bytes for a string or BLOB.
+// A text id of 0 means the text follows inline, as u32 size and bytes.
+inline constexpr char kEncodedMagic[8] = {'S', 'L', 'I', 'C', 'K', 'L', 'O', 'G'};
+inline constexpr uint16_t kEncodedVersion = 1;
+inline constexpr uint32_t kEncodedByteOrder = 0x01020304;
+inline constexpr char kEncodedHeader = 'H';
+inline constexpr char kEncodedText = 'T';
+inline constexpr char kEncodedEntry = 'E';
+inline constexpr uint8_t kEncodedLocated = 0x01;  // file and line follow
+inline constexpr uint8_t kEncodedProcess = 0x02;  // pid and tag follow
+inline constexpr size_t kEncodedHeaderSize = 1 + sizeof(kEncodedMagic) + 2 + 2 + 4;
+
+/// Bytes an argument takes in an encoded entry by ArgType, or 0 for one written
+/// another way: a wchar_t (as 4 bytes everywhere), a pointer not 8 bytes wide
+/// (as 8), and the strings and BLOB (a u32 size, then the bytes). At namespace
+/// scope: a local constexpr array can be rebuilt on the stack on every call.
+inline constexpr uint8_t kEncodedArgBytes[] = {1, 1, 1, 0, 1, 2, 4, 8, 1, 2, 4, 8, 4, 8,
+                                               sizeof(void*) == 8 ? 8 : 0, 0, 0, 0};
+static_assert(sizeof(kEncodedArgBytes) == static_cast<size_t>(ArgType::BLOB) + 1, "a new ArgType needs its size here");
+
+inline uint8_t encoded_arg_bytes(ArgType type) noexcept {
+    const auto index = static_cast<size_t>(type);
+    return index < sizeof(kEncodedArgBytes) ? kEncodedArgBytes[index] : 0;
+}
+
+/**
+ * @brief Format strings and file names already in an encoded file, by id
+ *
+ * Looked up by address first: a literal stays at one address, so a steady-state
+ * entry costs one direct-mapped slot and a compare against the stored copy. The
+ * compare is what stops an address reused for other text (a ring slot, a
+ * reloaded plugin) from taking the old id. A miss is looked up by content, which
+ * is how copied text (a runtime format, a collector's entries) shares an id.
+ * Writer thread only.
+ */
+class text_table {
+public:
+    static constexpr size_t kDefaultLimit = size_t{16} << 20;
+
+    text_table() : hints_(std::make_unique<hint[]>(kHints)) {}
+
+    /// The id of @p text, adding it when new (@p added set), or 0 when the table
+    /// is full and the text must go inline.
+    SLICK_LOGGER_FORCE_INLINE uint32_t intern(std::string_view text, bool& added) {
+        hint& h = hints_[hint_index(text.data())];
+        if (h.ptr == text.data() && h.size == text.size() && same(h.copy, text)) [[likely]] {
+            added = false;
+            return h.id;
+        }
+        return intern_slow(text.data(), text.size(), h, added);
+    }
+
+    /// Bytes the table may hold, counting a fixed overhead per text.
+    void set_limit(size_t bytes) noexcept { limit_ = bytes; }
+
+private:
+    struct hint {
+        const char* ptr = nullptr;  // where the text was last seen
+        const char* copy = nullptr; // its bytes, kept here
+        uint32_t size = 0;
+        uint32_t id = 0;
+    };
+    struct slot {
+        uint64_t hash = 0;
+        const char* copy = nullptr;
+        uint32_t size = 0;
+        uint32_t id = 0; // 0: empty
+    };
+    static constexpr size_t kHints = 1024;            // power of two
+    static constexpr size_t kOverheadPerText = 64;   // a slot, a hint, the table's slack
+    static constexpr size_t kBlockSize = 64 * 1024;
+
+    static size_t hint_index(const char* ptr) noexcept {
+        // Fibonacci hashing, as message_formats: literals sit at small aligned strides.
+        return static_cast<size_t>((static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)) *
+                                    0x9E3779B97F4A7C15ull) >> 54);
+    }
+    static uint64_t hash(std::string_view text) noexcept;
+    static uint64_t load8(const char* p) noexcept {
+        uint64_t word;
+        std::memcpy(&word, p, 8);
+        return word;
+    }
+    static uint32_t load4(const char* p) noexcept {
+        uint32_t word;
+        std::memcpy(&word, p, 4);
+        return word;
+    }
+    /// Whether @p text matches @p copy. Overlapping words XORed together, one
+    /// branch at the end: the early exits of a memcmp-style loop cost an entry
+    /// more than the compare itself.
+    static SLICK_LOGGER_FORCE_INLINE bool same(const char* copy, std::string_view text) noexcept {
+        const char* const b = text.data();
+        const size_t n = text.size();
+        if (n >= 8) {
+            uint64_t diff = load8(copy + n - 8) ^ load8(b + n - 8);
+            for (size_t i = 0; i + 8 < n; i += 8) {
+                diff |= load8(copy + i) ^ load8(b + i);
+            }
+            return diff == 0;
+        }
+        if (n >= 4) {
+            return ((load4(copy) ^ load4(b)) | (load4(copy + n - 4) ^ load4(b + n - 4))) == 0;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (copy[i] != b[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    /// Pointer and size rather than a string_view, which the Windows x64 ABI
+    /// passes through memory: the hot caller would spill it on every entry.
+    uint32_t intern_slow(const char* data, size_t size, hint& h, bool& added);
+    void insert(const slot& s) noexcept;
+    /// Keep a copy of @p text. Blocks never move, so a copy keeps its address.
+    const char* store(std::string_view text);
+
+    std::unique_ptr<hint[]> hints_;
+    std::vector<slot> slots_;  // open addressing, at most half full
+    std::vector<std::unique_ptr<char[]>> blocks_; // every text, so a hit is checked against its bytes
+    char* block_at_ = nullptr;
+    size_t block_left_ = 0;
+    size_t count_ = 0;
+    size_t used_ = 0;          // text bytes plus kOverheadPerText per text
+    size_t limit_ = kDefaultLimit;
+    uint32_t next_id_ = 1;
+};
+
+} // namespace detail
+
+/**
+ * @brief Writes entries in binary, for EncodedLogReader or slick_log_decode to render later
+ *
+ * A text sink formats every entry on the writer thread, hundreds of nanoseconds
+ * a line. This one writes what the entry holds: timestamp, level, thread, source
+ * location and each argument as its bytes, with a format string or file name
+ * written once and referred to by id after that. The writer drains entries with
+ * arguments 3-6x faster than through FileSink, into a smaller file.
+ *
+ * Read it back with EncodedLogReader, or render it with the slick_log_decode
+ * tool, which writes exactly what a FileSink would have. Each sink starts its
+ * session with a header, so appending to an existing file is fine. Not rotated.
+ *
+ * @code
+ * Logger::instance().add_encoded_file_sink("app.slog");
+ * // later: slick_log_decode app.slog -o app.log
+ * @endcode
+ */
+class EncodedFileSink : public FileSinkBase {
+public:
+    explicit EncodedFileSink(const std::filesystem::path& file_path, std::string&& name = "");
+    /// Hands whatever is still buffered to the file.
+    ~EncodedFileSink() override;
+
+    void write(const LogEntry& entry) override;
+    void flush() override;
+
+    /// Most bytes of format strings and file names kept to refer to by id
+    /// (16 MiB by default). Past it, new text goes inline in every entry using it.
+    /// Set before logging: the writer thread reads it.
+    void set_text_table_limit(size_t bytes) noexcept { texts_.set_limit(bytes); }
+
+private:
+    /// The id of @p text, writing its definition first when new, or 0 to inline it.
+    SLICK_LOGGER_FORCE_INLINE uint32_t text_id(std::string_view text) {
+        bool added = false;
+        const uint32_t id = texts_.intern(text, added);
+        if (added) [[unlikely]] {
+            write_text(id, text.data(), text.size());
+        }
+        return id;
+    }
+    /// A text's definition record. Out of line, so the rare path stays out of
+    /// write(), and pointer and size for the reason intern_slow() takes them.
+    void write_text(uint32_t id, const char* data, size_t size);
+    /// Room for @p size more bytes at the end of the buffer.
+    SLICK_LOGGER_FORCE_INLINE char* reserve(size_t size) {
+        if (used_ + size > buffer_.size()) [[unlikely]] {
+            grow(size);
+        }
+        return buffer_.data() + used_;
+    }
+    void grow(size_t size);
+    /// Hand the buffer to the stream. Out of line: once per write_cache_size() bytes.
+    void drain();
+
+    detail::text_table texts_;
+    // Records are written through a pointer into this buffer, which goes to the
+    // file once it holds write_cache_size() bytes. Growing a std::string per
+    // record, as text sinks do, cost a third of the time an entry takes here.
+    std::vector<char> buffer_;
+    size_t used_ = 0;
+};
+
+/**
+ * @brief Reads a file written by EncodedFileSink back as LogEntry values
+ *
+ * Each entry comes back as the sink saw it, so a sink renders it exactly as it
+ * would have then: give them to a FileSink to get the text file back.
+ *
+ * @code
+ * EncodedLogReader reader("app.slog");
+ * FileSink text("app.log");
+ * while (const LogEntry* entry = reader.next()) text.write(*entry);
+ * if (!reader.error().empty()) std::cerr << reader.error() << '\n';
+ * @endcode
+ */
+class EncodedLogReader {
+public:
+    /// @throws std::runtime_error if @p path cannot be opened, or holds
+    ///         something other than an EncodedFileSink file this version reads
+    explicit EncodedLogReader(const std::filesystem::path& path);
+
+    /// The next entry, valid until the next call, or null at the end of the file
+    /// or at a record it cannot read (see error()).
+    const LogEntry* next();
+
+    /// Why reading stopped before the end of the file, such as a record cut
+    /// short by a crash. Empty when it read everything.
+    const std::string& error() const noexcept { return error_; }
+
+private:
+    /// At least @p size unread bytes in the buffer, false at the end of the file.
+    bool fill(size_t size);
+    template<typename T>
+    bool read(T& value);
+    /// A u32 size and that many bytes, appended to @p out.
+    bool read_text(std::string& out);
+    /// Read a header record, its kind byte already read.
+    bool read_header();
+    bool read_definition();
+    bool read_entry();
+    /// Stop at a bad record: keep @p why for error(), return false.
+    bool fail(std::string why);
+
+    std::ifstream file_;
+    std::vector<char> buffer_;
+    size_t pos_ = 0;
+    size_t end_ = 0;
+    uint64_t consumed_ = 0;         // file offset of buffer_[pos_]
+    // By id - 1. A deque, so a text keeps its address as more arrive: entries
+    // point at it, and the format cache keys on that address.
+    std::deque<std::string> texts_;
+    std::string strings_;           // this entry's inline texts and arguments
+    LogEntry entry_{};
+    std::string error_;
+};
+
 /**
  * @brief One sample of the logging pipeline, published by the statistics thread
  *
@@ -3645,6 +3903,15 @@ public:
      * get_sink() round trip.
      */
     std::shared_ptr<BinarySink> add_binary_sink(const std::filesystem::path& path, std::string&& name = "");
+
+    /**
+     * @brief Add a sink that writes entries in binary, rendered later by slick_log_decode
+     * @param path Path to the encoded file; appended to if it exists
+     * @param name Optional name for the sink
+     * @return The sink, for set_text_table_limit() or the LOG_SINK_* macros
+     */
+    std::shared_ptr<EncodedFileSink> add_encoded_file_sink(const std::filesystem::path& path,
+                                                           std::string&& name = "");
 
     /**
      * @brief Set the line layout for every sink that has no pattern of its own
@@ -6753,6 +7020,520 @@ inline void BinarySink::write_payload(const std::byte* data, size_t size) {
     bytes_written_.fetch_add(size, std::memory_order_relaxed);
 }
 
+namespace detail {
+
+inline uint64_t text_table::hash(std::string_view text) noexcept {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ text.size();
+    const char* p = text.data();
+    size_t n = text.size();
+    for (; n >= 8; p += 8, n -= 8) {
+        uint64_t word;
+        std::memcpy(&word, p, 8);
+        h = (h ^ word) * 0xBF58476D1CE4E5B9ull;
+        h ^= h >> 29;
+    }
+    if (n != 0) {
+        uint64_t tail = 0;
+        std::memcpy(&tail, p, n);
+        h = (h ^ tail) * 0x94D049BB133111EBull;
+    }
+    return h ^ (h >> 32);
+}
+
+SLICK_LOGGER_NOINLINE inline uint32_t text_table::intern_slow(const char* data, size_t size, hint& h, bool& added) {
+    const std::string_view text{data, size};
+    added = false;
+    const uint64_t key = hash(text);
+    if (!slots_.empty()) {
+        const size_t mask = slots_.size() - 1;
+        for (size_t i = key & mask; slots_[i].id != 0; i = (i + 1) & mask) {
+            const slot& s = slots_[i];
+            if (s.hash == key && s.size == text.size() && same(s.copy, text)) {
+                h = {text.data(), s.copy, s.size, s.id};
+                return s.id;
+            }
+        }
+    }
+    if (used_ + text.size() + kOverheadPerText > limit_) {
+        return 0; // full: inline
+    }
+    if ((count_ + 1) * 2 > slots_.size()) {
+        std::vector<slot> old(std::max<size_t>(slots_.size() * 2, 256));
+        old.swap(slots_);
+        for (const slot& s : old) {
+            if (s.id != 0) {
+                insert(s);
+            }
+        }
+    }
+    const slot s{key, store(text), static_cast<uint32_t>(text.size()), next_id_++};
+    insert(s);
+    ++count_;
+    used_ += text.size() + kOverheadPerText;
+    h = {text.data(), s.copy, s.size, s.id};
+    added = true;
+    return s.id;
+}
+
+inline const char* text_table::store(std::string_view text) {
+    if (text.size() > block_left_) {
+        const size_t size = std::max(text.size(), kBlockSize);
+        blocks_.push_back(std::make_unique_for_overwrite<char[]>(size));
+        block_at_ = blocks_.back().get();
+        block_left_ = size;
+    }
+    char* const copy = block_at_;
+    if (!text.empty()) {
+        std::memcpy(copy, text.data(), text.size());
+    }
+    block_at_ += text.size();
+    block_left_ -= text.size();
+    return copy;
+}
+
+inline void text_table::insert(const slot& s) noexcept {
+    const size_t mask = slots_.size() - 1;
+    size_t i = s.hash & mask;
+    while (slots_[i].id != 0) {
+        i = (i + 1) & mask;
+    }
+    slots_[i] = s;
+}
+
+/// Writes an encoded record through a pointer the caller made room behind.
+struct record_cursor {
+    char* at;
+
+    template<typename T>
+    SLICK_LOGGER_FORCE_INLINE void put(T value) noexcept {
+        std::memcpy(at, &value, sizeof(T));
+        at += sizeof(T);
+    }
+    SLICK_LOGGER_FORCE_INLINE void put_bytes(const char* data, size_t size) noexcept {
+        if (size != 0) {
+            std::memcpy(at, data, size);
+        }
+        at += size;
+    }
+};
+
+/// The bytes of a string or BLOB argument, as an encoded entry carries them.
+inline std::string_view encoded_text_arg(const LogArgument& arg) noexcept {
+    if (arg.type == ArgType::STRING_LITERAL) {
+        const char* const text = arg.value.literal_ptr;
+        return text ? std::string_view{text} : std::string_view{};
+    }
+    if (arg.type == ArgType::STRING_DYNAMIC) {
+        return view_string_ref(arg.value.dynamic_str);
+    }
+    if (arg.type == ArgType::BLOB) {
+        const auto bytes = view_binary(arg.value.dynamic_str);
+        return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+    }
+    return {};
+}
+
+} // namespace detail
+
+inline EncodedFileSink::EncodedFileSink(const std::filesystem::path& file_path, std::string&& name)
+    // Binary, or Windows would expand every 0x0A byte into CR LF.
+    : FileSinkBase(file_path, std::ios::binary | std::ios::app, std::move(name)) {
+    detail::record_cursor out{reserve(detail::kEncodedHeaderSize)};
+    out.put(detail::kEncodedHeader);
+    out.put_bytes(detail::kEncodedMagic, sizeof(detail::kEncodedMagic));
+    out.put(detail::kEncodedVersion);
+    out.put(uint16_t{0});
+    out.put(detail::kEncodedByteOrder);
+    used_ = static_cast<size_t>(out.at - buffer_.data());
+}
+
+inline EncodedFileSink::~EncodedFileSink() {
+    drain();
+}
+
+inline void EncodedFileSink::flush() {
+    drain();
+    FileSinkBase::flush();
+}
+
+SLICK_LOGGER_NOINLINE inline void EncodedFileSink::drain() {
+    if (used_ != 0) {
+        // A failed stream drops the batch, as FileSinkBase::write_cached() does.
+        file_stream_.write(buffer_.data(), static_cast<std::streamsize>(used_));
+        used_ = 0;
+    }
+}
+
+SLICK_LOGGER_NOINLINE inline void EncodedFileSink::grow(size_t size) {
+    // A full cache and the record that crosses it, zero-filled once.
+    buffer_.resize(std::max({buffer_.size() * 2, used_ + size, write_cache_size_ + 4096}));
+}
+
+SLICK_LOGGER_NOINLINE inline void EncodedFileSink::write_text(uint32_t id, const char* data, size_t size) {
+    detail::record_cursor out{reserve(1 + 4 + 4 + size)};
+    out.put(detail::kEncodedText);
+    out.put(id);
+    out.put(static_cast<uint32_t>(size));
+    out.put_bytes(data, size);
+    used_ = static_cast<size_t>(out.at - buffer_.data());
+}
+
+inline void EncodedFileSink::write(const LogEntry& entry) {
+    // No check of the stream here: a failed one drops the buffer in drain(), and
+    // reaching its state through ofstream's virtual base costs every entry.
+    // Texts first: an entry refers only to ids defined ahead of it.
+    const std::string_view format = view_string_ref(entry.format);
+    const uint32_t format_id = text_id(format);
+    const bool located = has_source_location(entry);
+    const std::string_view file = located ? view_string_ref(entry.file) : std::string_view{};
+    const uint32_t file_id = located ? text_id(file) : 0;
+    // Local mode has no tag: skip the scan when its first byte says so.
+    const size_t tag_size = entry.tag[0] != '\0' ? detail::tag_length(entry.tag) : 0;
+    const uint32_t pid = entry.pid;
+    const bool process = pid != 0 || tag_size != 0;
+    const uint8_t arg_count = std::min<uint8_t>(entry.arg_count, SLICK_LOGGER_MAX_ARGS);
+
+    // The most the entry takes: per argument its type and 8 bytes (a scalar is
+    // copied whole and trimmed to its size), plus a string's bytes. The sizes
+    // are summed, not kept: a local array costs MSVC a stack cookie check.
+    size_t bound = 1 + 3 + 8 + 4 + 4 + (format_id ? 0 : 4 + format.size()) +
+                   (located ? 8 + (file_id ? 0 : 4 + file.size()) : 0) + (process ? 5 + tag_size : 0) +
+                   size_t{arg_count} * (1 + 8);
+    for (uint8_t i = 0; i < arg_count; ++i) {
+        const LogArgument& arg = entry.args[i];
+        if (detail::encoded_arg_bytes(arg.type) == 0) {
+            bound += detail::encoded_text_arg(arg).size(); // its u32 size is inside the 8 counted
+        }
+    }
+
+    detail::record_cursor out{reserve(bound)};
+    out.put(detail::kEncodedEntry);
+    out.put(static_cast<uint8_t>(entry.level));
+    out.put(static_cast<uint8_t>((located ? detail::kEncodedLocated : 0) | (process ? detail::kEncodedProcess : 0)));
+    out.put(arg_count);
+    out.put(entry.timestamp);
+    out.put(entry.thread_id);
+    const auto put_text = [&](uint32_t id, std::string_view text) {
+        out.put(id);
+        if (id == 0) {
+            out.put(static_cast<uint32_t>(text.size()));
+            out.put_bytes(text.data(), text.size());
+        }
+    };
+    put_text(format_id, format);
+    if (located) {
+        put_text(file_id, file);
+        out.put(entry.line);
+    }
+    if (process) {
+        out.put(pid);
+        out.put(static_cast<uint8_t>(tag_size));
+        out.put_bytes(entry.tag, tag_size);
+    }
+    for (uint8_t i = 0; i < arg_count; ++i) {
+        const LogArgument& arg = entry.args[i];
+        out.put(static_cast<uint8_t>(arg.type));
+        if (const uint8_t bytes = detail::encoded_arg_bytes(arg.type)) [[likely]] {
+            std::memcpy(out.at, &arg.value, 8); // one move whatever the size
+            out.at += bytes;
+            continue;
+        }
+        if (arg.type == ArgType::WCHAR) { // 2 bytes on Windows, 4 elsewhere
+            out.put(static_cast<uint32_t>(arg.value.wc));
+        } else if (arg.type == ArgType::PTR) {
+            out.put(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(arg.value.ptr)));
+        } else {
+            const std::string_view text = detail::encoded_text_arg(arg);
+            out.put(static_cast<uint32_t>(text.size()));
+            out.put_bytes(text.data(), text.size());
+        }
+    }
+    used_ = static_cast<size_t>(out.at - buffer_.data());
+    if (used_ >= write_cache_size_) {
+        drain();
+    }
+}
+
+inline EncodedLogReader::EncodedLogReader(const std::filesystem::path& path)
+    : file_(path, std::ios::binary), buffer_(size_t{1} << 20) {
+    if (!file_) {
+        throw std::runtime_error("Failed to open encoded log: " + path.string());
+    }
+    char kind = 0;
+    if (!read(kind)) {
+        return; // empty: no entries
+    }
+    if (kind != detail::kEncodedHeader || !read_header()) {
+        throw std::runtime_error(path.string() + ": " +
+                                 (error_.empty() ? std::string("not a file written by EncodedFileSink") : error_));
+    }
+}
+
+inline bool EncodedLogReader::fill(size_t size) {
+    if (end_ - pos_ >= size) [[likely]] {
+        return true;
+    }
+    std::memmove(buffer_.data(), buffer_.data() + pos_, end_ - pos_);
+    end_ -= pos_;
+    pos_ = 0;
+    if (buffer_.size() < size) {
+        buffer_.resize(std::max(size, buffer_.size() * 2));
+    }
+    while (end_ < size && file_) {
+        file_.read(buffer_.data() + end_, static_cast<std::streamsize>(buffer_.size() - end_));
+        end_ += static_cast<size_t>(file_.gcount());
+    }
+    return end_ >= size;
+}
+
+template<typename T>
+inline bool EncodedLogReader::read(T& value) {
+    if (!fill(sizeof(T))) {
+        return false;
+    }
+    std::memcpy(&value, buffer_.data() + pos_, sizeof(T));
+    pos_ += sizeof(T);
+    consumed_ += sizeof(T);
+    return true;
+}
+
+inline bool EncodedLogReader::read_text(std::string& out) {
+    static constexpr uint32_t kMaxText = uint32_t{1} << 26; // past this the file is corrupt
+    uint32_t size = 0;
+    if (!read(size)) {
+        return false;
+    }
+    if (size > kMaxText) {
+        return fail("a text of " + std::to_string(size) + " bytes at offset " + std::to_string(consumed_ - 4));
+    }
+    if (!fill(size)) {
+        return false;
+    }
+    out.append(buffer_.data() + pos_, size);
+    pos_ += size;
+    consumed_ += size;
+    return true;
+}
+
+inline bool EncodedLogReader::fail(std::string why) {
+    if (error_.empty()) {
+        error_ = std::move(why);
+    }
+    return false;
+}
+
+inline bool EncodedLogReader::read_header() {
+    char magic[sizeof(detail::kEncodedMagic)];
+    uint16_t version = 0;
+    uint16_t reserved = 0;
+    uint32_t byte_order = 0;
+    if (!read(magic) || !read(version) || !read(reserved) || !read(byte_order)) {
+        return false;
+    }
+    if (std::memcmp(magic, detail::kEncodedMagic, sizeof(magic)) != 0) {
+        return fail("not a file written by EncodedFileSink");
+    }
+    if (byte_order != detail::kEncodedByteOrder) {
+        return fail("written on a machine of the other byte order");
+    }
+    if (version == 0 || version > detail::kEncodedVersion) {
+        return fail("format version " + std::to_string(version) + ", this build reads up to " +
+                    std::to_string(detail::kEncodedVersion));
+    }
+    texts_.clear(); // a new session numbers its texts from 1 again
+    return true;
+}
+
+inline bool EncodedLogReader::read_definition() {
+    uint32_t id = 0;
+    if (!read(id)) {
+        return false;
+    }
+    if (id != texts_.size() + 1) {
+        return fail("text " + std::to_string(id) + " out of order at offset " + std::to_string(consumed_ - 4));
+    }
+    texts_.emplace_back();
+    return read_text(texts_.back());
+}
+
+inline bool EncodedLogReader::read_entry() {
+    uint8_t level = 0;
+    uint8_t bits = 0;
+    uint8_t arg_count = 0;
+    uint64_t timestamp = 0;
+    uint32_t thread_id = 0;
+    if (!read(level) || !read(bits) || !read(arg_count) || !read(timestamp) || !read(thread_id)) {
+        return false;
+    }
+    if (level >= static_cast<uint8_t>(LogLevel::L_OFF)) {
+        return fail("an entry at level " + std::to_string(level));
+    }
+    if (arg_count > SLICK_LOGGER_MAX_ARGS) {
+        return fail("an entry with " + std::to_string(arg_count) + " arguments, past SLICK_LOGGER_MAX_ARGS (" +
+                    std::to_string(SLICK_LOGGER_MAX_ARGS) + ") in this build");
+    }
+    LogEntry& e = entry_;
+    e = LogEntry{};
+    e.timestamp = timestamp;
+    e.thread_id = thread_id;
+    e.level = static_cast<LogLevel>(level);
+    e.arg_count = arg_count;
+
+    // Inline texts and arguments go to strings_, which may move as it grows,
+    // so their addresses are set once the whole entry is in.
+    struct pending {
+        int target; // -2 format, -1 file, else the argument
+        size_t offset;
+        uint32_t size;
+    };
+    pending pendings[SLICK_LOGGER_MAX_ARGS + 2];
+    size_t pending_count = 0;
+    strings_.clear();
+    const auto read_inline = [&](int target) {
+        const size_t offset = strings_.size();
+        if (!read_text(strings_)) {
+            return false;
+        }
+        pendings[pending_count++] = {target, offset, static_cast<uint32_t>(strings_.size() - offset)};
+        strings_.push_back('\0'); // a literal is read up to its NUL
+        return true;
+    };
+    const auto read_ref = [&](StringRef& ref, int target, bool& interned) {
+        uint32_t id = 0;
+        if (!read(id)) {
+            return false;
+        }
+        interned = id != 0;
+        if (id == 0) {
+            return read_inline(target);
+        }
+        if (id > texts_.size()) {
+            return fail("an unknown text " + std::to_string(id) + " at offset " + std::to_string(consumed_ - 4));
+        }
+        const std::string& text = texts_[id - 1];
+        ref = StringRef{text.c_str(), static_cast<uint32_t>(text.size())};
+        return true;
+    };
+
+    bool interned = false;
+    if (!read_ref(e.format, -2, interned)) {
+        return false;
+    }
+    if (interned) {
+        // Fixed while this reader lives, so its parse can be kept: see message_formats.
+        e.flags |= kEntryStaticFormat;
+    }
+    if (bits & detail::kEncodedLocated) {
+        bool unused = false;
+        uint32_t line = 0;
+        if (!read_ref(e.file, -1, unused) || !read(line)) {
+            return false;
+        }
+        e.line = line;
+        e.flags |= kEntryHasSourceLocation;
+    }
+    if (bits & detail::kEncodedProcess) {
+        uint32_t pid = 0;
+        uint8_t tag_size = 0;
+        if (!read(pid) || !read(tag_size)) {
+            return false;
+        }
+        if (tag_size > SLICK_LOGGER_TAG_SIZE) {
+            return fail("a process tag of " + std::to_string(tag_size) + " bytes");
+        }
+        if (!fill(tag_size)) {
+            return false;
+        }
+        std::memcpy(e.tag, buffer_.data() + pos_, tag_size);
+        pos_ += tag_size;
+        consumed_ += tag_size;
+        e.pid = pid;
+    }
+    for (uint8_t i = 0; i < arg_count; ++i) {
+        uint8_t type = 0;
+        if (!read(type)) {
+            return false;
+        }
+        if (type > static_cast<uint8_t>(ArgType::BLOB)) {
+            return fail("an argument of unknown type " + std::to_string(type));
+        }
+        LogArgument& arg = e.args[i];
+        arg.type = static_cast<ArgType>(type);
+        if (const uint8_t size = detail::encoded_arg_bytes(arg.type)) {
+            if (!fill(size)) {
+                return false;
+            }
+            std::memcpy(reinterpret_cast<char*>(&arg.value), buffer_.data() + pos_, size);
+            pos_ += size;
+            consumed_ += size;
+            continue;
+        }
+        switch (arg.type) {
+        case ArgType::WCHAR: {
+            uint32_t wc = 0;
+            if (!read(wc)) {
+                return false;
+            }
+            arg.value.wc = static_cast<wchar_t>(wc);
+            continue;
+        }
+        case ArgType::PTR: {
+            uint64_t ptr = 0;
+            if (!read(ptr)) {
+                return false;
+            }
+            arg.value.ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(ptr));
+            continue;
+        }
+        default: // STRING_LITERAL, STRING_DYNAMIC, BLOB
+            if (!read_inline(i)) {
+                return false;
+            }
+            continue;
+        }
+    }
+    for (size_t i = 0; i < pending_count; ++i) {
+        const pending& p = pendings[i];
+        const StringRef ref{strings_.data() + p.offset, p.size};
+        if (p.target == -2) {
+            e.format = ref;
+        } else if (p.target == -1) {
+            e.file = ref;
+        } else if (e.args[p.target].type == ArgType::STRING_LITERAL) {
+            e.args[p.target].value.literal_ptr = ref.ptr;
+        } else {
+            e.args[p.target].value.dynamic_str = ref;
+        }
+    }
+    return true;
+}
+
+inline const LogEntry* EncodedLogReader::next() {
+    while (error_.empty()) {
+        const uint64_t start = consumed_;
+        char kind = 0;
+        if (!read(kind)) {
+            return nullptr; // the end, between records
+        }
+        bool complete = false;
+        if (kind == detail::kEncodedEntry) {
+            if (read_entry()) {
+                return &entry_;
+            }
+        } else if (kind == detail::kEncodedText) {
+            complete = read_definition();
+        } else if (kind == detail::kEncodedHeader) {
+            complete = read_header();
+        } else {
+            fail("an unknown record at offset " + std::to_string(start));
+        }
+        if (!complete) {
+            fail("the record at offset " + std::to_string(start) + " is cut short");
+        }
+    }
+    return nullptr;
+}
+
 inline Logger& Logger::instance() {
     return *override_instance_.load(std::memory_order_acquire);
 }
@@ -8197,6 +8978,13 @@ inline void Logger::add_daily_file_sink(const std::filesystem::path& path, const
 
 inline std::shared_ptr<BinarySink> Logger::add_binary_sink(const std::filesystem::path& path, std::string&& name) {
     auto sink = std::make_shared<BinarySink>(path, std::move(name));
+    add_sink(sink);
+    return sink;
+}
+
+inline std::shared_ptr<EncodedFileSink> Logger::add_encoded_file_sink(const std::filesystem::path& path,
+                                                                      std::string&& name) {
+    auto sink = std::make_shared<EncodedFileSink>(path, std::move(name));
     add_sink(sink);
     return sink;
 }

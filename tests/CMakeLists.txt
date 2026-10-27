@@ -123,6 +123,22 @@ if(BUILD_SLICK_LOGGER_TESTING)
     )
     add_test(NAME slick_logger_shm_tests COMMAND slick_logger_shm_tests)
 
+    # --- EncodedFileSink, its reader and the decode tool ---
+    # The tool is built here whatever BUILD_SLICK_LOGGER_DECODER says, so the
+    # test can run it; same path-injection trick as above.
+    add_executable(slick_logger_test_decode ${PROJECT_SOURCE_DIR}/tools/slick_log_decode.cpp)
+    target_link_libraries(slick_logger_test_decode PRIVATE slick::logger)
+
+    add_executable(slick_logger_encoded_tests test_encoded_sink.cpp)
+    target_link_libraries(slick_logger_encoded_tests PRIVATE slick::logger GTest::gtest_main)
+    add_dependencies(slick_logger_encoded_tests slick_logger_test_decode)
+    target_compile_definitions(slick_logger_encoded_tests PRIVATE
+        DECODE_EXE_PATH="$<TARGET_FILE:slick_logger_test_decode>"
+    )
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/slick_logger_encoded_tests.wd)
+    add_test(NAME slick_logger_encoded_tests COMMAND slick_logger_encoded_tests
+             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/slick_logger_encoded_tests.wd)
+
 else()
     message(STATUS "Testing disabled - skipping slick-logger tests")
 endif()

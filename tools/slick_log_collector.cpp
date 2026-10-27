@@ -41,6 +41,7 @@ int usage() {
         "  --file <path>                write to a single file\n"
         "  --rotating <path>            write to a size-rotated file set\n"
         "  --daily <path>               write to a date-rotated file set\n"
+        "  --encoded <path>             write entries in binary, for slick_log_decode to render\n"
         "\n"
         "options:\n"
         "  --max-size <bytes>           rotation size threshold (default 10485760)\n"
@@ -66,6 +67,7 @@ int main(int argc, char** argv) {
     std::string file_path;
     std::string rotating_path;
     std::string daily_path;
+    std::string encoded_path;
     bool console = false;
     size_t max_size = 10 * 1024 * 1024;
     size_t max_files = 5;
@@ -92,6 +94,8 @@ int main(int argc, char** argv) {
             rotating_path = argv[++i];
         } else if (arg == "--daily") {
             daily_path = argv[++i];
+        } else if (arg == "--encoded") {
+            encoded_path = argv[++i];
         } else if (arg == "--level") {
             level = argv[++i];
         } else if (arg == "--pattern") {
@@ -116,7 +120,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--name is required\n\n");
         return usage();
     }
-    if (!console && file_path.empty() && rotating_path.empty() && daily_path.empty()) {
+    if (!console && file_path.empty() && rotating_path.empty() && daily_path.empty() && encoded_path.empty()) {
         std::fprintf(stderr, "at least one sink is required\n\n");
         return usage();
     }
@@ -164,6 +168,9 @@ int main(int argc, char** argv) {
         }
         if (!daily_path.empty()) {
             config.sinks.push_back(std::make_shared<slick::logger::DailyFileSink>(daily_path, rotation));
+        }
+        if (!encoded_path.empty()) {
+            config.sinks.push_back(std::make_shared<slick::logger::EncodedFileSink>(encoded_path));
         }
 
         slick::logger::Logger::instance().init(config);

@@ -21,6 +21,7 @@ option(SLICK_LOGGER_DEFAULT_THREAD_RINGS "Give each logging thread its own ring 
 # The multi-process collector is a convenience executable;
 # the shared-memory feature itself is header-only and always available.
 option(BUILD_SLICK_LOGGER_COLLECTOR "Build the standalone slick_log_collector executable" OFF)
+option(BUILD_SLICK_LOGGER_DECODER "Build slick_log_decode, which renders EncodedFileSink files as text" OFF)
 option(BUILD_SLICK_LOGGER_BENCHMARKS "Build performance benchmarks" OFF)
 
 # 2.3.0 or newer is required: the string ring is built with the items_per_slot
@@ -135,7 +136,7 @@ add_subdirectory(tests)
 # Add examples (placeholder)
 add_subdirectory(examples)
 
-if(BUILD_SLICK_LOGGER_COLLECTOR)
+if(BUILD_SLICK_LOGGER_COLLECTOR OR BUILD_SLICK_LOGGER_DECODER)
     add_subdirectory(tools)
 endif()
 
