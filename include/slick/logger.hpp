@@ -163,9 +163,9 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetLastError(void);
 #endif
 
 #define SLICK_LOGGER_VERSION_MAJOR 2
-#define SLICK_LOGGER_VERSION_MINOR 3
+#define SLICK_LOGGER_VERSION_MINOR 4
 #define SLICK_LOGGER_VERSION_PATCH 0
-#define SLICK_LOGGER_VERSION "2.3.0"
+#define SLICK_LOGGER_VERSION "2.4.0"
 
 #ifndef SLICK_LOGGER_MAX_ARGS
 #define SLICK_LOGGER_MAX_ARGS 20

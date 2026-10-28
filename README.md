@@ -25,6 +25,7 @@ and shared-memory logging across processes.
 - **Log Rotation**: Size-based and time-based rotation with configurable retention, for text and encoded files alike
 - **Customizable Pattern**: An spdlog-style `set_pattern()` that controls the whole line (field order, widths, alignment and which span is colored), globally or per sink
 - **Source Locations**: `LOG_*` macros record the call-site file and line by default, and a runtime switch turns that off
+- **Custom Clocks**: Stamp entries from any clock, including the built-in `TscTimestamper`, which reads the CPU cycle counter for under half the cost of `system_clock`
 - **Binary Payloads**: Raw byte payloads through the same queue, written verbatim by `BinarySink`
 - **Encoded Log Files**: `EncodedFileSink` writes entries in binary and skips formatting, so the writer thread drains them several times faster; `slick_log_decode` renders the file later
 - **Shared-Library Redirection**: Plugin or strategy libraries can route their logs into the host application's logger

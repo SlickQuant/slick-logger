@@ -85,6 +85,12 @@ unpaired UTF-16 surrogate on Windows, has no character to print and falls back
 to its numeric code point. Wide *strings* are not supported; convert them
 yourself before logging.
 
+### long double arguments
+
+A `long double` is logged as a `double`. MSVC's `long double` is the same size
+as `double`, so nothing changes there. Where it is wider (80-bit x87 on GCC and
+Clang for x86, 128-bit on some ARM targets), the extra precision is lost.
+
 `std::format` handles strings, numbers, pointers, chrono values, and any type
 with a `std::formatter` specialization, including width, precision, and
 alignment, and you can add formatters for your own types. It is part of the

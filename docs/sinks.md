@@ -170,7 +170,7 @@ Size-based log rotation. The size limit is configurable (default 10MB), only the
 
 ### DailyFileSink
 
-Date-based log rotation. It starts a new file each day, switching at midnight, names files `filename_YYYY-MM-DD.log`, and can clean up old files.
+Date-based log rotation. The day's lines go to `filename.log`, which is renamed `filename_YYYY-MM-DD.log` at midnight. With `max_file_size` set, it also rotates within a day. The newest of the day's earlier files is `filename_YYYY-MM-DD.log` and older ones get `_001`, `_002` and so on, keeping `max_files` per date. At midnight the day's last file joins them and the rest shift along. When the sink opens, it renames a file left over from an earlier date the same way.
 
 ### BinarySink
 
