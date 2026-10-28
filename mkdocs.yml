@@ -1,0 +1,102 @@
+site_name: Slick Logger
+site_description: Header-only C++20 asynchronous logger with lock-free per-thread rings
+site_url: https://slickquant.github.io/slick-logger/
+repo_url: https://github.com/SlickQuant/slick-logger
+repo_name: SlickQuant/slick-logger
+edit_uri: edit/main/docs/
+copyright: MIT licensed
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.indexes
+    - toc.follow
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+
+nav:
+  - Home: README.md
+  - Get started:
+      - Getting started: getting-started.md
+      - Configuration: configuration.md
+  - Guides:
+      - Formatting: formatting.md
+      - Sinks and rotation: sinks.md
+      - Binary and encoded logs: binary.md
+      - Timestamps: timestamps.md
+      - Runtime statistics: statistics.md
+  - Going further:
+      - Shared libraries: shared-libraries.md
+      - Multi-process logging: multi-process.md
+      - Architecture: architecture.md
+      - Performance: performance.md
+  - Known limitations: limitations.md
+  # Absolute URL: the Doxygen output is copied into site/api/ after the MkDocs
+  # build, so it does not exist under docs_dir and a relative path would warn.
+  - API Reference: https://slickquant.github.io/slick-logger/api/
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  # Mermaid diagrams. Without this custom_fences block every ```mermaid block
+  # renders as a plain code listing instead of a diagram.
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+plugins:
+  - search
+
+# `mkdocs build --strict` turns these into build failures, so a renamed heading
+# cannot silently break a cross-reference.
+validation:
+  links:
+    absolute_links: ignore
+    unrecognized_links: warn
+    anchors: warn
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/SlickQuant/slick-logger

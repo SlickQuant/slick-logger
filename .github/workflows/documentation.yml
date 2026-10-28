@@ -1,0 +1,132 @@
+name: Documentation
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'Doxyfile.in'
+      - 'requirements-docs.txt'
+      - '*.md'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'Doxyfile.in'
+      - 'requirements-docs.txt'
+      - '*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================================
+  # Build the combined site (MkDocs narrative docs + Doxygen API reference)
+  # and deploy it to GitHub Pages.
+  #
+  # Unlike ci.yml this job never configures CMake: Doxygen parses src/ directly
+  # and needs nothing but itself, graphviz and Python. The CMake
+  # slick-logger-docs target still exists for local use.
+  # ============================================================================
+  build-docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required to push to the gh-pages branch
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Doxygen
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y doxygen graphviz
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: pip
+        cache-dependency-path: requirements-docs.txt
+
+    - name: Install MkDocs
+      run: pip install -r requirements-docs.txt
+
+    # Stands in for CMake's configure_file(Doxyfile.in ... @ONLY). The version
+    # sits on its own line in project(), so match the keyword rather than the
+    # whole project() call.
+    - name: Generate Doxyfile
+      run: |
+        version=$(sed -n 's/^ *VERSION \([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+        if [ -z "$version" ]; then
+          echo "::error::Could not parse project VERSION from CMakeLists.txt"
+          exit 1
+        fi
+        echo "Documenting version $version"
+        sed "s/@PROJECT_VERSION@/$version/" Doxyfile.in > Doxyfile
+
+    - name: Build narrative documentation (MkDocs)
+      run: mkdocs build --strict
+
+    - name: Build API reference (Doxygen)
+      run: doxygen Doxyfile
+
+    # Publish the combined site once. Separate deployments would require
+    # keep_files: true and could race on the gh-pages branch.
+    - name: Assemble combined site
+      run: |
+        mkdir -p site/api
+        cp -r doxygen-out/html/. site/api/
+        test -f site/index.html
+        test -f site/api/index.html
+
+    - name: Upload site artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: documentation-site
+        path: site/
+
+    - name: Deploy to GitHub Pages
+      if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ github.token }}
+        publish_dir: ./site
+
+  # ============================================================================
+  # Link Check
+  # ============================================================================
+  check-links:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check Markdown Links
+      uses: gaurav-nelson/github-action-markdown-link-check@v1
+      with:
+        use-quiet-mode: 'yes'
+        config-file: '.github/markdown-link-check-config.json'
+
+  # ============================================================================
+  # Markdown Lint
+  # ============================================================================
+  markdown-lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Published documentation and the README only. AGENT.md is agent
+    # instructions, not docs, and is deliberately not linted.
+    - name: Lint Markdown Files
+      uses: articulate/actions-markdownlint@v1
+      with:
+        config: .markdownlint.json
+        files: 'README.md docs/*.md'
+        ignore: 'build'

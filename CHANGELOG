@@ -1,3 +1,12 @@
+# Unreleased
+The documentation moved out of the README into a published guide, and the C++ API reference is now generated from the comments the header already carried.
+
+- **Docs site.** `docs/` builds with MkDocs Material and is published at <https://slickquant.github.io/slick-logger/>, one page per topic: getting started, configuration, formatting, sinks and rotation, binary and encoded logs, timestamps, runtime statistics, shared libraries, multi-process logging, architecture and performance. The README keeps the original heading anchors beside links to the moved sections, including the `#multi-process-logging-shared-memory` link used by the v2.3.0 release notes
+- **Known limitations.** A new page collects the sharp edges that were scattered through the README: lossy rings and what `entry_loss_count` does and does not count, format strings stored by pointer, the argument and payload caps, and the build settings that must match across a shared library or a shared-memory segment
+- **API reference.** Doxygen parses `src/logger.hpp` and publishes to `/api/` on the same site, excluding the `slick::logger::detail` namespace. `cmake --build build --target slick-logger-docs` builds it locally when Doxygen is installed; the target exists only in a top-level configure, so FetchContent and `add_subdirectory()` consumers get neither it nor a `docs` collision, and without Doxygen it is left out too. A top-level configure also answers to the shorter `docs`
+- **README.** Keeps the full installation instructions alongside the overview, feature list, performance table and quick start. A guide table links to the detailed pages and preserves the original section anchors
+- **CI.** A new `documentation.yml` workflow builds the guide with `mkdocs build --strict`, generates the API reference, publishes both to GitHub Pages, and runs a Markdown link check and markdownlint
+
 # v2.3.0 - 10-17-2026
 Entries can now be stamped by a clock of your choice instead of always `std::chrono::system_clock`: a calibrated TSC, a backtest's simulated time, or a fixed clock in tests. Code that calls `LOG_*` needs no changes, the default output is unchanged, and a 2.3.0 process can share a segment with a 2.2.x one.
 

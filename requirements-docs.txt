@@ -1,0 +1,11 @@
+# Documentation site toolchain.
+#
+#   pip install -r requirements-docs.txt
+#   mkdocs serve          # live preview on http://127.0.0.1:8000
+#   mkdocs build          # static site into site/
+#
+# The C++ API reference is generated separately by Doxygen (see Doxyfile.in);
+# CI copies it into site/api/ before publishing.
+
+mkdocs-material>=9.5,<10
+pymdown-extensions>=10.7,<11

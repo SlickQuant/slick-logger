@@ -1,0 +1,259 @@
+# Doxyfile for slick-logger
+#
+# Generates the C++ API reference published at <site>/api/.
+#
+# MkDocs builds the narrative documentation (installation, configuration,
+# formatting, sinks, multi-process logging) from docs/. That directory is left
+# out of INPUT so Doxygen does not process those pages too.
+#
+# src/logger.hpp is the source of truth, and include/slick/logger.hpp is
+# generated from it by CMake's configure_file(). Parsing src/ keeps the
+# reference independent of a configure step, so the four SLICK_LOGGER_VERSION*
+# macros show their @...@ placeholders here. The page header shows the version
+# instead, filled in at configure time.
+
+#---------------------------------------------------------------------------
+# Project related configuration options
+#---------------------------------------------------------------------------
+
+DOXYFILE_ENCODING      = UTF-8
+PROJECT_NAME           = "slick-logger"
+PROJECT_NUMBER         = @PROJECT_VERSION@
+PROJECT_BRIEF          = "Header-only C++20 asynchronous logger with lock-free per-thread rings"
+PROJECT_LOGO           =
+
+# Not docs/api: docs/ is MkDocs' docs_dir, so HTML generated there would end up
+# in the MkDocs site build.
+#
+# Keep this a single path component. Doxygen creates only the last component of
+# OUTPUT_DIRECTORY, so a nested path like build/doxygen fails outright in a
+# fresh checkout where build/ does not exist yet:
+#   error: tag OUTPUT_DIRECTORY: Output directory 'build/doxygen' does not
+#          exist and cannot be created
+OUTPUT_DIRECTORY       = doxygen-out
+
+CREATE_SUBDIRS         = NO
+ALLOW_UNICODE_NAMES    = NO
+OUTPUT_LANGUAGE        = English
+BRIEF_MEMBER_DESC      = YES
+REPEAT_BRIEF           = YES
+ALWAYS_DETAILED_SEC    = NO
+INLINE_INHERITED_MEMB  = NO
+FULL_PATH_NAMES        = YES
+STRIP_FROM_PATH        = src/
+STRIP_FROM_INC_PATH    = src/
+SHORT_NAMES            = NO
+JAVADOC_AUTOBRIEF      = YES
+JAVADOC_BANNER         = NO
+QT_AUTOBRIEF           = NO
+MULTILINE_CPP_IS_BRIEF = NO
+INHERIT_DOCS           = YES
+SEPARATE_MEMBER_PAGES  = NO
+TAB_SIZE               = 4
+MARKDOWN_SUPPORT       = YES
+TOC_INCLUDE_HEADINGS   = 5
+AUTOLINK_SUPPORT       = YES
+BUILTIN_STL_SUPPORT    = YES
+DISTRIBUTE_GROUP_DOC   = NO
+GROUP_NESTED_COMPOUNDS = NO
+SUBGROUPING            = YES
+INLINE_GROUPED_CLASSES = NO
+INLINE_SIMPLE_STRUCTS  = NO
+TYPEDEF_HIDES_STRUCT   = NO
+LOOKUP_CACHE_SIZE      = 0
+NUM_PROC_THREADS       = 0
+
+#---------------------------------------------------------------------------
+# Build related configuration options
+#---------------------------------------------------------------------------
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_PRIV_VIRTUAL   = NO
+EXTRACT_PACKAGE        = NO
+EXTRACT_STATIC         = NO
+EXTRACT_LOCAL_CLASSES  = YES
+EXTRACT_LOCAL_METHODS  = NO
+EXTRACT_ANON_NSPACES   = NO
+RESOLVE_UNNAMED_PARAMS = YES
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+HIDE_FRIEND_COMPOUNDS  = NO
+HIDE_IN_BODY_DOCS      = NO
+INTERNAL_DOCS          = NO
+CASE_SENSE_NAMES       = YES
+HIDE_SCOPE_NAMES       = NO
+HIDE_COMPOUND_REFERENCE= NO
+SHOW_HEADERFILE        = YES
+SHOW_INCLUDE_FILES     = YES
+SHOW_GROUPED_MEMB_INC  = NO
+FORCE_LOCAL_INCLUDES   = NO
+INLINE_INFO            = YES
+SORT_MEMBER_DOCS       = YES
+SORT_BRIEF_DOCS        = NO
+SORT_MEMBERS_CTORS_1ST = YES
+SORT_GROUP_NAMES       = NO
+SORT_BY_SCOPE_NAME     = NO
+STRICT_PROTO_MATCHING  = NO
+GENERATE_TODOLIST      = YES
+GENERATE_TESTLIST      = YES
+GENERATE_BUGLIST       = YES
+GENERATE_DEPRECATEDLIST= YES
+ENABLED_SECTIONS       =
+MAX_INITIALIZER_LINES  = 30
+SHOW_USED_FILES        = YES
+SHOW_FILES             = YES
+SHOW_NAMESPACES        = YES
+
+# slick::logger::detail holds hundreds of implementation helpers that would bury
+# the public API, so it is excluded. Everything else in slick::logger is public.
+EXCLUDE_SYMBOLS        = slick::logger::detail
+
+#---------------------------------------------------------------------------
+# Input options
+#---------------------------------------------------------------------------
+
+INPUT                  = src/
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.hpp \
+                         *.h
+RECURSIVE              = NO
+EXCLUDE                =
+EXCLUDE_SYMLINKS       = NO
+EXCLUDE_PATTERNS       =
+EXAMPLE_PATH           =
+EXAMPLE_PATTERNS       =
+EXAMPLE_RECURSIVE      = NO
+FILTER_SOURCE_FILES    = NO
+USE_MDFILE_AS_MAINPAGE =
+
+#---------------------------------------------------------------------------
+# Source browsing
+#---------------------------------------------------------------------------
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = YES
+REFERENCED_BY_RELATION = NO
+REFERENCES_RELATION    = NO
+REFERENCES_LINK_SOURCE = YES
+SOURCE_TOOLTIPS        = YES
+USE_HTAGS              = NO
+VERBATIM_HEADERS       = NO
+
+#---------------------------------------------------------------------------
+# Indexing
+#---------------------------------------------------------------------------
+
+ALPHABETICAL_INDEX     = YES
+IGNORE_PREFIX          =
+
+#---------------------------------------------------------------------------
+# HTML output
+#---------------------------------------------------------------------------
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_FILE_EXTENSION    = .html
+HTML_COLORSTYLE        = AUTO_LIGHT
+HTML_COLORSTYLE_HUE    = 220
+HTML_COLORSTYLE_SAT    = 100
+HTML_COLORSTYLE_GAMMA  = 80
+HTML_DYNAMIC_MENUS     = YES
+HTML_DYNAMIC_SECTIONS  = NO
+HTML_CODE_FOLDING      = YES
+HTML_INDEX_NUM_ENTRIES = 100
+GENERATE_DOCSET        = NO
+GENERATE_HTMLHELP      = NO
+GENERATE_QHP           = NO
+GENERATE_ECLIPSEHELP   = NO
+DISABLE_INDEX          = NO
+GENERATE_TREEVIEW      = YES
+FULL_SIDEBAR           = NO
+ENUM_VALUES_PER_LINE   = 4
+TREEVIEW_WIDTH         = 250
+EXT_LINKS_IN_WINDOW    = NO
+OBFUSCATE_EMAILS       = YES
+SEARCHENGINE           = YES
+SERVER_BASED_SEARCH    = NO
+EXTERNAL_SEARCH        = NO
+
+#---------------------------------------------------------------------------
+# Output formats we do not generate
+#---------------------------------------------------------------------------
+
+GENERATE_LATEX         = NO
+GENERATE_RTF           = NO
+GENERATE_MAN           = NO
+GENERATE_XML           = NO
+GENERATE_DOCBOOK       = NO
+GENERATE_AUTOGEN_DEF   = NO
+GENERATE_SQLITE3       = NO
+GENERATE_PERLMOD       = NO
+
+#---------------------------------------------------------------------------
+# Configuration options related to the preprocessor
+#---------------------------------------------------------------------------
+
+ENABLE_PREPROCESSING   = YES
+
+# Only the macros listed below are expanded. slick-logger's LOG_* macros expand
+# into thousands of tokens (level checks, call-site capture, argument packing),
+# and letting Doxygen expand those would dominate the parse and bury the class
+# reference. They are documented in docs/getting-started.md instead.
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+SEARCH_INCLUDES        = YES
+INCLUDE_PATH           = src/
+INCLUDE_FILE_PATTERNS  =
+
+# Macros the header itself defines behind an #if that Doxygen cannot evaluate
+# here. _WIN32 is left undefined, so the POSIX branches are the ones documented.
+PREDEFINED             = SLICK_LOGGER_ENABLE_THREAD_ID=1 \
+                         SLICK_LOGGER_ENABLE_LOSS_DETECTION=0 \
+                         SLICK_LOGGER_ENABLE_CPU_RELAX=1 \
+                         SLICK_LOGGER_ENABLE_SOURCE_LOCATION=1 \
+                         SLICK_LOGGER_DEFAULT_THREAD_RINGS=1 \
+                         SLICK_LOGGER_MAX_ARGS=20 \
+                         SLICK_LOGGER_TAG_SIZE=16 \
+                         SLICK_LOGGER_TSAN=0 \
+                         SLICK_LOGGER_HAS_ATOMIC_SHARED_PTR=1 \
+                         SLICK_LOGGER_HAS_FLOAT128_T=1 \
+                         DOXYGEN_SHOULD_SKIP_THIS \
+                         __cplusplus=202002L
+EXPAND_AS_DEFINED      =
+SKIP_FUNCTION_MACROS   = YES
+
+#---------------------------------------------------------------------------
+# Configuration options related to diagram generator tools
+#---------------------------------------------------------------------------
+
+HIDE_UNDOC_RELATIONS   = YES
+HAVE_DOT               = YES
+DOT_NUM_THREADS        = 0
+DOT_COMMON_ATTR        = "fontname=Helvetica,fontsize=10"
+DOT_EDGE_ATTR          = "labelfontname=Helvetica,labelfontsize=10"
+DOT_NODE_ATTR          = "shape=box,height=0.2,width=0.4"
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = YES
+GROUP_GRAPHS           = YES
+UML_LOOK               = YES
+UML_LIMIT_NUM_FIELDS   = 10
+DOT_UML_DETAILS        = NO
+DOT_WRAP_THRESHOLD     = 17
+TEMPLATE_RELATIONS     = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = YES
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+GRAPHICAL_HIERARCHY    = YES
+DIRECTORY_GRAPH        = YES
+DIR_GRAPH_MAX_DEPTH    = 1
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+DOT_PATH               =
+DOT_GRAPH_MAX_NODES    = 50
+MAX_DOT_GRAPH_DEPTH    = 0
+DOT_MULTI_TARGETS      = YES
+GENERATE_LEGEND        = YES
+DOT_CLEANUP            = YES

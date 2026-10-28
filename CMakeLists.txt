@@ -144,6 +144,36 @@ if(BUILD_SLICK_LOGGER_BENCHMARKS AND CMAKE_BUILD_TYPE MATCHES Release)
     add_subdirectory(benchmarks)
 endif()
 
+# Convenience targets for local use: `cmake --build build --target slick-logger-docs`,
+# with `docs` as a shorter alias. CI does not use them: .github/workflows/
+# documentation.yml runs doxygen directly, so the docs build does not depend on
+# this project's configure. Output lands in doxygen-out/html (see Doxyfile.in).
+#
+# Only the top-level project gets them. A build that pulls this file in through
+# FetchContent or add_subdirectory() belongs to the parent, which builds its own
+# docs, and a target named `docs` here would collide with one of the parent's
+# ("add_custom_target cannot create target docs" fails the whole configure).
+# It also keeps find_package(Doxygen) out of a consumer's configure.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    find_package(Doxygen QUIET)
+    if(DOXYGEN_FOUND)
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in
+            ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+            @ONLY
+        )
+        add_custom_target(slick-logger-docs
+            COMMAND ${DOXYGEN_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            COMMENT "Generating API documentation with Doxygen (version ${PROJECT_VERSION})"
+            VERBATIM
+        )
+        add_custom_target(docs DEPENDS slick-logger-docs)
+    else()
+        message(STATUS "Doxygen not found - `slick-logger-docs` target unavailable")
+    endif()
+endif()
+
 # Installation rules
 install(DIRECTORY include/ DESTINATION include)
 

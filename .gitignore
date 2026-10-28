@@ -48,3 +48,9 @@ build*/
 .agents/
 *.log
 benchmark_logs/
+
+# Documentation build output (mkdocs build, doxygen, CMake docs target)
+doxygen-out/
+site/
+.cache/
+Doxyfile

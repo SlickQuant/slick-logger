@@ -195,7 +195,7 @@ jobs:
             separate dependency to install. Their licences are in `licenses/`.
 
             `slick-log-collector-*` contains the prebuilt standalone collector for
-            [multi-process logging](https://github.com/SlickQuant/slick-logger#multi-process-logging-shared-memory).
+            [multi-process logging](https://slickquant.github.io/slick-logger/multi-process/#multi-process-logging-shared-memory).
             It is optional; you only need it to collect log entries from several
             processes into one set of sinks.
 
