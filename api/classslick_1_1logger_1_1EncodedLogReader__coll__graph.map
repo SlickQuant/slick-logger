@@ -1,0 +1,3 @@
+<map id="slick::logger::EncodedLogReader" name="slick::logger::EncodedLogReader">
+<area shape="rect" id="Node000001" title="Reads a file written by EncodedFileSink back as LogEntry values." alt="" coords="5,5,184,125"/>
+</map>

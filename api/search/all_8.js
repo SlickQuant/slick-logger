@@ -1,0 +1,26 @@
+var searchData=
+[
+  ['i16_0',['i16',['../structslick_1_1logger_1_1LogArgument.html#a97197f9a6c330ced185d43f31d262727',1,'slick::logger::LogArgument']]],
+  ['i32_1',['i32',['../structslick_1_1logger_1_1LogArgument.html#a5bfb1a1b5a6e47d0861128e7c80477d7',1,'slick::logger::LogArgument']]],
+  ['i64_2',['i64',['../structslick_1_1logger_1_1LogArgument.html#a3ef3a9ed6f22ff6d3dfb68a4aa8eac19',1,'slick::logger::LogArgument']]],
+  ['i8_3',['i8',['../structslick_1_1logger_1_1LogArgument.html#a9bff12b949e185eb19c98d94bc85bbb1',1,'slick::logger::LogArgument']]],
+  ['include_5fsource_5flocation_4',['include_source_location',['../structslick_1_1logger_1_1LogConfig.html#a66eaa9879c41635b8913447f7c577fd9',1,'slick::logger::LogConfig']]],
+  ['index_5',['index',['../classslick_1_1logger_1_1ISink.html#a4a0d46774264757c2f15eb74e10d2d40',1,'slick::logger::ISink']]],
+  ['index_5f_6',['index_',['../classslick_1_1logger_1_1ISink.html#ac51f8797421e7e838ad6be069de6aa34',1,'slick::logger::ISink']]],
+  ['inherited_5fpattern_5f_7',['inherited_pattern_',['../classslick_1_1logger_1_1ISink.html#a3f8a3226668bbed5d071fdd3997e1235',1,'slick::logger::ISink']]],
+  ['inherited_5fstore_5f_8',['inherited_store_',['../classslick_1_1logger_1_1ISink.html#a8422d12409d12e712f41088146e09997',1,'slick::logger::ISink']]],
+  ['init_9',['init',['../classslick_1_1logger_1_1Logger.html#a8243e21caa6dd43dbc357317defa7995',1,'slick::logger::Logger::init(const std::filesystem::path &amp;log_file, size_t log_queue_size=65536, size_t string_buffer_size=1&lt;&lt; 24)'],['../classslick_1_1logger_1_1Logger.html#a4febeea8346aea207ffd2619ccedaba4',1,'slick::logger::Logger::init(const LogConfig &amp;config)'],['../classslick_1_1logger_1_1Logger.html#abcdd1630644be3bb82edf271d30b9896',1,'slick::logger::Logger::init(size_t queue_size=65536, size_t string_buffer_size=1&lt;&lt; 24)']]],
+  ['instance_10',['instance',['../classslick_1_1logger_1_1Logger.html#a22523580063ab21b3eb7afa74c6944da',1,'slick::logger::Logger']]],
+  ['int16_5ft_11',['INT16_T',['../namespaceslick_1_1logger.html#a3d216ece2ff5f7efd58310548de2fd5fa5e66c6e44fda6975bc1d1f10f4ea0436',1,'slick::logger']]],
+  ['int32_5ft_12',['INT32_T',['../namespaceslick_1_1logger.html#a3d216ece2ff5f7efd58310548de2fd5fa1436af9feb7b630b48ac357f5157bbca',1,'slick::logger']]],
+  ['int64_5ft_13',['INT64_T',['../namespaceslick_1_1logger.html#a3d216ece2ff5f7efd58310548de2fd5faf9ac882f78f9c31f0a7cfb558ff6b7df',1,'slick::logger']]],
+  ['int8_5ft_14',['INT8_T',['../namespaceslick_1_1logger.html#a3d216ece2ff5f7efd58310548de2fd5faa4ce26f417237ef0667dd68d978d9193',1,'slick::logger']]],
+  ['interval_5fsec_15',['interval_sec',['../structslick_1_1logger_1_1LogStats.html#a931914037ee736afef8031529f38b1f1',1,'slick::logger::LogStats']]],
+  ['is_5fdedicated_16',['is_dedicated',['../classslick_1_1logger_1_1ISink.html#a488c1adf1cad9bce4f44e542c8cd9c7f',1,'slick::logger::ISink']]],
+  ['is_5ffloat128_5fv_17',['is_float128_v',['../namespaceslick_1_1logger.html#a5f11961209aaaa4bdfbf3dea62b56208',1,'slick::logger']]],
+  ['is_5fsingle_5fformat_5fargs_5fv_18',['is_single_format_args_v',['../namespaceslick_1_1logger.html#a0d0194304effba15361396ec57a510bf',1,'slick::logger']]],
+  ['is_5fstring_5fliteral_19',['IS_STRING_LITERAL',['../logger_8hpp.html#a03a845ce31ed480a45de26aeb94a8617',1,'logger.hpp']]],
+  ['isink_20',['isink',['../classslick_1_1logger_1_1ISink.html#aae47de9e02f358e7c63cf22bafe56255',1,'slick::logger::ISink::ISink()'],['../classslick_1_1logger_1_1ISink.html',1,'slick::logger::ISink']]],
+  ['iso8601_21',['ISO8601',['../classslick_1_1logger_1_1TimestampFormatter.html#ab998487251a066b5d9517ed64ba68972a35b6786739efcdc5a74ab1dca29d3b6b',1,'slick::logger::TimestampFormatter']]],
+  ['itimestamper_22',['ITimestamper',['../classslick_1_1logger_1_1ITimestamper.html',1,'slick::logger']]]
+];

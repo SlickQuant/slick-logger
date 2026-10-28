@@ -1,0 +1,21 @@
+<map id="slick::logger::ISink" name="slick::logger::ISink">
+<area shape="rect" id="Node000001" title=" " alt="" coords="134,5,310,571"/>
+<area shape="rect" id="Node000002" href="$classslick_1_1logger_1_1ConsoleSink.html" title=" " alt="" coords="27,739,209,864"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="165,585,133,739,128,738,159,584"/>
+<area shape="rect" id="Node000003" href="$classslick_1_1logger_1_1FileSinkBase.html" title="Shared file&#45;stream plumbing for sinks that write to a file." alt="" coords="233,619,419,984"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="285,583,292,618,286,619,279,584"/>
+<area shape="rect" id="Node000004" href="$classslick_1_1logger_1_1BinarySink.html" title="Writes raw binary payloads to a file, byte for byte." alt="" coords="27,1062,198,1187"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="227,979,223,986,165,1063,161,1060,218,982,223,976"/>
+<area shape="rect" id="Node000005" href="$classslick_1_1logger_1_1EncodedFileSink.html" title="Writes entries in binary, for EncodedLogReader or slick_log_decode to render later." alt="" coords="223,1032,429,1217"/>
+<area shape="poly" id="edge4_Node000003_Node000005" title=" " alt="" coords="329,997,329,1032,323,1032,323,997"/>
+<area shape="rect" id="Node000008" href="$classslick_1_1logger_1_1FileSink.html" title=" " alt="" coords="491,1062,643,1187"/>
+<area shape="poly" id="edge7_Node000003_Node000008" title=" " alt="" coords="430,936,523,1060,519,1063,426,940"/>
+<area shape="rect" id="Node000006" href="$classslick_1_1logger_1_1DailyEncodedFileSink.html" title="EncodedFileSink that rotates by date, with DailyFileSink&#39;s file names." alt="" coords="5,1368,196,1468"/>
+<area shape="poly" id="edge5_Node000005_Node000006" title=" " alt="" coords="241,1230,211,1267,136,1369,132,1366,207,1264,236,1226"/>
+<area shape="rect" id="Node000007" href="$classslick_1_1logger_1_1RotatingEncodedFileSink.html" title="EncodedFileSink that rotates by size, with RotatingFileSink&#39;s file names." alt="" coords="221,1368,431,1468"/>
+<area shape="poly" id="edge6_Node000005_Node000007" title=" " alt="" coords="329,1231,329,1368,323,1368,323,1231"/>
+<area shape="rect" id="Node000009" href="$classslick_1_1logger_1_1DailyFileSink.html" title=" " alt="" coords="455,1265,680,1571"/>
+<area shape="poly" id="edge8_Node000008_Node000009" title=" " alt="" coords="570,1201,570,1265,565,1265,565,1201"/>
+<area shape="rect" id="Node000010" href="$classslick_1_1logger_1_1RotatingFileSink.html" title=" " alt="" coords="704,1365,911,1471"/>
+<area shape="poly" id="edge9_Node000008_Node000010" title=" " alt="" coords="635,1196,693,1264,771,1364,767,1367,689,1267,631,1200"/>
+</map>

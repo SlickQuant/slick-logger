@@ -1,0 +1,9 @@
+<map id="slick::logger::PatternFormatter::Context" name="slick::logger::PatternFormatter::Context">
+<area shape="rect" id="Node000001" title="Everything a pattern can render that does not live in the LogEntry." alt="" coords="65,456,275,536"/>
+<area shape="rect" id="Node000002" title=" " alt="" coords="26,202,143,267"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="94,267,113,342,142,431,145,440,140,442,137,433,108,344,89,268"/>
+<area shape="rect" id="Node000003" title=" " alt="" coords="5,5,164,85"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="87,99,87,202,82,202,82,99"/>
+<area shape="rect" id="Node000004" href="$classslick_1_1logger_1_1TimestampFormatter.html" title="Class to format timestamps in various formats." alt="" coords="168,135,345,335"/>
+<area shape="poly" id="edge3_Node000001_Node000004" title=" " alt="" coords="256,336,247,385,230,433,224,444,219,441,225,431,242,384,251,335"/>
+</map>

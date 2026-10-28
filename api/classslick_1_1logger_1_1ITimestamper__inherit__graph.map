@@ -1,0 +1,7 @@
+<map id="slick::logger::ITimestamper" name="slick::logger::ITimestamper">
+<area shape="rect" id="Node000001" title="Source of the time stamped on every log entry." alt="" coords="128,5,320,91"/>
+<area shape="rect" id="Node000002" href="$classslick_1_1logger_1_1TscTimestamper.html" title="Nanosecond timestamps from the CPU&#39;s cycle counter." alt="" coords="5,139,213,264"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="186,103,158,140,154,137,182,100"/>
+<area shape="rect" id="Node000003" title=" " alt="" coords="237,161,440,241"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="266,100,311,160,307,163,262,104"/>
+</map>

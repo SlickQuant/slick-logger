@@ -1,0 +1,11 @@
+<map id="slick::logger::EncodedFileSink" name="slick::logger::EncodedFileSink">
+<area shape="rect" id="Node000001" title="Writes entries in binary, for EncodedLogReader or slick_log_decode to render later." alt="" coords="109,1032,316,1217"/>
+<area shape="rect" id="Node000004" href="$classslick_1_1logger_1_1DailyEncodedFileSink.html" title="EncodedFileSink that rotates by date, with DailyFileSink&#39;s file names." alt="" coords="5,1265,196,1365"/>
+<area shape="poly" id="edge3_Node000001_Node000004" title=" " alt="" coords="153,1231,132,1267,127,1264,149,1228"/>
+<area shape="rect" id="Node000005" href="$classslick_1_1logger_1_1RotatingEncodedFileSink.html" title="EncodedFileSink that rotates by size, with RotatingFileSink&#39;s file names." alt="" coords="221,1265,431,1365"/>
+<area shape="poly" id="edge4_Node000001_Node000005" title=" " alt="" coords="277,1228,299,1264,294,1267,273,1231"/>
+<area shape="rect" id="Node000002" href="$classslick_1_1logger_1_1FileSinkBase.html" title="Shared file&#45;stream plumbing for sinks that write to a file." alt="" coords="119,619,306,984"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="215,997,215,1032,210,1032,210,997"/>
+<area shape="rect" id="Node000003" href="$classslick_1_1logger_1_1ISink.html" title=" " alt="" coords="125,5,301,571"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="215,584,215,618,210,618,210,584"/>
+</map>

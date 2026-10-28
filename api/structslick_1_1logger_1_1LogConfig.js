@@ -1,0 +1,28 @@
+var structslick_1_1logger_1_1LogConfig =
+[
+    [ "collect_backlog", "structslick_1_1logger_1_1LogConfig.html#ace20f34621c4b500bfb5f83a57228363", null ],
+    [ "enable_stats", "structslick_1_1logger_1_1LogConfig.html#a3c0eaebd754ea146eb624cfe40e6d430", null ],
+    [ "include_source_location", "structslick_1_1logger_1_1LogConfig.html#a66eaa9879c41635b8913447f7c577fd9", null ],
+    [ "log_queue_size", "structslick_1_1logger_1_1LogConfig.html#a8b8c241622550419d234ce6ec2d472ad", null ],
+    [ "max_thread_rings", "structslick_1_1logger_1_1LogConfig.html#a51de95ccbb0223e7f265e509d98d57bb", null ],
+    [ "min_level", "structslick_1_1logger_1_1LogConfig.html#af27d055adcba5aaff67ff79aed37c6bb", null ],
+    [ "mode", "structslick_1_1logger_1_1LogConfig.html#a0863c41e7867288b90165aa58cfad4ee", null ],
+    [ "pattern", "structslick_1_1logger_1_1LogConfig.html#a9531af03e2e29acc6ac06f56d0a28b2b", null ],
+    [ "process_tag", "structslick_1_1logger_1_1LogConfig.html#a1b46882ef0df31b2a1e9eb22717d2dbb", null ],
+    [ "shared_memory_name", "structslick_1_1logger_1_1LogConfig.html#a4c60c4209c7014658ee2c2339235deb4", null ],
+    [ "shared_thread_ring_size", "structslick_1_1logger_1_1LogConfig.html#a84638e2fc6dc60569f5c92c4af129a03", null ],
+    [ "shared_thread_rings", "structslick_1_1logger_1_1LogConfig.html#a0458a5a4ad864a307e7871874566ffb4", null ],
+    [ "sinks", "structslick_1_1logger_1_1LogConfig.html#a5da28536d3c90a41fdb11e5b347a87ef", null ],
+    [ "stalled_entry_timeout_ms", "structslick_1_1logger_1_1LogConfig.html#a3fe7b4bb5eb396798c66d7667b3b7169", null ],
+    [ "stats_file", "structslick_1_1logger_1_1LogConfig.html#a0a7ce98b3ed9fde2c8897caa24acd08d", null ],
+    [ "stats_interval_ms", "structslick_1_1logger_1_1LogConfig.html#a5337fdbbf0f2cf2cab097f0626b38cdb", null ],
+    [ "stats_max_file_size", "structslick_1_1logger_1_1LogConfig.html#a997b91f2a434bf9fe5d885877c438d1f", null ],
+    [ "stats_sample_interval_ms", "structslick_1_1logger_1_1LogConfig.html#a0e40e2ec54c5d591e0094ff81854a387", null ],
+    [ "string_buffer_size", "structslick_1_1logger_1_1LogConfig.html#aab73118a75bb8ae90f6bd04031d808b7", null ],
+    [ "string_items_per_slot", "structslick_1_1logger_1_1LogConfig.html#aa00b25182412c180c3a8a264d5e28f3b", null ],
+    [ "thread_ring_full", "structslick_1_1logger_1_1LogConfig.html#ade3687b604a3c6b41e8115981d37fcf1", null ],
+    [ "thread_ring_size", "structslick_1_1logger_1_1LogConfig.html#aac38973328bcfd6f09f83af3ccd08f3f", null ],
+    [ "thread_rings", "structslick_1_1logger_1_1LogConfig.html#ad38f8278b7fca52212334c0869ac7628", null ],
+    [ "timestamper", "structslick_1_1logger_1_1LogConfig.html#a1809ac0cde0596e8f39f18b1211f6c42", null ],
+    [ "writer_poll_interval_us", "structslick_1_1logger_1_1LogConfig.html#aa98dd71a66a5855b4484f03433615f68", null ]
+];

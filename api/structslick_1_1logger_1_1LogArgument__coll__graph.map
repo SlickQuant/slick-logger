@@ -1,0 +1,5 @@
+<map id="slick::logger::LogArgument" name="slick::logger::LogArgument">
+<area shape="rect" id="Node000001" title=" " alt="" coords="5,193,193,459"/>
+<area shape="rect" id="Node000002" href="$structslick_1_1logger_1_1StringRef.html" title="Reference to a string, either by address or by ring&#45;buffer index." alt="" coords="19,5,180,131"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="102,131,102,177,97,177,97,131"/>
+</map>
