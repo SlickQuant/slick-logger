@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -17,10 +18,12 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <new>
 #include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #ifdef _WIN32
@@ -43,6 +46,55 @@ using slick::logger::Logger;
 using slick::logger::LogLevel;
 using slick::logger::QueueMode;
 using slick::logger::Logger;
+
+// Allocation failure injection, inert until a test arms it. After the first
+// array allocation of exactly array_bytes, that thread's next plain allocation
+// throws bad_alloc if it is at most max_bytes. A larger one counts a miss instead.
+namespace alloc_fault {
+std::atomic<size_t> array_bytes{0}; // armed while non-zero
+std::atomic<size_t> max_bytes{0};
+std::atomic<int> failed{0};
+std::atomic<int> missed{0};
+thread_local bool fail_next = false;
+
+void* allocate(size_t size) {
+    if (void* p = std::malloc(size ? size : 1)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+} // namespace alloc_fault
+
+void* operator new(size_t size) {
+    if (alloc_fault::fail_next) [[unlikely]] {
+        alloc_fault::fail_next = false;
+        if (size <= alloc_fault::max_bytes.load(std::memory_order_relaxed)) {
+            alloc_fault::failed.fetch_add(1, std::memory_order_relaxed);
+            throw std::bad_alloc();
+        }
+        alloc_fault::missed.fetch_add(1, std::memory_order_relaxed);
+    }
+    return alloc_fault::allocate(size);
+}
+
+void* operator new[](size_t size) {
+    size_t armed = alloc_fault::array_bytes.load(std::memory_order_relaxed);
+    if (armed == size && armed != 0 && alloc_fault::array_bytes.compare_exchange_strong(armed, 0)) [[unlikely]] {
+        alloc_fault::fail_next = true;
+    }
+    return alloc_fault::allocate(size);
+}
+
+// Replace every unaligned form. One left to the runtime (or ASan) would free
+// memory with a call that doesn't match how it was allocated.
+void* operator new(size_t size, const std::nothrow_t&) noexcept { return std::malloc(size ? size : 1); }
+void* operator new[](size_t size, const std::nothrow_t&) noexcept { return std::malloc(size ? size : 1); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 
 namespace {
 
@@ -1561,4 +1613,37 @@ TEST_F(SharedMemoryTest, StringGaugeCountsTheFirstProducerAttachedOutsideAScan) 
     ASSERT_TRUE(gated && big && on_hold);
     EXPECT_GE(stats.string_inflight_bytes, 3000u)
         << "the waiting record's string was reported free; written " << stats.string_bytes_written;
+}
+
+// attach_producer() takes all of a producer's rings or none. Here the list of
+// rings the merge reads fails to grow once. A producer committed before that
+// would stay half attached, never read and never retried.
+TEST_F(SharedMemoryTest, AttachIsRetriedAfterAnAllocationFailure) {
+    using slick::logger::detail::ring_view;
+    static_assert(std::is_trivially_destructible_v<ring_view>, "new[] adds no cookie to the array size");
+    const auto log_path = temp_log("test_shm_attach_oom.log");
+    const auto segment = unique_segment_name("slt_ao_");
+    const auto release = temp_log("test_shm_attach_oom_release.marker");
+    constexpr size_t kRings = 3; // an array size nothing else in the collector allocates
+    constexpr size_t kCount = 20;
+
+    Logger::instance().init(collector_config(segment, log_path));
+    alloc_fault::failed = 0;
+    alloc_fault::missed = 0;
+    alloc_fault::max_bytes = kRings * sizeof(ring_view*);
+    alloc_fault::array_bytes = kRings * sizeof(ring_view);
+    std::thread producer([&] {
+        run_producer("--name " + segment + " --tag oom --rings " + std::to_string(kRings) + " --log attach " +
+                     std::to_string(kCount) + " --wait " + release.string() +
+                     " --queue-size 1024 --string-buffer-size 65536");
+    });
+    const bool drained =
+        wait_for([&] { return count_lines_containing(read_lines(log_path), "step attach ") == kCount; });
+    touch_file(release);
+    producer.join();
+    Logger::instance().shutdown();
+    alloc_fault::array_bytes = 0;
+
+    EXPECT_EQ(alloc_fault::failed.load(), 1) << "missed " << alloc_fault::missed.load();
+    EXPECT_TRUE(drained) << "the producer's rings were never read";
 }

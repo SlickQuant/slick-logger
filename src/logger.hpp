@@ -8593,6 +8593,7 @@ inline void Logger::close_registry() noexcept {
         }
         remote_.reset();
         remote_views_.clear();
+        remote_views_.shrink_to_fit(); // free it with remote_, so a reopened collector starts with no allocation
         remote_flush_targets_.clear();
         collector_lease_ = 0;
         remote_retired_produced_ = remote_retired_consumed_ = remote_retired_dropped_ = 0;
@@ -8721,6 +8722,9 @@ inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
                 view.reader.skip();
             }
         }
+        // Reserve room for every ring before committing. A push_back that threw
+        // partway would leave the producer attached with rings nobody reads or retries.
+        remote_views_.reserve(remote_views_.size() + count);
         detail::remote_producer& producer = remote_[index];
         producer.segment = std::move(segment);
         producer.views = std::move(views);
