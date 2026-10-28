@@ -63,6 +63,17 @@ void* allocate(size_t size) {
     }
     throw std::bad_alloc();
 }
+
+/// Make attach_producer() fail when it lists a producer's @p rings for the
+/// merge. That is the first small allocation after its ring_view array.
+void fail_attach(size_t rings) {
+    using slick::logger::detail::ring_view;
+    static_assert(std::is_trivially_destructible_v<ring_view>, "new[] adds no cookie to the array size");
+    failed = 0;
+    missed = 0;
+    max_bytes = rings * sizeof(ring_view*);
+    array_bytes = rings * sizeof(ring_view);
+}
 } // namespace alloc_fault
 
 void* operator new(size_t size) {
@@ -1619,8 +1630,6 @@ TEST_F(SharedMemoryTest, StringGaugeCountsTheFirstProducerAttachedOutsideAScan) 
 // rings the merge reads fails to grow once. A producer committed before that
 // would stay half attached, never read and never retried.
 TEST_F(SharedMemoryTest, AttachIsRetriedAfterAnAllocationFailure) {
-    using slick::logger::detail::ring_view;
-    static_assert(std::is_trivially_destructible_v<ring_view>, "new[] adds no cookie to the array size");
     const auto log_path = temp_log("test_shm_attach_oom.log");
     const auto segment = unique_segment_name("slt_ao_");
     const auto release = temp_log("test_shm_attach_oom_release.marker");
@@ -1628,10 +1637,7 @@ TEST_F(SharedMemoryTest, AttachIsRetriedAfterAnAllocationFailure) {
     constexpr size_t kCount = 20;
 
     Logger::instance().init(collector_config(segment, log_path));
-    alloc_fault::failed = 0;
-    alloc_fault::missed = 0;
-    alloc_fault::max_bytes = kRings * sizeof(ring_view*);
-    alloc_fault::array_bytes = kRings * sizeof(ring_view);
+    alloc_fault::fail_attach(kRings);
     std::thread producer([&] {
         run_producer("--name " + segment + " --tag oom --rings " + std::to_string(kRings) + " --log attach " +
                      std::to_string(kCount) + " --wait " + release.string() +
@@ -1646,4 +1652,43 @@ TEST_F(SharedMemoryTest, AttachIsRetriedAfterAnAllocationFailure) {
 
     EXPECT_EQ(alloc_fault::failed.load(), 1) << "missed " << alloc_fault::missed.load();
     EXPECT_TRUE(drained) << "the producer's rings were never read";
+}
+
+// The collector frees a dead producer's slot and segment only when there is
+// nothing to read. An attach that fails for now (out of memory here) keeps
+// both, records and all, for the next scan.
+TEST_F(SharedMemoryTest, DeadProducersRecordsOutliveAFailedAttach) {
+    const auto log_path = temp_log("test_shm_attach_dead.log");
+    const auto segment = unique_segment_name("slt_ad_");
+    const auto logged = temp_log("test_shm_attach_dead.logged");
+    const auto go = temp_log("test_shm_attach_dead.go");
+    constexpr size_t kRings = 3;
+    constexpr size_t kCount = 20;
+
+    // No collector yet: the producer logs, then dies without closing its slot.
+    int rc = 0;
+    std::thread producer([&] {
+        rc = run_producer("--name " + segment + " --tag dead --rings " + std::to_string(kRings) + " --log dead " +
+                          std::to_string(kCount) + " --touch " + logged.string() + " --wait " + go.string() +
+                          " --crash --queue-size 1024 --string-buffer-size 65536");
+    });
+    ASSERT_TRUE(wait_for([&] { return std::filesystem::exists(logged); }));
+    // On Windows a segment is destroyed with its last handle, so hold these open
+    // past the producer's exit.
+    registry_mapping registry(segment);
+    slick::shm::shared_memory keep((segment + ".r0").c_str(), slick::shm::open_existing);
+    touch_file(go);
+    producer.join();
+    ASSERT_NE(rc, 0);
+    ASSERT_EQ(registry.state(0), shm_registry_slot::kActive);
+
+    alloc_fault::fail_attach(kRings); // fails the collector's first attach, inside init()
+    Logger::instance().init(collector_config(segment, log_path));
+    const bool drained =
+        wait_for([&] { return count_lines_containing(read_lines(log_path), "step dead ") == kCount; });
+    Logger::instance().shutdown();
+    alloc_fault::array_bytes = 0;
+
+    EXPECT_EQ(alloc_fault::failed.load(), 1) << "missed " << alloc_fault::missed.load();
+    EXPECT_TRUE(drained) << "the dead producer's segment was freed with its records unread";
 }

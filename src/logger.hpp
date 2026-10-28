@@ -4474,7 +4474,12 @@ private:
     /// Collector, writer thread: scan when a producer announced a change, or
     /// every kRegistryScanMs for liveness.
     void poll_registry();
-    bool attach_producer(uint32_t index, bool skip_backlog);
+    enum class AttachResult : uint8_t {
+        Attached,
+        Unreadable, // no segment, another generation's, or one this build cannot read
+        Retry       // failed for now (out of memory or handles), leaving the segment and its records
+    };
+    AttachResult attach_producer(uint32_t index, bool skip_backlog);
     /// Collector: attach every registered producer not attached yet, so flush()
     /// and the string frontier see one that registered since the last scan.
     void attach_new_producers() noexcept;
@@ -8653,7 +8658,8 @@ inline void Logger::scan_registry(bool initial) {
             continue;
         }
         if (state == slot_t::kActive || state == slot_t::kClosing) {
-            if (!attach_producer(i, initial && !registry_backlog_) &&
+            // On Retry the slot keeps its segment, records and all, for the next scan.
+            if (attach_producer(i, initial && !registry_backlog_) == AttachResult::Unreadable &&
                 (state == slot_t::kClosing || !detail::process_running(slot.pid.load(std::memory_order_relaxed),
                                                                        slot.start_time.load(std::memory_order_relaxed)))) {
                 free_registry_slot(i, control); // nothing to read, and nobody left to write it
@@ -8673,14 +8679,14 @@ inline void Logger::scan_registry(bool initial) {
     publish_remote_totals();
 }
 
-inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
+inline Logger::AttachResult Logger::attach_producer(uint32_t index, bool skip_backlog) {
     using slot_t = detail::shm_registry_slot;
     using segment_t = detail::shm_ring_segment;
     const slot_t& slot = registry_->slots[index];
     const uint64_t control = slot.control.load(std::memory_order_acquire);
     const uint32_t state = slot_t::state_of(control);
     if (state != slot_t::kActive && state != slot_t::kClosing) {
-        return false;
+        return AttachResult::Unreadable;
     }
     const uint32_t generation = slot_t::generation_of(control);
     try {
@@ -8688,7 +8694,7 @@ inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
         auto* const header = static_cast<segment_t*>(segment.data());
         if (!header || segment.size() < sizeof(segment_t) || header->magic != segment_t::kMagic ||
             header->generation != generation) {
-            return false; // not the segment this generation built
+            return AttachResult::Unreadable; // not the segment this generation built
         }
         if (header->layout_version != segment_t::kLayoutVersion ||
             header->ring_layout_version != detail::producer_ring::kLayoutVersion ||
@@ -8702,7 +8708,7 @@ inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
                                       "(version or SLICK_LOGGER_TAG_SIZE); its thread rings are not read",
                     slot.pid.load(std::memory_order_relaxed));
             }
-            return false;
+            return AttachResult::Unreadable;
         }
         const uint32_t count = header->ring_count;
         auto views = std::make_unique<detail::ring_view[]>(count);
@@ -8711,7 +8717,7 @@ inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
             detail::producer_ring* const ring = header->ring(r);
             if (ring->layout_version() != detail::producer_ring::kLayoutVersion ||
                 ring->capacity() != header->ring_capacity) {
-                return false;
+                return AttachResult::Unreadable;
             }
             detail::ring_view& view = views[r];
             view.ring = ring;
@@ -8738,9 +8744,17 @@ inline bool Logger::attach_producer(uint32_t index, bool skip_backlog) {
             remote_views_.push_back(&producer.views[r]);
         }
         publish_remote_totals(); // attached outside a scan too: flush(), the frontier, a spill
-        return true;
+        return AttachResult::Attached;
+    } catch (const std::bad_alloc&) {
+        return AttachResult::Retry;
+    } catch (const std::system_error& e) {
+        // Opening the segment failed. Not found or permission denied is final. Anything
+        // else, such as running out of handles or address space, is retried.
+        const std::error_code& ec = e.code();
+        return ec == slick::shm::errc::not_found || ec == std::errc::permission_denied ? AttachResult::Unreadable
+                                                                                       : AttachResult::Retry;
     } catch (const std::exception&) {
-        return false; // not there yet, or already gone
+        return AttachResult::Unreadable;
     }
 }
 
